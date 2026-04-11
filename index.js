@@ -8,7 +8,7 @@ app.use((req, res, next) => {
 });
 
 const PORT = process.env.PORT || 3000;
-const ADDON_ID = 'org.xtream.addon';
+const ADDON_ID = 'org.xtremio.addon';
 
 let config = {
     serverUrl: '',
@@ -16,17 +16,42 @@ let config = {
     password: ''
 };
 
-function getManifest() {
+
+async function getManifest() {
     const isConfigured = config.serverUrl && config.username && config.password;
+    const catalogs = [];
+
+    if (isConfigured) {
+        try {
+            const cats = await getCategories();
+            catalogs.push(
+                {
+                    type: 'tv',
+                    id: 'xtremio_live',
+                    name: 'xTremio',
+                    extra: [
+                        { name: 'genre', options: cats.live.map(c => c.category_name) },
+                        { name: 'skip' },
+                        { name: 'search' }
+                    ]
+                }
+            );
+        } catch (e) {
+            catalogs.push(
+                { type: 'tv', id: 'xtremio_live', name: 'xTremio' }
+            );
+        }
+    }
+
     return {
         id: ADDON_ID,
         version: '1.0.0',
         name: 'xTremio',
         description: 'xTremio addon for Stremio',
-        resources: ['stream', 'catalog'],
-        types: ['channel', 'movie', 'series'],
-        catalogs: [],
-        idPrefixes: ['xtream_'],
+        resources: ['catalog', 'stream'],
+        types: ['tv'],
+        catalogs,
+        idPrefixes: ['xtremio_'],
         behaviorHints: {
             configurable: true,
             configurationRequired: !isConfigured
@@ -35,8 +60,8 @@ function getManifest() {
     };
 }
 
-app.get('/manifest.json', (req, res) => {
-    res.json(getManifest());
+app.get('/manifest.json', async (req, res) => {
+    res.json(await getManifest());
 });
 
 function normalizeUrl(url) {
@@ -45,7 +70,62 @@ function normalizeUrl(url) {
     return url;
 }
 
-async function validateXtreamCredentials(serverUrl, username, password) {
+async function xtremioGet(action, extraParams = '') {
+    const url = `${config.serverUrl}/player_api.php?username=${encodeURIComponent(config.username)}&password=${encodeURIComponent(config.password)}&action=${action}${extraParams}`;
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(), 15000);
+    try {
+        const res = await fetch(url, { signal: controller.signal, redirect: 'follow' });
+        const data = await res.json();
+
+        const sample = Array.isArray(data) ? data.slice(0, 10) : data;
+        console.log(`[xtremioGet] ${action} (${Array.isArray(data) ? data.length : '?'} items)`, JSON.stringify(sample, null, 2));
+        
+        return data;
+    } finally {
+        clearTimeout(timer);
+    }
+}
+
+let catCache = { live: [], ts: 0 };
+const CACHE_TTL = 5 * 60 * 1000;
+
+async function getCategories() {
+    if (catCache.ts > Date.now() - CACHE_TTL && catCache.live.length) return catCache;
+    const live = await xtremioGet('get_live_categories');
+    catCache = {
+        live: Array.isArray(live) ? live : [],
+        ts: Date.now()
+    };
+    return catCache;
+}
+
+function parseExtra(extra) {
+    const params = {};
+    if (extra) {
+        extra.split('&').forEach(p => {
+            const [k, ...rest] = p.split('=');
+            params[decodeURIComponent(k)] = decodeURIComponent(rest.join('='));
+        });
+    }
+    return params;
+}
+
+const PAGE_SIZE = 100;
+
+const streamCache = new Map();
+
+async function getCachedStreams(action, catParam = '') {
+    const key = `${action}${catParam}`;
+    const cached = streamCache.get(key);
+    if (cached && cached.ts > Date.now() - CACHE_TTL) return cached.data;
+    const data = await xtremioGet(action, catParam);
+    const items = Array.isArray(data) ? data : [];
+    streamCache.set(key, { data: items, ts: Date.now() });
+    return items;
+}
+
+async function validateXtremioCredentials(serverUrl, username, password) {
     const base = normalizeUrl(serverUrl);
     const path = `/player_api.php?username=${encodeURIComponent(username)}&password=${encodeURIComponent(password)}`;
     const urls = [base, base.replace(/^https?/, m => m === 'https' ? 'http' : 'https')];
@@ -222,7 +302,7 @@ app.post('/configure', async (req, res) => {
     const password = req.body.password || '';
 
     try {
-        const validation = await validateXtreamCredentials(serverUrl, username, password);
+        const validation = await validateXtremioCredentials(serverUrl, username, password);
 
         if (validation.valid) {
             config.serverUrl = validation.resolvedUrl || normalizeUrl(serverUrl);
@@ -230,6 +310,9 @@ app.post('/configure', async (req, res) => {
             config.password = password;
             config.maxConnections = validation.maxConnections;
             config.expDate = validation.expDate;
+            catCache.ts = 0;
+            streamCache.clear();
+            getCategories().catch(() => {});
         }
 
         res.send(renderConfigPage({
@@ -245,6 +328,69 @@ app.post('/configure', async (req, res) => {
             password,
             status: { valid: false, error: 'Something went wrong. Please try again.' }
         }));
+    }
+});
+
+app.get('/catalog/:type/:id/:extra?.json', async (req, res) => {
+    if (!config.serverUrl) return res.json({ metas: [] });
+
+    const { type, id } = req.params;
+    const extra = parseExtra(req.params.extra);
+    const skip = parseInt(extra.skip) || 0;
+    const genre = extra.genre;
+
+    try {
+        if (id !== 'xtremio_live') return res.json({ metas: [] });
+
+        let categoryId;
+        if (genre) {
+            const cats = await getCategories();
+            const cat = cats.live.find(c => c.category_name === genre);
+            if (cat) categoryId = cat.category_id;
+        }
+
+        const catParam = categoryId ? `&category_id=${categoryId}` : '';
+        let items = await getCachedStreams('get_live_streams', catParam);
+
+        if (extra.search) {
+            const q = extra.search.toLowerCase();
+            items = items.filter(s => s.name?.toLowerCase().includes(q));
+        }
+
+        const page = items.slice(skip, skip + PAGE_SIZE);
+        const metas = page.map(s => ({
+            id: `xtremio_live_${s.stream_id}`,
+            type: 'tv',
+            name: s.name,
+            poster: s.stream_icon || undefined,
+            posterShape: 'square'
+        }));
+
+        res.json({ metas });
+    } catch (e) {
+        res.json({ metas: [] });
+    }
+});
+
+app.get('/meta/:type/:id.json', (req, res) => {
+    res.json({ meta: null });
+});
+
+app.get('/stream/:type/:id.json', (req, res) => {
+    if (!config.serverUrl) return res.json({ streams: [] });
+    const { type, id } = req.params;
+    const { serverUrl, username, password } = config;
+
+    if (id.startsWith('xtremio_live_')) {
+        const streamId = id.replace('xtremio_live_', '');
+        res.json({
+            streams: [
+                { url: `${serverUrl}/live/${username}/${password}/${streamId}.m3u8`, title: 'HLS' },
+                { url: `${serverUrl}/live/${username}/${password}/${streamId}.ts`, title: 'MPEG-TS' }
+            ]
+        });
+    } else {
+        res.json({ streams: [] });
     }
 });
 
