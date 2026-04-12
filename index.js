@@ -1,4 +1,8 @@
 const express = require('express');
+const fs = require('fs');
+const path = require('path');
+
+const CONFIG_PATH = path.join(__dirname, 'config.json');
 
 const app = express();
 app.use(express.urlencoded({ extended: true }));
@@ -16,6 +20,29 @@ let config = {
     password: ''
 };
 
+function loadConfig() {
+    try {
+        if (fs.existsSync(CONFIG_PATH)) {
+            const data = JSON.parse(fs.readFileSync(CONFIG_PATH, 'utf8'));
+            config = { ...config, ...data };
+            console.log('[config] Loaded saved config for', config.username);
+        }
+    } catch (e) {
+        console.error('[config] Failed to load config:', e.message);
+    }
+}
+
+function saveConfig() {
+    try {
+        fs.writeFileSync(CONFIG_PATH, JSON.stringify(config, null, 2));
+        console.log('[config] Config saved');
+    } catch (e) {
+        console.error('[config] Failed to save config:', e.message);
+    }
+}
+
+loadConfig();
+
 
 async function getManifest() {
     const isConfigured = config.serverUrl && config.username && config.password;
@@ -24,13 +51,46 @@ async function getManifest() {
     if (isConfigured) {
         try {
             const cats = await getCategories();
+            const movieGenres = ['Top', ...new Set(cats.movies.map(c => c.category_name).filter(Boolean))];
+            const liveGenres = [...new Set(cats.live.map(c => c.category_name).filter(Boolean))];
+
             catalogs.push(
                 {
-                    type: 'tv',
+                    type: 'XT-Live',
                     id: 'xtremio_live',
-                    name: 'xTremio',
+                    name: 'All',
                     extra: [
-                        { name: 'genre', options: cats.live.map(c => c.category_name) },
+                        { name: 'genre', options: liveGenres, isRequired: true },
+                        { name: 'skip' },
+                        { name: 'search' }
+                    ]
+                },
+                {
+                    type: 'XT-Movies',
+                    id: 'xtremio_movies_popular',
+                    name: 'Popular',
+                    extra: [
+                        { name: 'genre', options: movieGenres, isRequired: true },
+                        { name: 'skip' },
+                        { name: 'search' }
+                    ]
+                },
+                {
+                    type: 'XT-Movies',
+                    id: 'xtremio_movies_new',
+                    name: 'New',
+                    extra: [
+                        { name: 'genre', options: movieGenres, isRequired: true },
+                        { name: 'skip' },
+                        { name: 'search' }
+                    ]
+                },
+                {
+                    type: 'XT-Movies',
+                    id: 'xtremio_movies_featured',
+                    name: 'Featured',
+                    extra: [
+                        { name: 'genre', options: movieGenres, isRequired: true },
                         { name: 'skip' },
                         { name: 'search' }
                     ]
@@ -38,7 +98,10 @@ async function getManifest() {
             );
         } catch (e) {
             catalogs.push(
-                { type: 'tv', id: 'xtremio_live', name: 'xTremio' }
+                { type: 'XT-Live', id: 'xtremio_live', name: 'All' },
+                { type: 'XT-Movies', id: 'xtremio_movies_popular', name: 'Popular' },
+                { type: 'XT-Movies', id: 'xtremio_movies_new', name: 'New' },
+                { type: 'XT-Movies', id: 'xtremio_movies_featured', name: 'Featured' }
             );
         }
     }
@@ -48,8 +111,8 @@ async function getManifest() {
         version: '1.0.0',
         name: 'xTremio',
         description: 'xTremio addon for Stremio',
-        resources: ['catalog', 'stream'],
-        types: ['tv'],
+        resources: ['catalog', 'meta', 'stream'],
+        types: ['XT-Live', 'XT-Movies'],
         catalogs,
         idPrefixes: ['xtremio_'],
         behaviorHints: {
@@ -80,21 +143,25 @@ async function xtremioGet(action, extraParams = '') {
 
         const sample = Array.isArray(data) ? data.slice(0, 10) : data;
         console.log(`[xtremioGet] ${action} (${Array.isArray(data) ? data.length : '?'} items)`, JSON.stringify(sample, null, 2));
-        
+
         return data;
     } finally {
         clearTimeout(timer);
     }
 }
 
-let catCache = { live: [], ts: 0 };
+let catCache = { live: [], movies: [], ts: 0 };
 const CACHE_TTL = 5 * 60 * 1000;
 
 async function getCategories() {
-    if (catCache.ts > Date.now() - CACHE_TTL && catCache.live.length) return catCache;
-    const live = await xtremioGet('get_live_categories');
+    if (catCache.ts > Date.now() - CACHE_TTL && catCache.live.length && catCache.movies.length) return catCache;
+    const [live, movies] = await Promise.all([
+        xtremioGet('get_live_categories'),
+        xtremioGet('get_vod_categories')
+    ]);
     catCache = {
         live: Array.isArray(live) ? live : [],
+        movies: Array.isArray(movies) ? movies : [],
         ts: Date.now()
     };
     return catCache;
@@ -166,9 +233,9 @@ async function validateXtremioCredentials(serverUrl, username, password) {
             if (url === urls[0] && urls.length > 1) continue;
             const msg = e.name === 'AbortError' ? 'Connection timed out'
                 : e.cause?.code === 'ECONNREFUSED' ? 'Connection refused — check server URL and port'
-                : e.cause?.code === 'ENOTFOUND' ? 'Server not found — check the URL'
-                : e.cause?.code === 'ECONNRESET' ? 'Connection reset by server'
-                : e.message || 'Cannot connect to server';
+                    : e.cause?.code === 'ENOTFOUND' ? 'Server not found — check the URL'
+                        : e.cause?.code === 'ECONNRESET' ? 'Connection reset by server'
+                            : e.message || 'Cannot connect to server';
             return { valid: false, error: msg };
         } finally {
             clearTimeout(timer);
@@ -293,7 +360,11 @@ function renderConfigPage({ serverUrl = '', username = '', password = '', status
 }
 
 app.get('/configure', (req, res) => {
-    res.send(renderConfigPage({}));
+    res.send(renderConfigPage({
+        serverUrl: req.query.serverUrl || config.serverUrl,
+        username: req.query.username || config.username,
+        password: req.query.password || config.password
+    }));
 });
 
 app.post('/configure', async (req, res) => {
@@ -310,9 +381,10 @@ app.post('/configure', async (req, res) => {
             config.password = password;
             config.maxConnections = validation.maxConnections;
             config.expDate = validation.expDate;
+            saveConfig();
             catCache.ts = 0;
             streamCache.clear();
-            getCategories().catch(() => {});
+            getCategories().catch(() => { });
         }
 
         res.send(renderConfigPage({
@@ -340,43 +412,135 @@ app.get('/catalog/:type/:id/:extra?.json', async (req, res) => {
     const genre = extra.genre;
 
     try {
-        if (id !== 'xtremio_live') return res.json({ metas: [] });
-
-        let categoryId;
-        if (genre) {
+        if (id === 'xtremio_live') {
             const cats = await getCategories();
-            const cat = cats.live.find(c => c.category_name === genre);
-            if (cat) categoryId = cat.category_id;
+            const selectedGenre = genre || (cats.live[0] && cats.live[0].category_name);
+            let categoryId;
+            if (selectedGenre) {
+                const cat = cats.live.find(c => c.category_name === selectedGenre);
+                if (cat) categoryId = cat.category_id;
+            }
+
+            const catParam = categoryId ? `&category_id=${categoryId}` : '';
+            let items = await getCachedStreams('get_live_streams', catParam);
+
+            if (extra.search) {
+                const q = extra.search.toLowerCase();
+                items = items.filter(s => s.name?.toLowerCase().includes(q));
+            }
+
+            const page = items.slice(skip, skip + PAGE_SIZE);
+            const metas = page.map(s => ({
+                id: `xtremio_live_${s.stream_id}`,
+                type: 'XT-Live',
+                name: s.name,
+                poster: s.stream_icon || undefined,
+                posterShape: 'square'
+            }));
+
+            return res.json({ metas });
         }
 
-        const catParam = categoryId ? `&category_id=${categoryId}` : '';
-        let items = await getCachedStreams('get_live_streams', catParam);
+        if (id.startsWith('xtremio_movies_')) {
+            const cats = await getCategories();
+            const selectedGenre = (genre && genre !== 'Top') ? genre : (cats.movies[0] && cats.movies[0].category_name);
+            const cat = cats.movies.find(c => c.category_name === selectedGenre);
+            if (!cat) return res.json({ metas: [] });
 
-        if (extra.search) {
-            const q = extra.search.toLowerCase();
-            items = items.filter(s => s.name?.toLowerCase().includes(q));
+            const catParam = `&category_id=${cat.category_id}`;
+            let items = await getCachedStreams('get_vod_streams', catParam);
+
+            if (extra.search) {
+                const q = extra.search.toLowerCase();
+                items = items.filter(s => s.name?.toLowerCase().includes(q));
+            }
+
+            if (id === 'xtremio_movies_new') {
+                items = [...items].sort((a, b) => (parseInt(b.added) || 0) - (parseInt(a.added) || 0));
+            } else if (id === 'xtremio_movies_popular') {
+                items = [...items].sort((a, b) => (parseFloat(b.rating) || 0) - (parseFloat(a.rating) || 0));
+            } else if (id === 'xtremio_movies_featured') {
+                items = [...items].sort(() => Math.random() - 0.5);
+            }
+
+            const page = items.slice(skip, skip + PAGE_SIZE);
+            const metas = page.map(s => ({
+                id: `xtremio_movie_${s.stream_id}`,
+                type: 'XT-Movies',
+                name: s.name,
+                poster: s.stream_icon || undefined,
+                posterShape: 'poster'
+            }));
+
+            return res.json({ metas });
         }
 
-        const page = items.slice(skip, skip + PAGE_SIZE);
-        const metas = page.map(s => ({
-            id: `xtremio_live_${s.stream_id}`,
-            type: 'tv',
-            name: s.name,
-            poster: s.stream_icon || undefined,
-            posterShape: 'square'
-        }));
-
-        res.json({ metas });
+        res.json({ metas: [] });
     } catch (e) {
         res.json({ metas: [] });
     }
 });
 
-app.get('/meta/:type/:id.json', (req, res) => {
-    res.json({ meta: null });
+app.get('/meta/:type/:id.json', async (req, res) => {
+    if (!config.serverUrl) return res.json({ meta: null });
+    const { type, id } = req.params;
+
+    try {
+        if (id.startsWith('xtremio_live_')) {
+            const streamId = id.replace('xtremio_live_', '');
+            const items = await getCachedStreams('get_live_streams');
+            const s = items.find(i => String(i.stream_id) === streamId);
+            if (!s) return res.json({ meta: null });
+            return res.json({
+                meta: {
+                    id: `xtremio_live_${s.stream_id}`,
+                    type: 'XT-Live',
+                    name: s.name,
+                    poster: s.stream_icon || undefined,
+                    posterShape: 'square',
+                    genres: s.category_name ? [s.category_name] : [],
+                    description: s.name || undefined,
+                    logo: s.stream_icon || undefined
+                }
+            });
+        }
+
+        if (id.startsWith('xtremio_movie_')) {
+            const streamId = id.replace('xtremio_movie_', '');
+            const info = await xtremioGet('get_vod_info', `&vod_id=${streamId}`);
+            const movie = info?.info ?? info ?? {};
+            const cast = movie.cast ? movie.cast.split(',').map(c => c.trim()).filter(Boolean) : [];
+            const backdrop = Array.isArray(movie.backdrop_path) && movie.backdrop_path[0] ? movie.backdrop_path[0] : undefined;
+
+            return res.json({
+                meta: {
+                    id: `xtremio_movie_${streamId}`,
+                    type: 'XT-Movies',
+                    name: movie.name || movie.o_name || 'Unknown',
+                    poster: movie.cover_big || movie.movie_image || undefined,
+                    posterShape: 'poster',
+                    background: backdrop,
+                    description: movie.plot || movie.description || undefined,
+                    releaseInfo: movie.releasedate ? String(movie.releasedate) : undefined,
+                    genres: movie.genre ? movie.genre.split(',').map(g => g.trim()).filter(Boolean) : [],
+                    runtime: movie.duration || movie.episode_run_time ? String(movie.episode_run_time) + ' min' : undefined,
+                    director: movie.director || undefined,
+                    cast,
+                    imdbRating: movie.rating ? String(movie.rating) : undefined,
+                    year: movie.releasedate ? parseInt(movie.releasedate.slice(0, 4)) : undefined,
+                    country: movie.country || undefined,
+                    trailer: movie.youtube_trailer || undefined
+                }
+            });
+        }
+
+        res.json({ meta: null });
+    } catch (e) {
+        res.json({ meta: null });
+    }
 });
 
-app.get('/stream/:type/:id.json', (req, res) => {
+app.get('/stream/:type/:id.json', async (req, res) => {
     if (!config.serverUrl) return res.json({ streams: [] });
     const { type, id } = req.params;
     const { serverUrl, username, password } = config;
@@ -387,6 +551,15 @@ app.get('/stream/:type/:id.json', (req, res) => {
             streams: [
                 { url: `${serverUrl}/live/${username}/${password}/${streamId}.m3u8`, title: 'HLS' },
                 { url: `${serverUrl}/live/${username}/${password}/${streamId}.ts`, title: 'MPEG-TS' }
+            ]
+        });
+    } else if (id.startsWith('xtremio_movie_')) {
+        const streamId = id.replace('xtremio_movie_', '');
+        const info = await xtremioGet('get_vod_info', `&vod_id=${streamId}`);
+        const ext = info?.movie_data?.container_extension || 'mp4';
+        res.json({
+            streams: [
+                { url: `${serverUrl}/movie/${username}/${password}/${streamId}.${ext}`, title: 'Movie' }
             ]
         });
     } else {
