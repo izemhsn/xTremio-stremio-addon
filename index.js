@@ -460,7 +460,13 @@ app.get('/catalog/:type/:id/:extra?.json', async (req, res) => {
             } else if (id === 'xtremio_movies_popular') {
                 items = [...items].sort((a, b) => (parseFloat(b.rating) || 0) - (parseFloat(a.rating) || 0));
             } else if (id === 'xtremio_movies_featured') {
-                items = [...items].sort(() => Math.random() - 0.5);
+                // Seeded shuffle based on the day so order is stable across pagination
+                const daySeed = Math.floor(Date.now() / 86400000);
+                items = [...items].sort((a, b) => {
+                    const ha = ((parseInt(a.stream_id) || 0) * 2654435761 + daySeed) & 0x7fffffff;
+                    const hb = ((parseInt(b.stream_id) || 0) * 2654435761 + daySeed) & 0x7fffffff;
+                    return ha - hb;
+                });
             }
 
             const page = items.slice(skip, skip + PAGE_SIZE);
@@ -488,8 +494,14 @@ app.get('/meta/:type/:id.json', async (req, res) => {
     try {
         if (id.startsWith('xtremio_live_')) {
             const streamId = id.replace('xtremio_live_', '');
-            const items = await getCachedStreams('get_live_streams');
-            const s = items.find(i => String(i.stream_id) === streamId);
+            // Search across all cached category streams to find the channel
+            const cats = await getCategories();
+            let s = null;
+            for (const cat of cats.live) {
+                const items = await getCachedStreams('get_live_streams', `&category_id=${cat.category_id}`);
+                s = items.find(i => String(i.stream_id) === streamId);
+                if (s) break;
+            }
             if (!s) return res.json({ meta: null });
             return res.json({
                 meta: {
@@ -523,7 +535,7 @@ app.get('/meta/:type/:id.json', async (req, res) => {
                     description: movie.plot || movie.description || undefined,
                     releaseInfo: movie.releasedate ? String(movie.releasedate) : undefined,
                     genres: movie.genre ? movie.genre.split(',').map(g => g.trim()).filter(Boolean) : [],
-                    runtime: movie.duration || movie.episode_run_time ? String(movie.episode_run_time) + ' min' : undefined,
+                    runtime: movie.duration ? String(movie.duration) + ' min' : (movie.episode_run_time ? String(movie.episode_run_time) + ' min' : undefined),
                     director: movie.director || undefined,
                     cast,
                     imdbRating: movie.rating ? String(movie.rating) : undefined,
