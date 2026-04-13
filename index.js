@@ -52,6 +52,7 @@ async function getManifest() {
         try {
             const cats = await getCategories();
             const movieGenres = ['Top', ...new Set(cats.movies.map(c => c.category_name).filter(Boolean))];
+            const seriesGenres = ['Top', ...new Set(cats.series.map(c => c.category_name).filter(Boolean))];
             const liveGenres = [...new Set(cats.live.map(c => c.category_name).filter(Boolean))];
 
             catalogs.push(
@@ -94,6 +95,36 @@ async function getManifest() {
                         { name: 'skip' },
                         { name: 'search' }
                     ]
+                },
+                {
+                    type: 'XT-Series',
+                    id: 'xtremio_series_popular',
+                    name: 'Popular',
+                    extra: [
+                        { name: 'genre', options: seriesGenres, isRequired: true },
+                        { name: 'skip' },
+                        { name: 'search' }
+                    ]
+                },
+                {
+                    type: 'XT-Series',
+                    id: 'xtremio_series_new',
+                    name: 'New',
+                    extra: [
+                        { name: 'genre', options: seriesGenres, isRequired: true },
+                        { name: 'skip' },
+                        { name: 'search' }
+                    ]
+                },
+                {
+                    type: 'XT-Series',
+                    id: 'xtremio_series_featured',
+                    name: 'Featured',
+                    extra: [
+                        { name: 'genre', options: seriesGenres, isRequired: true },
+                        { name: 'skip' },
+                        { name: 'search' }
+                    ]
                 }
             );
         } catch (e) {
@@ -101,7 +132,10 @@ async function getManifest() {
                 { type: 'XT-Live', id: 'xtremio_live', name: 'All' },
                 { type: 'XT-Movies', id: 'xtremio_movies_popular', name: 'Popular' },
                 { type: 'XT-Movies', id: 'xtremio_movies_new', name: 'New' },
-                { type: 'XT-Movies', id: 'xtremio_movies_featured', name: 'Featured' }
+                { type: 'XT-Movies', id: 'xtremio_movies_featured', name: 'Featured' },
+                { type: 'XT-Series', id: 'xtremio_series_popular', name: 'Popular' },
+                { type: 'XT-Series', id: 'xtremio_series_new', name: 'New' },
+                { type: 'XT-Series', id: 'xtremio_series_featured', name: 'Featured' }
             );
         }
     }
@@ -112,7 +146,7 @@ async function getManifest() {
         name: 'xTremio',
         description: 'xTremio addon for Stremio',
         resources: ['catalog', 'meta', 'stream'],
-        types: ['XT-Live', 'XT-Movies'],
+        types: ['XT-Live', 'XT-Movies', 'XT-Series'],
         catalogs,
         idPrefixes: ['xtremio_'],
         behaviorHints: {
@@ -150,18 +184,20 @@ async function xtremioGet(action, extraParams = '') {
     }
 }
 
-let catCache = { live: [], movies: [], ts: 0 };
+let catCache = { live: [], movies: [], series: [], ts: 0 };
 const CACHE_TTL = 5 * 60 * 1000;
 
 async function getCategories() {
-    if (catCache.ts > Date.now() - CACHE_TTL && catCache.live.length && catCache.movies.length) return catCache;
-    const [live, movies] = await Promise.all([
+    if (catCache.ts > Date.now() - CACHE_TTL && catCache.live.length && catCache.movies.length && catCache.series.length) return catCache;
+    const [live, movies, series] = await Promise.all([
         xtremioGet('get_live_categories'),
-        xtremioGet('get_vod_categories')
+        xtremioGet('get_vod_categories'),
+        xtremioGet('get_series_categories')
     ]);
     catCache = {
         live: Array.isArray(live) ? live : [],
         movies: Array.isArray(movies) ? movies : [],
+        series: Array.isArray(series) ? series : [],
         ts: Date.now()
     };
     return catCache;
@@ -481,6 +517,45 @@ app.get('/catalog/:type/:id/:extra?.json', async (req, res) => {
             return res.json({ metas });
         }
 
+        if (id.startsWith('xtremio_series_')) {
+            const cats = await getCategories();
+            const selectedGenre = (genre && genre !== 'Top') ? genre : (cats.series[0] && cats.series[0].category_name);
+            const cat = cats.series.find(c => c.category_name === selectedGenre);
+            if (!cat) return res.json({ metas: [] });
+
+            const catParam = `&category_id=${cat.category_id}`;
+            let items = await getCachedStreams('get_series', catParam);
+
+            if (extra.search) {
+                const q = extra.search.toLowerCase();
+                items = items.filter(s => s.name?.toLowerCase().includes(q));
+            }
+
+            if (id === 'xtremio_series_new') {
+                items = [...items].sort((a, b) => (parseInt(b.last_modified) || 0) - (parseInt(a.last_modified) || 0));
+            } else if (id === 'xtremio_series_popular') {
+                items = [...items].sort((a, b) => (parseFloat(b.rating) || 0) - (parseFloat(a.rating) || 0));
+            } else if (id === 'xtremio_series_featured') {
+                const daySeed = Math.floor(Date.now() / 86400000);
+                items = [...items].sort((a, b) => {
+                    const ha = ((parseInt(a.series_id) || 0) * 2654435761 + daySeed) & 0x7fffffff;
+                    const hb = ((parseInt(b.series_id) || 0) * 2654435761 + daySeed) & 0x7fffffff;
+                    return ha - hb;
+                });
+            }
+
+            const page = items.slice(skip, skip + PAGE_SIZE);
+            const metas = page.map(s => ({
+                id: `xtremio_series_${s.series_id}`,
+                type: 'XT-Series',
+                name: s.name,
+                poster: s.cover || undefined,
+                posterShape: 'poster'
+            }));
+
+            return res.json({ metas });
+        }
+
         res.json({ metas: [] });
     } catch (e) {
         res.json({ metas: [] });
@@ -546,6 +621,50 @@ app.get('/meta/:type/:id.json', async (req, res) => {
             });
         }
 
+        if (id.startsWith('xtremio_series_')) {
+            const seriesId = id.replace('xtremio_series_', '');
+            const info = await xtremioGet('get_series_info', `&series_id=${seriesId}`);
+            const series = info?.info ?? info ?? {};
+            const cast = series.cast ? series.cast.split(',').map(c => c.trim()).filter(Boolean) : [];
+            const backdrop = Array.isArray(series.backdrop_path) && series.backdrop_path[0] ? series.backdrop_path[0] : undefined;
+
+            const videos = [];
+            const episodes = info?.episodes ?? {};
+            for (const [seasonNum, eps] of Object.entries(episodes)) {
+                if (!Array.isArray(eps)) continue;
+                for (const ep of eps) {
+                    videos.push({
+                        id: `xtremio_episode_${seriesId}:${seasonNum}:${ep.id}`,
+                        title: ep.title || `Episode ${ep.episode_num}`,
+                        season: parseInt(seasonNum),
+                        episode: parseInt(ep.episode_num) || 1,
+                        released: ep.info?.releasedate ? new Date(ep.info.releasedate).toISOString() : undefined,
+                        overview: ep.info?.plot || undefined
+                    });
+                }
+            }
+
+            return res.json({
+                meta: {
+                    id: `xtremio_series_${seriesId}`,
+                    type: 'XT-Series',
+                    name: series.name || 'Unknown',
+                    poster: series.cover || undefined,
+                    posterShape: 'poster',
+                    background: backdrop,
+                    description: series.plot || undefined,
+                    releaseInfo: series.releaseDate ? String(series.releaseDate) : undefined,
+                    genres: series.genre ? series.genre.split(',').map(g => g.trim()).filter(Boolean) : [],
+                    runtime: series.episode_run_time ? String(series.episode_run_time) + ' min' : undefined,
+                    director: series.director || undefined,
+                    cast,
+                    imdbRating: series.rating ? String(series.rating) : undefined,
+                    year: series.releaseDate ? parseInt(String(series.releaseDate).slice(0, 4)) : undefined,
+                    videos
+                }
+            });
+        }
+
         res.json({ meta: null });
     } catch (e) {
         res.json({ meta: null });
@@ -572,6 +691,24 @@ app.get('/stream/:type/:id.json', async (req, res) => {
         res.json({
             streams: [
                 { url: `${serverUrl}/movie/${username}/${password}/${streamId}.${ext}`, title: 'Movie' }
+            ]
+        });
+    } else if (id.startsWith('xtremio_episode_')) {
+        // Format: xtremio_episode_{seriesId}:{season}:{episodeId}
+        const parts = id.replace('xtremio_episode_', '').split(':');
+        const seriesId = parts[0];
+        const episodeId = parts[2];
+        const info = await xtremioGet('get_series_info', `&series_id=${seriesId}`);
+        let ext = 'mp4';
+        const episodes = info?.episodes ?? {};
+        for (const eps of Object.values(episodes)) {
+            if (!Array.isArray(eps)) continue;
+            const ep = eps.find(e => String(e.id) === episodeId);
+            if (ep) { ext = ep.container_extension || 'mp4'; break; }
+        }
+        res.json({
+            streams: [
+                { url: `${serverUrl}/series/${username}/${password}/${episodeId}.${ext}`, title: 'Episode' }
             ]
         });
     } else {
