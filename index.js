@@ -125,6 +125,22 @@ async function getManifest() {
                         { name: 'skip' },
                         { name: 'search' }
                     ]
+                },
+                {
+                    type: 'movie',
+                    id: 'xtremio_search_movie',
+                    name: 'Search Results',
+                    extra: [
+                        { name: 'search', isRequired: true }
+                    ]
+                },
+                {
+                    type: 'series',
+                    id: 'xtremio_search_series',
+                    name: 'Search Results',
+                    extra: [
+                        { name: 'search', isRequired: true }
+                    ]
                 }
             );
         } catch (e) {
@@ -135,7 +151,9 @@ async function getManifest() {
                 { type: 'XT-Movies', id: 'xtremio_movies_featured', name: 'Featured' },
                 { type: 'XT-Series', id: 'xtremio_series_popular', name: 'Popular' },
                 { type: 'XT-Series', id: 'xtremio_series_new', name: 'New' },
-                { type: 'XT-Series', id: 'xtremio_series_featured', name: 'Featured' }
+                { type: 'XT-Series', id: 'xtremio_series_featured', name: 'Featured' },
+                { type: 'movie', id: 'xtremio_search_movie', name: 'Search Results', extra: [{ name: 'search', isRequired: true }] },
+                { type: 'series', id: 'xtremio_search_series', name: 'Search Results', extra: [{ name: 'search', isRequired: true }] }
             );
         }
     }
@@ -556,6 +574,40 @@ app.get('/catalog/:type/:id/:extra?.json', async (req, res) => {
             return res.json({ metas });
         }
 
+        if (id === 'xtremio_search_movie' && extra.search) {
+            const { data: allVod } = await getAllVodStreams();
+            const q = extra.search.toLowerCase();
+            const items = allVod.filter(s => s.name?.toLowerCase().includes(q));
+            
+            const page = items.slice(skip, skip + PAGE_SIZE);
+            const metas = page.map(s => ({
+                id: `xtremio_movie_${s.stream_id}`,
+                type: 'movie',
+                name: s.name,
+                poster: s.stream_icon || undefined,
+                posterShape: 'poster'
+            }));
+
+            return res.json({ metas });
+        }
+
+        if (id === 'xtremio_search_series' && extra.search) {
+            const { data: allSeries } = await getAllSeries();
+            const q = extra.search.toLowerCase();
+            const items = allSeries.filter(s => s.name?.toLowerCase().includes(q));
+            
+            const page = items.slice(skip, skip + PAGE_SIZE);
+            const metas = page.map(s => ({
+                id: `xtremio_series_${s.series_id}`,
+                type: 'series',
+                name: s.name,
+                poster: s.cover || undefined,
+                posterShape: 'poster'
+            }));
+
+            return res.json({ metas });
+        }
+
         res.json({ metas: [] });
     } catch (e) {
         res.json({ metas: [] });
@@ -598,7 +650,7 @@ app.get('/meta/:type/:id.json', async (req, res) => {
             return res.json({
                 meta: {
                     id: `xtremio_movie_${streamId}`,
-                    type: 'XT-Movies',
+                    type: type === 'movie' ? 'movie' : 'XT-Movies',
                     name: movie.name || movie.o_name || 'Unknown',
                     poster: movie.cover_big || movie.movie_image || undefined,
                     posterShape: 'poster',
@@ -643,7 +695,7 @@ app.get('/meta/:type/:id.json', async (req, res) => {
             return res.json({
                 meta: {
                     id: `xtremio_series_${seriesId}`,
-                    type: 'XT-Series',
+                    type: type === 'series' ? 'series' : 'XT-Series',
                     name: series.name || 'Unknown',
                     poster: series.cover || undefined,
                     posterShape: 'poster',
