@@ -8,16 +8,31 @@ const app = express();
 app.use(express.urlencoded({ extended: true }));
 app.use((req, res, next) => {
     res.setHeader('Access-Control-Allow-Origin', '*');
+    res.setHeader('Access-Control-Allow-Headers', 'Content-Type');
+    res.setHeader('Access-Control-Allow-Methods', 'GET, POST, OPTIONS');
+    if (req.method === 'OPTIONS') return res.sendStatus(200);
     next();
 });
 
 const PORT = process.env.PORT || 3000;
+const HOST = process.env.HOST || '0.0.0.0';
 const ADDON_ID = 'org.xtremio.addon';
+
+function getBaseUrl(req) {
+    const proto = req.headers['x-forwarded-proto'] || req.protocol || 'http';
+    const host = req.headers['x-forwarded-host'] || req.headers.host || `localhost:${PORT}`;
+    return `${proto}://${host}`;
+}
+
+function escapeHtml(str) {
+    return String(str || '').replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;').replace(/'/g, '&#039;');
+}
 
 let config = {
     serverUrl: '',
     username: '',
-    password: ''
+    password: '',
+    hideCustomVOD: false
 };
 
 function loadConfig() {
@@ -43,8 +58,7 @@ function saveConfig() {
 
 loadConfig();
 
-
-async function getManifest() {
+async function getManifest(baseUrl = `http://localhost:${PORT}`) {
     const isConfigured = config.serverUrl && config.username && config.password;
     const catalogs = [];
 
@@ -57,9 +71,9 @@ async function getManifest() {
 
             catalogs.push(
                 {
-                    type: 'XT-Live',
+                    type: 'Live TV',
                     id: 'xtremio_live',
-                    name: 'All',
+                    name: 'Live TV',
                     extra: [
                         { name: 'genre', options: liveGenres, isRequired: true },
                         { name: 'skip' },
@@ -145,7 +159,7 @@ async function getManifest() {
             );
         } catch (e) {
             catalogs.push(
-                { type: 'XT-Live', id: 'xtremio_live', name: 'All' },
+                { type: 'Live TV', id: 'xtremio_live', name: 'Live TV' },
                 { type: 'XT-Movies', id: 'xtremio_movies_popular', name: 'Popular' },
                 { type: 'XT-Movies', id: 'xtremio_movies_new', name: 'New' },
                 { type: 'XT-Movies', id: 'xtremio_movies_featured', name: 'Featured' },
@@ -164,19 +178,19 @@ async function getManifest() {
         name: 'xTremio',
         description: 'xTremio addon for Stremio',
         resources: ['catalog', 'meta', 'stream'],
-        types: ['XT-Live', 'XT-Movies', 'XT-Series', 'movie', 'series'],
-        catalogs,
+        types: config.hideCustomVOD ? ['Live TV', 'movie', 'series'] : ['Live TV', 'XT-Movies', 'XT-Series', 'movie', 'series'],
+        catalogs: config.hideCustomVOD ? catalogs.filter(c => c.type !== 'XT-Movies' && c.type !== 'XT-Series') : catalogs,
         idPrefixes: ['xtremio_', 'tt'],
         behaviorHints: {
             configurable: true,
             configurationRequired: !isConfigured
         },
-        config: { url: `http://127.0.0.1:${PORT}/configure` }
+        config: { url: `${baseUrl}/configure` }
     };
 }
 
 app.get('/manifest.json', async (req, res) => {
-    res.json(await getManifest());
+    res.json(await getManifest(getBaseUrl(req)));
 });
 
 function normalizeUrl(url) {
@@ -193,8 +207,7 @@ async function xtremioGet(action, extraParams = '') {
         const res = await fetch(url, { signal: controller.signal, redirect: 'follow' });
         const data = await res.json();
 
-        const sample = Array.isArray(data) ? data.slice(0, 10) : data;
-        console.log(`[xtremioGet] ${action} (${Array.isArray(data) ? data.length : '?'} items)`, JSON.stringify(sample, null, 2));
+        console.log(`[xtremioGet] ${action} (${Array.isArray(data) ? data.length : '?'} items)`);
 
         return data;
     } finally {
@@ -206,7 +219,7 @@ let catCache = { live: [], movies: [], series: [], ts: 0 };
 const CACHE_TTL = 5 * 60 * 1000;
 
 async function getCategories() {
-    if (catCache.ts > Date.now() - CACHE_TTL && catCache.live.length && catCache.movies.length && catCache.series.length) return catCache;
+    if (catCache.ts > Date.now() - CACHE_TTL) return catCache;
     const [live, movies, series] = await Promise.all([
         xtremioGet('get_live_categories'),
         xtremioGet('get_vod_categories'),
@@ -235,6 +248,7 @@ function parseExtra(extra) {
 const PAGE_SIZE = 100;
 
 const streamCache = new Map();
+const MAX_STREAM_CACHE = 500;
 
 async function getCachedStreams(action, catParam = '') {
     const key = `${action}${catParam}`;
@@ -242,6 +256,10 @@ async function getCachedStreams(action, catParam = '') {
     if (cached && cached.ts > Date.now() - CACHE_TTL) return cached.data;
     const data = await xtremioGet(action, catParam);
     const items = Array.isArray(data) ? data : [];
+    if (streamCache.size >= MAX_STREAM_CACHE) {
+        const oldest = streamCache.keys().next().value;
+        streamCache.delete(oldest);
+    }
     streamCache.set(key, { data: items, ts: Date.now() });
     return items;
 }
@@ -298,21 +316,29 @@ async function validateXtremioCredentials(serverUrl, username, password) {
     return { valid: false, error: 'Cannot connect to server' };
 }
 
-function renderConfigPage({ serverUrl = '', username = '', password = '', status = null }) {
+function renderConfigPage({ serverUrl = '', username = '', password = '', hideCustomVOD = false, status = null, baseUrl = `http://localhost:${PORT}` }) {
+    const safeServerUrl = escapeHtml(serverUrl);
+    const safeUsername = escapeHtml(username);
+    const safePassword = escapeHtml(password);
     let statusHtml = '';
     if (status) {
         if (status.valid) {
-            const installUrl = `stremio://127.0.0.1:${PORT}/manifest.json`;
+            const installUrl = `stremio://${baseUrl.replace(/^https?:\/\//, '')}/manifest.json`;
+            const httpUrl = `${baseUrl}/manifest.json`;
             statusHtml = `
                 <div class="status-section">
                     <div class="status-banner status-success">
                         <svg fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="3" d="M5 13l4 4L19 7"/></svg>
-                        <span class="status-text">Connected! Welcome, ${status.userInfo.username || username}</span>
+                        <span class="status-text">Connected! Welcome, ${escapeHtml(status.userInfo.username || username)}</span>
                     </div>
                     <a href="${installUrl}" class="btn full install-link">
                         <svg fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M4 16v1a3 3 0 003 3h10a3 3 0 003-3v-1m-4-4l-4 4m0 0l-4-4m4 4V4"/></svg>
                         Install in Stremio
                     </a>
+                    <div style="margin-top: 16px;">
+                        <p style="font-size: 13px; color: #555; margin-bottom: 8px; font-weight: 600; text-align: left;">Or copy this link to install:</p>
+                        <input type="text" value="${httpUrl}" readonly onclick="this.select(); document.execCommand('copy'); const p = this.previousElementSibling; const orig = p.innerText; p.innerText = '✓ Copied to clipboard!'; p.style.color = '#2e7d32'; setTimeout(() => { p.innerText = orig; p.style.color = '#555'; }, 2000);" style="width: 100%; padding: 12px; border: 2px solid #e0e0e0; border-radius: 10px; font-size: 14px; color: #333; background: #f9f9f9; cursor: pointer; text-align: center; transition: border-color 0.2s;" title="Click to copy install link" onmouseover="this.style.borderColor='#7c4dff'" onmouseout="this.style.borderColor='#e0e0e0'" />
+                    </div>
                 </div>`;
         } else {
             statusHtml = `
@@ -388,22 +414,26 @@ function renderConfigPage({ serverUrl = '', username = '', password = '', status
                         <label>Server URL</label>
                         <div class="input-wrapper">
                             <svg fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M21 12a9 9 0 01-9 9m9-9a9 9 0 00-9-9m9 9H3m9 9a9 9 0 01-9-9m9 9c1.657 0 3-4.03 3-9s-1.343-9-3-9m0 18c-1.657 0-3-4.03-3-9s1.343-9 3-9m-9 9a9 9 0 019-9"/></svg>
-                            <input type="url" name="serverUrl" value="${serverUrl}" placeholder="http://example.com:port" required />
+                            <input type="url" name="serverUrl" value="${safeServerUrl}" placeholder="http://example.com:port" required />
                         </div>
                     </div>
                     <div class="input-group">
                         <label>Username</label>
                         <div class="input-wrapper">
                             <svg fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M16 7a4 4 0 11-8 0 4 4 0 018 0zM12 14a7 7 0 00-7 7h14a7 7 0 00-7-7z"/></svg>
-                            <input type="text" name="username" value="${username}" placeholder="Enter username" required />
+                            <input type="text" name="username" value="${safeUsername}" placeholder="Enter username" required />
                         </div>
                     </div>
                     <div class="input-group">
                         <label>Password</label>
                         <div class="input-wrapper">
                             <svg fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M12 15v2m-6 4h12a2 2 0 002-2v-6a2 2 0 00-2-2H6a2 2 0 00-2 2v6a2 2 0 002 2zm10-10V7a4 4 0 00-8 0v4h8z"/></svg>
-                            <input type="password" name="password" value="${password}" placeholder="Enter password" required />
+                            <input type="password" name="password" value="${safePassword}" placeholder="Enter password" required />
                         </div>
+                    </div>
+                    <div class="input-group" style="display: flex; align-items: center; gap: 10px; margin-top: -5px; padding-left: 5px;">
+                        <input type="checkbox" name="hideCustomVOD" id="hideCustomVOD" value="true" ${hideCustomVOD ? 'checked' : ''} style="width: 18px; height: 18px; cursor: pointer;" />
+                        <label for="hideCustomVOD" style="margin-bottom: 0; cursor: pointer; display: inline; font-size: 13px;">Show only Live TV and Cinemeta globally</label>
                     </div>
                     <button type="submit" class="btn full">Save & Install</button>
                 </form>
@@ -417,7 +447,9 @@ app.get('/configure', (req, res) => {
     res.send(renderConfigPage({
         serverUrl: req.query.serverUrl || config.serverUrl,
         username: req.query.username || config.username,
-        password: req.query.password || config.password
+        password: req.query.password || config.password,
+        hideCustomVOD: config.hideCustomVOD,
+        baseUrl: getBaseUrl(req)
     }));
 });
 
@@ -425,6 +457,7 @@ app.post('/configure', async (req, res) => {
     const serverUrl = (req.body.serverUrl || '').trim().replace(/\/+$/, '');
     const username = req.body.username || '';
     const password = req.body.password || '';
+    const hideCustomVOD = req.body.hideCustomVOD === 'true';
 
     try {
         const validation = await validateXtremioCredentials(serverUrl, username, password);
@@ -433,6 +466,7 @@ app.post('/configure', async (req, res) => {
             config.serverUrl = validation.resolvedUrl || normalizeUrl(serverUrl);
             config.username = username;
             config.password = password;
+            config.hideCustomVOD = hideCustomVOD;
             config.maxConnections = validation.maxConnections;
             config.expDate = validation.expDate;
             saveConfig();
@@ -445,14 +479,18 @@ app.post('/configure', async (req, res) => {
             serverUrl: validation.valid ? config.serverUrl : serverUrl,
             username,
             password,
-            status: validation
+            hideCustomVOD: validation.valid ? config.hideCustomVOD : hideCustomVOD,
+            status: validation,
+            baseUrl: getBaseUrl(req)
         }));
     } catch (e) {
         res.send(renderConfigPage({
             serverUrl,
             username,
             password,
-            status: { valid: false, error: 'Something went wrong. Please try again.' }
+            hideCustomVOD,
+            status: { valid: false, error: 'Something went wrong. Please try again.' },
+            baseUrl: getBaseUrl(req)
         }));
     }
 });
@@ -486,7 +524,7 @@ app.get('/catalog/:type/:id/:extra?.json', async (req, res) => {
             const page = items.slice(skip, skip + PAGE_SIZE);
             const metas = page.map(s => ({
                 id: `xtremio_live_${s.stream_id}`,
-                type: 'XT-Live',
+                type: 'Live TV',
                 name: s.name,
                 poster: s.stream_icon || undefined,
                 posterShape: 'square'
@@ -610,6 +648,7 @@ app.get('/catalog/:type/:id/:extra?.json', async (req, res) => {
 
         res.json({ metas: [] });
     } catch (e) {
+        console.error('[catalog] Error:', e.message);
         res.json({ metas: [] });
     }
 });
@@ -629,13 +668,12 @@ app.get('/meta/:type/:id.json', async (req, res) => {
             return res.json({
                 meta: {
                     id: `xtremio_live_${s.stream_id}`,
-                    type: 'XT-Live',
+                    type: 'Live TV',
                     name: s.name,
                     poster: s.stream_icon || undefined,
                     posterShape: 'square',
                     genres: s.category_name ? [s.category_name] : [],
-                    description: s.name || undefined,
-                    logo: s.stream_icon || undefined
+                    description: s.name || undefined
                 }
             });
         }
@@ -715,6 +753,7 @@ app.get('/meta/:type/:id.json', async (req, res) => {
 
         res.json({ meta: null });
     } catch (e) {
+        console.error('[meta] Error:', e.message);
         res.json({ meta: null });
     }
 });
@@ -938,8 +977,10 @@ app.get('/stream/:type/:id.json', async (req, res) => {
 
     if (id.startsWith('xtremio_movie_')) {
         const streamId = id.replace('xtremio_movie_', '');
-        const info = await xtremioGet('get_vod_info', `&vod_id=${streamId}`);
-        const ext = info?.movie_data?.container_extension || 'mp4';
+        // Try cached VOD list first for extension, fall back to API call
+        const { data: allVod } = await getAllVodStreams();
+        const cached = allVod.find(v => String(v.stream_id) === streamId);
+        const ext = cached?.container_extension || (await xtremioGet('get_vod_info', `&vod_id=${streamId}`))?.movie_data?.container_extension || 'mp4';
         return res.json({
             streams: [
                 { url: `${serverUrl}/movie/${username}/${password}/${streamId}.${ext}`, title: '▶ xTremio' }
@@ -1060,14 +1101,29 @@ app.get('/stream/:type/:id.json', async (req, res) => {
 });
 
 app.get('/', (req, res) => {
+    const base = getBaseUrl(req);
     res.json({
         message: 'xTremio addon is running',
-        configureUrl: `http://127.0.0.1:${PORT}/configure`,
-        manifestUrl: `http://127.0.0.1:${PORT}/manifest.json`
+        configureUrl: `${base}/configure`,
+        manifestUrl: `${base}/manifest.json`
     });
 });
 
-app.listen(PORT, () => {
-    console.log(`Addon running at http://127.0.0.1:${PORT}`);
-    console.log(`Configure: http://127.0.0.1:${PORT}/configure`);
+const server = app.listen(PORT, HOST, () => {
+    console.log(`Addon running at http://${HOST === '0.0.0.0' ? 'localhost' : HOST}:${PORT}`);
+    console.log(`Configure: http://localhost:${PORT}/configure`);
 });
+
+server.on('error', (err) => {
+    if (err.code === 'EADDRINUSE') {
+        console.error(`Port ${PORT} is already in use. Kill the existing process or use a different port: PORT=3001 npm start`);
+    } else {
+        console.error('Server error:', err.message);
+    }
+    process.exit(1);
+});
+
+process.on('SIGTERM', () => { console.log('SIGTERM received, shutting down...'); server.close(() => process.exit(0)); });
+process.on('SIGINT', () => { console.log('SIGINT received, shutting down...'); server.close(() => process.exit(0)); });
+process.on('uncaughtException', (err) => { console.error('Uncaught exception:', err); });
+process.on('unhandledRejection', (err) => { console.error('Unhandled rejection:', err); });
