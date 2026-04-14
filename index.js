@@ -146,9 +146,9 @@ async function getManifest() {
         name: 'xTremio',
         description: 'xTremio addon for Stremio',
         resources: ['catalog', 'meta', 'stream'],
-        types: ['XT-Live', 'XT-Movies', 'XT-Series'],
+        types: ['XT-Live', 'XT-Movies', 'XT-Series', 'movie', 'series'],
         catalogs,
-        idPrefixes: ['xtremio_'],
+        idPrefixes: ['xtremio_', 'tt'],
         behaviorHints: {
             configurable: true,
             configurationRequired: !isConfigured
@@ -569,14 +569,10 @@ app.get('/meta/:type/:id.json', async (req, res) => {
     try {
         if (id.startsWith('xtremio_live_')) {
             const streamId = id.replace('xtremio_live_', '');
-            // Search across all cached category streams to find the channel
-            const cats = await getCategories();
-            let s = null;
-            for (const cat of cats.live) {
-                const items = await getCachedStreams('get_live_streams', `&category_id=${cat.category_id}`);
-                s = items.find(i => String(i.stream_id) === streamId);
-                if (s) break;
-            }
+            // Search across all live streams in one go instead of fetching category by category sequentially
+            const allLive = await getCachedStreams('get_live_streams', '');
+            let s = allLive.find(i => String(i.stream_id) === streamId);
+            
             if (!s) return res.json({ meta: null });
             return res.json({
                 meta: {
@@ -671,29 +667,235 @@ app.get('/meta/:type/:id.json', async (req, res) => {
     }
 });
 
+// --- IMDb → TMDB ID conversion using Cinemeta (free, no API key) ---
+
+const imdbToTmdbCache = new Map();
+
+async function imdbToTmdbId(imdbId, requestedType) {
+    const cached = imdbToTmdbCache.get(imdbId);
+    if (cached && cached.ts > Date.now() - 24 * 60 * 60 * 1000) return cached.data;
+
+    let result = null;
+
+    // Try Cinemeta (Stremio's free metadata API) — gives us moviedb_id (= TMDB ID)
+    // We only check the requestedType (movie or series) to save time
+    try {
+        const url = `https://v3-cinemeta.strem.io/meta/${requestedType}/${imdbId}.json`;
+        const controller = new AbortController();
+        const timer = setTimeout(() => controller.abort(), 8000);
+        const res = await fetch(url, { signal: controller.signal });
+        clearTimeout(timer);
+        const data = await res.json();
+        const meta = data?.meta;
+        if (meta && meta.name) {
+            const yearStr = meta.year || meta.released;
+            let year = null;
+            if (yearStr) {
+                const m = String(yearStr).match(/(\d{4})/);
+                if (m) year = parseInt(m[1]);
+            }
+            result = {
+                tmdbId: meta.moviedb_id || null,
+                title: meta.name,
+                year,
+                type: requestedType
+            };
+            console.log(`[imdbToTmdb] ${imdbId} → TMDB ${result.tmdbId || 'N/A'} "${result.title}" (${requestedType})`);
+        }
+    } catch (e) {
+        // Skip
+    }
+
+    // Fallback: IMDb suggestion API (no TMDB ID, but gives title + year for name matching)
+    if (!result) {
+        try {
+            const url = `https://v3.sg.media-imdb.com/suggestion/t/${imdbId}.json`;
+            const res = await fetch(url);
+            const data = await res.json();
+            const r = data?.d?.[0];
+            if (r) {
+                result = { tmdbId: null, title: r.l, year: r.y || null, type: r.qid === 'tvSeries' ? 'series' : 'movie' };
+                console.log(`[imdbToTmdb] ${imdbId} → "${result.title}" (${result.type}, no TMDB ID, name-match only)`);
+            }
+        } catch (e) {
+            console.log(`[imdbToTmdb] All lookups failed for ${imdbId}:`, e.message);
+        }
+    }
+
+    imdbToTmdbCache.set(imdbId, { data: result, ts: Date.now() });
+    return result;
+}
+
+// --- Xtream content caches with TMDB index ---
+
+const vodListCache = { data: null, tmdbIndex: null, imdbIndex: null, ts: 0 };
+
+async function getAllVodStreams() {
+    if (vodListCache.data && vodListCache.ts > Date.now() - CACHE_TTL) return vodListCache;
+    const data = await xtremioGet('get_vod_streams');
+    const items = Array.isArray(data) ? data : [];
+    // Build ID indexes for O(1) lookup
+    const tmdbIndex = new Map();
+    const imdbIndex = new Map();
+    for (const vod of items) {
+        const tmdbId = vod.tmdb || vod.tmdb_id;
+        if (tmdbId) tmdbIndex.set(String(tmdbId).trim(), vod);
+        
+        let imdbId = vod.imdb || vod.imdb_id;
+        if (imdbId) {
+            imdbId = String(imdbId).trim();
+            imdbIndex.set(imdbId, vod);
+            // Some providers omit the 'tt' prefix, so we index both formats just in case
+            if (!imdbId.startsWith('tt')) imdbIndex.set('tt' + imdbId, vod);
+        }
+    }
+    vodListCache.data = items;
+    vodListCache.tmdbIndex = tmdbIndex;
+    vodListCache.imdbIndex = imdbIndex;
+    vodListCache.ts = Date.now();
+    console.log(`[cache] VOD: ${items.length} items, ${tmdbIndex.size} with TMDB, ${imdbIndex.size} with IMDb IDs`);
+    return vodListCache;
+}
+
+const seriesListCache = { data: null, tmdbIndex: null, imdbIndex: null, ts: 0 };
+
+async function getAllSeries() {
+    if (seriesListCache.data && seriesListCache.ts > Date.now() - CACHE_TTL) return seriesListCache;
+    const data = await xtremioGet('get_series');
+    const items = Array.isArray(data) ? data : [];
+    // Build ID indexes for O(1) lookup
+    const tmdbIndex = new Map();
+    const imdbIndex = new Map();
+    for (const s of items) {
+        const tmdbId = s.tmdb || s.tmdb_id;
+        if (tmdbId) tmdbIndex.set(String(tmdbId).trim(), s);
+        
+        let imdbId = s.imdb || s.imdb_id;
+        if (imdbId) {
+            imdbId = String(imdbId).trim();
+            imdbIndex.set(imdbId, s);
+            if (!imdbId.startsWith('tt')) imdbIndex.set('tt' + imdbId, s);
+        }
+    }
+    seriesListCache.data = items;
+    seriesListCache.tmdbIndex = tmdbIndex;
+    seriesListCache.imdbIndex = imdbIndex;
+    seriesListCache.ts = Date.now();
+    console.log(`[cache] Series: ${items.length} items, ${tmdbIndex.size} with TMDB, ${imdbIndex.size} with IMDb IDs`);
+    return seriesListCache;
+}
+
+function normalizeTitle(title) {
+    return (title || '').toLowerCase()
+        .replace(/[^a-z0-9\s]/g, '')
+        .replace(/\s+/g, ' ')
+        .trim();
+}
+
+function findByName(items, title, year) {
+    const normalized = normalizeTitle(title);
+    if (!normalized) return null;
+
+    let bestMatch = null;
+    for (const item of items) {
+        const itemName = normalizeTitle((item.name || '').replace(/\s*\(?\d{4}\)?\s*$/, ''));
+        if (itemName === normalized) {
+            // If year matches too, it's a definite match
+            if (year && (item.name || '').includes(String(year))) {
+                return item;
+            }
+            if (!bestMatch) bestMatch = item;
+        }
+    }
+    return bestMatch;
+}
+
+async function findVodByImdb(imdbId) {
+    const { data: allVod, tmdbIndex, imdbIndex } = await getAllVodStreams();
+
+    // 1. Primary: Direct match by IMDb ID (Fastest, avoids external request)
+    if (imdbIndex.has(imdbId)) {
+        const match = imdbIndex.get(imdbId);
+        console.log(`[findVod] IMDb ID ${imdbId} matched directly → "${match.name}"`);
+        return match;
+    }
+
+    // 2. Fallback: Lookup TMDB ID via Cinemeta
+    const tmdbInfo = await imdbToTmdbId(imdbId, 'movie');
+    if (!tmdbInfo) return null;
+
+    // 3. Match by TMDB ID
+    if (tmdbInfo.tmdbId && tmdbIndex.has(String(tmdbInfo.tmdbId))) {
+        const match = tmdbIndex.get(String(tmdbInfo.tmdbId));
+        console.log(`[findVod] TMDB ID ${tmdbInfo.tmdbId} matched → "${match.name}"`);
+        return match;
+    }
+
+    // 4. Last resort: match by title + year
+    const match = findByName(allVod, tmdbInfo.title, tmdbInfo.year);
+    if (match) {
+        console.log(`[findVod] Name matched "${tmdbInfo.title}" → "${match.name}"`);
+    }
+    return match;
+}
+
+async function findSeriesByImdb(imdbId) {
+    const { data: allSeries, tmdbIndex, imdbIndex } = await getAllSeries();
+
+    // 1. Primary: Direct match by IMDb ID (Fastest, avoids external request)
+    if (imdbIndex.has(imdbId)) {
+        const match = imdbIndex.get(imdbId);
+        console.log(`[findSeries] IMDb ID ${imdbId} matched directly → "${match.name}"`);
+        return match;
+    }
+
+    // 2. Fallback: Lookup TMDB ID via Cinemeta
+    const tmdbInfo = await imdbToTmdbId(imdbId, 'series');
+    if (!tmdbInfo) return null;
+
+    // 3. Match by TMDB ID
+    if (tmdbInfo.tmdbId && tmdbIndex.has(String(tmdbInfo.tmdbId))) {
+        const match = tmdbIndex.get(String(tmdbInfo.tmdbId));
+        console.log(`[findSeries] TMDB ID ${tmdbInfo.tmdbId} matched → "${match.name}"`);
+        return match;
+    }
+
+    // 4. Last resort: match by title + year
+    const match = findByName(allSeries, tmdbInfo.title, tmdbInfo.year);
+    if (match) {
+        console.log(`[findSeries] Name matched "${tmdbInfo.title}" → "${match.name}"`);
+    }
+    return match;
+}
+
 app.get('/stream/:type/:id.json', async (req, res) => {
     if (!config.serverUrl) return res.json({ streams: [] });
     const { type, id } = req.params;
     const { serverUrl, username, password } = config;
 
+    // --- Handle xTremio's own IDs ---
     if (id.startsWith('xtremio_live_')) {
         const streamId = id.replace('xtremio_live_', '');
-        res.json({
+        return res.json({
             streams: [
                 { url: `${serverUrl}/live/${username}/${password}/${streamId}.m3u8`, title: 'HLS' },
                 { url: `${serverUrl}/live/${username}/${password}/${streamId}.ts`, title: 'MPEG-TS' }
             ]
         });
-    } else if (id.startsWith('xtremio_movie_')) {
+    }
+
+    if (id.startsWith('xtremio_movie_')) {
         const streamId = id.replace('xtremio_movie_', '');
         const info = await xtremioGet('get_vod_info', `&vod_id=${streamId}`);
         const ext = info?.movie_data?.container_extension || 'mp4';
-        res.json({
+        return res.json({
             streams: [
-                { url: `${serverUrl}/movie/${username}/${password}/${streamId}.${ext}`, title: 'Movie' }
+                { url: `${serverUrl}/movie/${username}/${password}/${streamId}.${ext}`, title: '▶ xTremio' }
             ]
         });
-    } else if (id.startsWith('xtremio_episode_')) {
+    }
+
+    if (id.startsWith('xtremio_episode_')) {
         // Format: xtremio_episode_{seriesId}:{season}:{episodeId}
         const parts = id.replace('xtremio_episode_', '').split(':');
         const seriesId = parts[0];
@@ -706,14 +908,103 @@ app.get('/stream/:type/:id.json', async (req, res) => {
             const ep = eps.find(e => String(e.id) === episodeId);
             if (ep) { ext = ep.container_extension || 'mp4'; break; }
         }
-        res.json({
+        return res.json({
             streams: [
-                { url: `${serverUrl}/series/${username}/${password}/${episodeId}.${ext}`, title: 'Episode' }
+                { url: `${serverUrl}/series/${username}/${password}/${episodeId}.${ext}`, title: '▶ xTremio' }
             ]
         });
-    } else {
-        res.json({ streams: [] });
     }
+
+    // --- Handle IMDb IDs (like WatchHub) ---
+    // Stremio sends: "tt1234567" for movies, "tt1234567:1:3" for series episodes (imdb:season:episode)
+    if (id.startsWith('tt')) {
+        try {
+            // Parse the IMDb ID — for series episodes it comes as "tt1234567:season:episode"
+            const parts = id.split(':');
+            const imdbId = parts[0];
+            const requestedSeason = parts.length > 1 ? parseInt(parts[1]) : null;
+            const requestedEpisode = parts.length > 2 ? parseInt(parts[2]) : null;
+
+            if (type === 'movie') {
+                const match = await findVodByImdb(imdbId);
+                if (match) {
+                    const streamId = match.stream_id;
+                    const ext = match.container_extension || 'mp4';
+                    console.log(`[stream] IMDb ${imdbId} → movie "${match.name}" (stream_id: ${streamId})`);
+                    return res.json({
+                        streams: [{
+                            url: `${serverUrl}/movie/${username}/${password}/${streamId}.${ext}`,
+                            title: '▶ Play on xTremio',
+                            name: 'xTremio',
+                            behaviorHints: { notWebViewUrl: true }
+                        }]
+                    });
+                }
+            }
+
+            if (type === 'series') {
+                const match = await findSeriesByImdb(imdbId);
+                if (match) {
+                    const seriesId = match.series_id;
+                    const info = await xtremioGet('get_series_info', `&series_id=${seriesId}`);
+                    const episodes = info?.episodes ?? {};
+
+                    if (requestedSeason !== null && requestedEpisode !== null) {
+                        const seasonEps = episodes[String(requestedSeason)];
+                        if (Array.isArray(seasonEps)) {
+                            const ep = seasonEps.find(e => parseInt(e.episode_num) === requestedEpisode);
+                            if (ep) {
+                                const ext = ep.container_extension || 'mp4';
+                                console.log(`[stream] IMDb ${id} → "${match.name}" S${requestedSeason}E${requestedEpisode}`);
+                                return res.json({
+                                    streams: [{
+                                        url: `${serverUrl}/series/${username}/${password}/${ep.id}.${ext}`,
+                                        title: `▶ Play Episode on xTremio`,
+                                        name: 'xTremio',
+                                        behaviorHints: { 
+                                            notWebViewUrl: true,
+                                            bingeworthyGroup: `xtremio-${seriesId}`
+                                        }
+                                    }]
+                                });
+                            }
+                        }
+                        console.log(`[stream] IMDb ${id} → "${match.name}" found but S${requestedSeason}E${requestedEpisode} not available`);
+                        return res.json({ streams: [] });
+                    }
+
+                    // If no specific episode requested, return all episodes
+                    const streams = [];
+                    for (const [seasonNum, eps] of Object.entries(episodes)) {
+                        if (!Array.isArray(eps)) continue;
+                        for (const ep of eps) {
+                            const ext = ep.container_extension || 'mp4';
+                            streams.push({
+                                url: `${serverUrl}/series/${username}/${password}/${ep.id}.${ext}`,
+                                title: `▶ S${seasonNum}E${ep.episode_num} - ${ep.title || 'Episode ' + ep.episode_num}`,
+                                name: 'xTremio',
+                                behaviorHints: { 
+                                    notWebViewUrl: true,
+                                    bingeworthyGroup: `xtremio-${seriesId}`
+                                }
+                            });
+                        }
+                    }
+
+                    if (streams.length > 0) {
+                        console.log(`[stream] IMDb ${imdbId} → "${match.name}" (${streams.length} episodes)`);
+                        return res.json({ streams });
+                    }
+                }
+            }
+
+            console.log(`[stream] No xTremio match for IMDb ${id} (type: ${type})`);
+        } catch (e) {
+            console.error(`[stream] Error matching IMDb ${id}:`, e.message);
+        }
+    }
+
+    res.json({ streams: [] });
 });
 
 app.get('/', (req, res) => {
