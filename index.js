@@ -616,7 +616,7 @@ app.get('/catalog/:type/:id/:extra?.json', async (req, res) => {
             const { data: allVod } = await getAllVodStreams();
             const q = extra.search.toLowerCase();
             const items = allVod.filter(s => s.name?.toLowerCase().includes(q));
-            
+
             const page = items.slice(skip, skip + PAGE_SIZE);
             const metas = page.map(s => ({
                 id: `xtremio_movie_${s.stream_id}`,
@@ -633,7 +633,7 @@ app.get('/catalog/:type/:id/:extra?.json', async (req, res) => {
             const { data: allSeries } = await getAllSeries();
             const q = extra.search.toLowerCase();
             const items = allSeries.filter(s => s.name?.toLowerCase().includes(q));
-            
+
             const page = items.slice(skip, skip + PAGE_SIZE);
             const metas = page.map(s => ({
                 id: `xtremio_series_${s.series_id}`,
@@ -663,13 +663,13 @@ app.get('/meta/:type/:id.json', async (req, res) => {
             // Search across all live streams in one go instead of fetching category by category sequentially
             const allLive = await getCachedStreams('get_live_streams', '');
             let s = allLive.find(i => String(i.stream_id) === streamId);
-            
+
             if (!s) return res.json({ meta: null });
             return res.json({
                 meta: {
                     id: `xtremio_live_${s.stream_id}`,
                     type: 'Live TV',
-                    name: s.name,
+                    name: undefined,
                     poster: s.stream_icon || undefined,
                     posterShape: 'square',
                     genres: s.category_name ? [s.category_name] : [],
@@ -688,7 +688,7 @@ app.get('/meta/:type/:id.json', async (req, res) => {
             return res.json({
                 meta: {
                     id: `xtremio_movie_${streamId}`,
-                    type: type === 'movie' ? 'movie' : 'XT-Movies',
+                    type: 'movie',
                     name: movie.name || movie.o_name || 'Unknown',
                     poster: movie.cover_big || movie.movie_image || undefined,
                     posterShape: 'poster',
@@ -725,7 +725,8 @@ app.get('/meta/:type/:id.json', async (req, res) => {
                         season: parseInt(seasonNum),
                         episode: parseInt(ep.episode_num) || 1,
                         released: ep.info?.releasedate ? new Date(ep.info.releasedate).toISOString() : undefined,
-                        overview: ep.info?.plot || undefined
+                        overview: ep.info?.plot || undefined,
+                        thumbnail: ep.info?.movie_image || ep.container_image || undefined
                     });
                 }
             }
@@ -733,7 +734,7 @@ app.get('/meta/:type/:id.json', async (req, res) => {
             return res.json({
                 meta: {
                     id: `xtremio_series_${seriesId}`,
-                    type: type === 'series' ? 'series' : 'XT-Series',
+                    type: 'series',
                     name: series.name || 'Unknown',
                     poster: series.cover || undefined,
                     posterShape: 'poster',
@@ -831,7 +832,7 @@ async function getAllVodStreams() {
     for (const vod of items) {
         const tmdbId = vod.tmdb || vod.tmdb_id;
         if (tmdbId) tmdbIndex.set(String(tmdbId).trim(), vod);
-        
+
         let imdbId = vod.imdb || vod.imdb_id;
         if (imdbId) {
             imdbId = String(imdbId).trim();
@@ -860,7 +861,7 @@ async function getAllSeries() {
     for (const s of items) {
         const tmdbId = s.tmdb || s.tmdb_id;
         if (tmdbId) tmdbIndex.set(String(tmdbId).trim(), s);
-        
+
         let imdbId = s.imdb || s.imdb_id;
         if (imdbId) {
             imdbId = String(imdbId).trim();
@@ -983,7 +984,7 @@ app.get('/stream/:type/:id.json', async (req, res) => {
         const ext = cached?.container_extension || (await xtremioGet('get_vod_info', `&vod_id=${streamId}`))?.movie_data?.container_extension || 'mp4';
         return res.json({
             streams: [
-                { url: `${serverUrl}/movie/${username}/${password}/${streamId}.${ext}`, title: '▶ xTremio' }
+                { url: `${serverUrl}/movie/${username}/${password}/${streamId}.${ext}`, title: '▶ Play' }
             ]
         });
     }
@@ -1003,7 +1004,7 @@ app.get('/stream/:type/:id.json', async (req, res) => {
         }
         return res.json({
             streams: [
-                { url: `${serverUrl}/series/${username}/${password}/${episodeId}.${ext}`, title: '▶ xTremio' }
+                { url: `${serverUrl}/series/${username}/${password}/${episodeId}.${ext}`, title: '▶ Play' }
             ]
         });
     }
@@ -1027,7 +1028,7 @@ app.get('/stream/:type/:id.json', async (req, res) => {
                     return res.json({
                         streams: [{
                             url: `${serverUrl}/movie/${username}/${password}/${streamId}.${ext}`,
-                            title: '▶ Play on xTremio',
+                            title: '▶ Play',
                             name: 'xTremio',
                             behaviorHints: { notWebViewUrl: true }
                         }]
@@ -1052,9 +1053,9 @@ app.get('/stream/:type/:id.json', async (req, res) => {
                                 return res.json({
                                     streams: [{
                                         url: `${serverUrl}/series/${username}/${password}/${ep.id}.${ext}`,
-                                        title: `▶ Play Episode on xTremio`,
+                                        title: `▶ Play`,
                                         name: 'xTremio',
-                                        behaviorHints: { 
+                                        behaviorHints: {
                                             notWebViewUrl: true,
                                             bingeworthyGroup: `xtremio-${seriesId}`
                                         }
@@ -1076,7 +1077,7 @@ app.get('/stream/:type/:id.json', async (req, res) => {
                                 url: `${serverUrl}/series/${username}/${password}/${ep.id}.${ext}`,
                                 title: `▶ S${seasonNum}E${ep.episode_num} - ${ep.title || 'Episode ' + ep.episode_num}`,
                                 name: 'xTremio',
-                                behaviorHints: { 
+                                behaviorHints: {
                                     notWebViewUrl: true,
                                     bingeworthyGroup: `xtremio-${seriesId}`
                                 }
