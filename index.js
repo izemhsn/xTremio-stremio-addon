@@ -145,7 +145,7 @@ async function getManifest(baseUrl = `http://localhost:${PORT}`, cfg = null) {
         name: 'xTremio',
         description: 'xTremio addon for Stremio',
         resources: ['catalog', 'meta', 'stream'],
-        types: ['Live TV', 'XT-Movies', 'XT-Series'],
+        types: ['Live TV', 'XT-Movies', 'XT-Series', 'series'],
         catalogs,
         idPrefixes: ['xtremio_'],
         behaviorHints: {
@@ -221,6 +221,23 @@ async function getCategories(cfg) {
     return entry;
 }
 
+// Live streams cache - populated when browsing Live TV, used by meta endpoint
+const liveStreamsCache = new Map();
+const LIVE_STREAMS_CACHE_TTL = 30 * 60 * 1000;
+
+function getCachedLiveStreams(cfg) {
+    const key = cfg.serverUrl;
+    const cached = liveStreamsCache.get(key);
+    if (cached && cached.ts > Date.now() - LIVE_STREAMS_CACHE_TTL) {
+        return cached.data;
+    }
+    return null;
+}
+
+function setCachedLiveStreams(cfg, items) {
+    liveStreamsCache.set(cfg.serverUrl, { data: items, ts: Date.now() });
+}
+
 function parseExtra(extra) {
     const params = {};
     if (extra) {
@@ -257,13 +274,36 @@ function isUsableSeriesInfo(info) {
 const SERIES_INFO_MAX_ATTEMPTS = 3;
 const SERIES_INFO_BACKOFF_MS = 500;
 
+const seriesInfoCache = new Map();
+const SERIES_INFO_CACHE_TTL = 30 * 60 * 1000;
+
+function seriesInfoCacheKey(cfg, seriesId) {
+    return `${cfg.serverUrl}\n${cfg.username}\n${cfg.password}\n${seriesId}`;
+}
+
+function getCachedSeriesInfo(cfg, seriesId) {
+    const entry = seriesInfoCache.get(seriesInfoCacheKey(cfg, seriesId));
+    if (entry && entry.ts > Date.now() - SERIES_INFO_CACHE_TTL) return entry.data;
+    return null;
+}
+
+function setCachedSeriesInfo(cfg, seriesId, data) {
+    seriesInfoCache.set(seriesInfoCacheKey(cfg, seriesId), { data, ts: Date.now() });
+}
+
 async function getSeriesInfo(cfg, seriesId) {
+    const hit = getCachedSeriesInfo(cfg, seriesId);
+    if (hit) return hit;
+
     let lastInfo = null;
     let lastError = null;
     for (let attempt = 1; attempt <= SERIES_INFO_MAX_ATTEMPTS; attempt++) {
         try {
             const info = await xtremioGet(cfg, 'get_series_info', `&series_id=${seriesId}`, { timeoutMs: 8000 });
-            if (isUsableSeriesInfo(info)) return info;
+            if (isUsableSeriesInfo(info)) {
+                setCachedSeriesInfo(cfg, seriesId, info);
+                return info;
+            }
             lastInfo = info;
             console.warn(`[getSeriesInfo] attempt ${attempt}/${SERIES_INFO_MAX_ATTEMPTS} for series ${seriesId} returned unusable data`);
         } catch (e) {
@@ -510,8 +550,24 @@ app.get('/:config/catalog/:type/:id/:extra?.json', async (req, res) => {
                 if (cat) categoryId = cat.category_id;
             }
 
-            const catParam = categoryId ? `&category_id=${categoryId}` : '';
-            let items = await getStreams(cfg, 'get_live_streams', catParam);
+            // Fetch all live channels once, then filter in-memory by selected category.
+            let allItems = getCachedLiveStreams(cfg);
+            if (!allItems) {
+                allItems = await getStreams(cfg, 'get_live_streams', '');
+                setCachedLiveStreams(cfg, allItems);
+            }
+
+            let items = allItems;
+            if (categoryId) {
+                const catIdStr = String(categoryId);
+                const selectedGenreLower = (selectedGenre || '').toLowerCase();
+                items = allItems.filter(s => {
+                    if (s.category_id != null && s.category_id !== '') {
+                        return String(s.category_id) === catIdStr;
+                    }
+                    return selectedGenreLower && String(s.category_name || '').toLowerCase() === selectedGenreLower;
+                });
+            }
 
             if (extra.search) {
                 const q = extra.search.toLowerCase();
@@ -577,7 +633,7 @@ app.get('/:config/catalog/:type/:id/:extra?.json', async (req, res) => {
             if (!cat) return res.json({ metas: [] });
 
             const catParam = `&category_id=${cat.category_id}`;
-            let items = await getStreams(cfg, 'get_series_streams', catParam);
+            let items = await getStreams(cfg, 'get_series', catParam);
 
             if (extra.search) {
                 const q = extra.search.toLowerCase();
@@ -600,7 +656,7 @@ app.get('/:config/catalog/:type/:id/:extra?.json', async (req, res) => {
             const page = items.slice(skip, skip + PAGE_SIZE);
             const metas = page.map(s => ({
                 id: `xtremio_series_${s.series_id}`,
-                type: 'XT-Series',
+                type: 'series',
                 name: s.name,
                 poster: s.cover || undefined,
                 posterShape: 'poster'
@@ -625,9 +681,20 @@ app.get('/:config/meta/:type/:id.json', async (req, res) => {
     try {
         if (id.startsWith('xtremio_live_')) {
             const streamId = id.replace('xtremio_live_', '');
-            // Xtream has no per-channel live info endpoint; fetch the full channel list.
-            const allLive = await getStreams(cfg, 'get_live_streams', '');
-            const s = allLive.find(i => String(i.stream_id) === streamId);
+            // Try cached live streams first, fall back to fetching
+            let allLive = getCachedLiveStreams(cfg);
+            if (!allLive) {
+                allLive = await getStreams(cfg, 'get_live_streams', '');
+                setCachedLiveStreams(cfg, allLive);
+            }
+
+            let s = allLive.find(i => String(i.stream_id) === streamId);
+            if (!s) {
+                // Cache may be stale; refresh once and retry by ID.
+                allLive = await getStreams(cfg, 'get_live_streams', '');
+                setCachedLiveStreams(cfg, allLive);
+                s = allLive.find(i => String(i.stream_id) === streamId);
+            }
 
             if (!s) return res.json({ meta: null });
             const meta = {
@@ -691,7 +758,7 @@ app.get('/:config/meta/:type/:id.json', async (req, res) => {
                         title: ep.title || `Episode ${ep.episode_num}`,
                         season: parseInt(seasonNum),
                         episode: parseInt(ep.episode_num) || 1,
-                        released: toIsoDate(ep.info?.releasedate),
+                        released: toIsoDate(ep.info?.releasedate) || '1970-01-01T00:00:00.000Z',
                         overview: ep.info?.plot || undefined,
                         thumbnail: ep.info?.movie_image || undefined
                     });
@@ -709,7 +776,7 @@ app.get('/:config/meta/:type/:id.json', async (req, res) => {
 
             const meta = {
                 id: `xtremio_series_${seriesId}`,
-                type: 'XT-Series',
+                type: 'series',
                 name: series.name || 'Unknown',
                 poster: series.cover || undefined,
                 posterShape: 'poster',
