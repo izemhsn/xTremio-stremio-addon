@@ -957,6 +957,10 @@ app.get('/', (req, res) => {
     });
 });
 
+app.get('/health', (req, res) => {
+    res.json({ status: 'ok', uptime: process.uptime() });
+});
+
 const server = app.listen(PORT, HOST, () => {
     console.log(`Addon running at http://${HOST === '0.0.0.0' ? 'localhost' : HOST}:${PORT}`);
     console.log(`Configure: http://localhost:${PORT}/configure`);

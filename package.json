@@ -1,18 +1,36 @@
 {
   "name": "xtremio-stremio-addon",
-  "version": "1.0.0",
-  "description": "xTremio addon for Stremio - Live TV, Movies and Series",
+  "version": "1.0.1",
+  "description": "Stremio addon that exposes an Xtream Codes (IPTV) provider as Live TV, Movies and Series catalogs.",
   "main": "index.js",
   "scripts": {
-    "start": "node index.js"
+    "start": "node index.js",
+    "dev": "node --watch index.js"
   },
-  "keywords": ["stremio", "addon", "xtream", "iptv"],
-  "license": "ISC",
+  "keywords": [
+    "stremio",
+    "stremio-addon",
+    "xtream",
+    "xtream-codes",
+    "iptv",
+    "vod"
+  ],
+  "author": "izemhsn",
+  "license": "SEE LICENSE IN LICENSE",
+  "private": true,
   "type": "commonjs",
   "engines": {
     "node": ">=18.0.0"
   },
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/izemhsn/xTremio-stremio-addon.git"
+  },
+  "bugs": {
+    "url": "https://github.com/izemhsn/xTremio-stremio-addon/issues"
+  },
+  "homepage": "https://github.com/izemhsn/xTremio-stremio-addon#readme",
   "dependencies": {
-    "express": "^4.21.0"
+    "express": "^4.22.1"
   }
 }
