@@ -124,6 +124,20 @@ async function getManifest(baseUrl = `http://localhost:${PORT}`, cfg = null) {
                         { name: 'skip' },
                         { name: 'search' }
                     ]
+                },
+                {
+                    type: 'XT-Movies',
+                    id: 'xtremio_search_movies',
+                    name: 'Search Movies',
+                    extra: [{ name: 'search', isRequired: true }],
+                    searchProperties: ['name']
+                },
+                {
+                    type: 'XT-Series',
+                    id: 'xtremio_search_series',
+                    name: 'Search Series',
+                    extra: [{ name: 'search', isRequired: true }],
+                    searchProperties: ['name']
                 }
             );
         } catch (e) {
@@ -134,7 +148,9 @@ async function getManifest(baseUrl = `http://localhost:${PORT}`, cfg = null) {
                 { type: 'XT-Movies', id: 'xtremio_movies_featured', name: 'Featured' },
                 { type: 'XT-Series', id: 'xtremio_series_popular', name: 'Popular' },
                 { type: 'XT-Series', id: 'xtremio_series_new', name: 'New' },
-                { type: 'XT-Series', id: 'xtremio_series_featured', name: 'Featured' }
+                { type: 'XT-Series', id: 'xtremio_series_featured', name: 'Featured' },
+                { type: 'XT-Movies', id: 'xtremio_search_movies', name: 'Search Movies', extra: [{ name: 'search', isRequired: true }], searchProperties: ['name'] },
+                { type: 'XT-Series', id: 'xtremio_search_series', name: 'Search Series', extra: [{ name: 'search', isRequired: true }], searchProperties: ['name'] }
             );
         }
     }
@@ -147,7 +163,7 @@ async function getManifest(baseUrl = `http://localhost:${PORT}`, cfg = null) {
         resources: ['catalog', 'meta', 'stream'],
         types: ['Live TV', 'XT-Movies', 'XT-Series', 'series'],
         catalogs,
-        idPrefixes: ['xtremio_'],
+        idPrefixes: ['xtremio_live_', 'xtremio_movie_', 'xtremio_series_', 'xtremio_episode_'],
         behaviorHints: {
             configurable: true,
             configurationRequired: !cfg
@@ -172,7 +188,8 @@ function normalizeUrl(url) {
 }
 
 async function xtremioGet(cfg, action, extraParams = '', { timeoutMs = 15000 } = {}) {
-    const url = `${cfg.serverUrl}/player_api.php?username=${encodeURIComponent(cfg.username)}&password=${encodeURIComponent(cfg.password)}&action=${action}${extraParams}`;
+    const base = normalizeUrl(cfg.serverUrl);
+    const url = `${base}/player_api.php?username=${encodeURIComponent(cfg.username)}&password=${encodeURIComponent(cfg.password)}&action=${action}${extraParams}`;
     const controller = new AbortController();
     const timer = setTimeout(() => controller.abort(), timeoutMs);
     try {
@@ -194,8 +211,24 @@ function toIsoDate(s) {
     return isNaN(d.getTime()) ? undefined : d.toISOString();
 }
 
-const catCache = new Map();
+// Xtream providers return `cast`/`genre` as either a comma-separated string or an array.
+function splitList(value) {
+    if (!value) return [];
+    if (Array.isArray(value)) return value.map(v => String(v).trim()).filter(Boolean);
+    return String(value).split(',').map(v => v.trim()).filter(Boolean);
+}
+
+// `backdrop_path` can be an array of URLs or a single URL string.
+function pickBackdrop(value) {
+    if (!value) return undefined;
+    if (Array.isArray(value)) return value[0] || undefined;
+    return String(value) || undefined;
+}
+
+// All in-memory caches share the same TTL.
 const CACHE_TTL = 30 * 60 * 1000;
+
+const catCache = new Map();
 
 async function getCategories(cfg) {
     const cached = catCache.get(cfg.serverUrl);
@@ -221,21 +254,50 @@ async function getCategories(cfg) {
     return entry;
 }
 
-// Live streams cache - populated when browsing Live TV, used by meta endpoint
-const liveStreamsCache = new Map();
-const LIVE_STREAMS_CACHE_TTL = 30 * 60 * 1000;
-
-function getCachedLiveStreams(cfg) {
-    const key = cfg.serverUrl;
-    const cached = liveStreamsCache.get(key);
-    if (cached && cached.ts > Date.now() - LIVE_STREAMS_CACHE_TTL) {
-        return cached.data;
-    }
-    return null;
+// Stream list caches - populated on first fetch, reused for catalogs, search and meta
+function createStreamListCache() {
+    const map = new Map();
+    return {
+        get(cfg) {
+            const cached = map.get(cfg.serverUrl);
+            if (cached && cached.ts > Date.now() - CACHE_TTL) return cached.data;
+            return null;
+        },
+        set(cfg, items) {
+            map.set(cfg.serverUrl, { data: items, ts: Date.now() });
+        }
+    };
 }
 
-function setCachedLiveStreams(cfg, items) {
-    liveStreamsCache.set(cfg.serverUrl, { data: items, ts: Date.now() });
+const liveStreamsCache = createStreamListCache();
+const vodStreamsCache = createStreamListCache();
+const seriesStreamsCache = createStreamListCache();
+
+async function getAllVodStreams(cfg) {
+    let items = vodStreamsCache.get(cfg);
+    if (!items) {
+        items = await getStreams(cfg, 'get_vod_streams', '');
+        vodStreamsCache.set(cfg, items);
+    }
+    return items;
+}
+
+async function getAllSeriesStreams(cfg) {
+    let items = seriesStreamsCache.get(cfg);
+    if (!items) {
+        items = await getStreams(cfg, 'get_series', '');
+        seriesStreamsCache.set(cfg, items);
+    }
+    return items;
+}
+
+async function getAllLiveStreams(cfg) {
+    let items = liveStreamsCache.get(cfg);
+    if (!items) {
+        items = await getStreams(cfg, 'get_live_streams', '');
+        liveStreamsCache.set(cfg, items);
+    }
+    return items;
 }
 
 function parseExtra(extra) {
@@ -275,7 +337,6 @@ const SERIES_INFO_MAX_ATTEMPTS = 3;
 const SERIES_INFO_BACKOFF_MS = 500;
 
 const seriesInfoCache = new Map();
-const SERIES_INFO_CACHE_TTL = 30 * 60 * 1000;
 
 function seriesInfoCacheKey(cfg, seriesId) {
     return `${cfg.serverUrl}\n${cfg.username}\n${cfg.password}\n${seriesId}`;
@@ -283,7 +344,7 @@ function seriesInfoCacheKey(cfg, seriesId) {
 
 function getCachedSeriesInfo(cfg, seriesId) {
     const entry = seriesInfoCache.get(seriesInfoCacheKey(cfg, seriesId));
-    if (entry && entry.ts > Date.now() - SERIES_INFO_CACHE_TTL) return entry.data;
+    if (entry && entry.ts > Date.now() - CACHE_TTL) return entry.data;
     return null;
 }
 
@@ -550,24 +611,19 @@ app.get('/:config/catalog/:type/:id/:extra?.json', async (req, res) => {
                 if (cat) categoryId = cat.category_id;
             }
 
-            // Fetch all live channels once, then filter in-memory by selected category.
-            let allItems = getCachedLiveStreams(cfg);
-            if (!allItems) {
-                allItems = await getStreams(cfg, 'get_live_streams', '');
-                setCachedLiveStreams(cfg, allItems);
-            }
+            // No genre selected and none resolvable -> nothing to show.
+            if (!categoryId) return res.json({ metas: [] });
 
-            let items = allItems;
-            if (categoryId) {
-                const catIdStr = String(categoryId);
-                const selectedGenreLower = (selectedGenre || '').toLowerCase();
-                items = allItems.filter(s => {
-                    if (s.category_id != null && s.category_id !== '') {
-                        return String(s.category_id) === catIdStr;
-                    }
-                    return selectedGenreLower && String(s.category_name || '').toLowerCase() === selectedGenreLower;
-                });
-            }
+            // Fetch all live channels once (cached), then filter in-memory by selected category.
+            const allItems = await getAllLiveStreams(cfg);
+            const catIdStr = String(categoryId);
+            const selectedGenreLower = (selectedGenre || '').toLowerCase();
+            let items = allItems.filter(s => {
+                if (s.category_id != null && s.category_id !== '') {
+                    return String(s.category_id) === catIdStr;
+                }
+                return selectedGenreLower && String(s.category_name || '').toLowerCase() === selectedGenreLower;
+            });
 
             if (extra.search) {
                 const q = extra.search.toLowerCase();
@@ -592,8 +648,12 @@ app.get('/:config/catalog/:type/:id/:extra?.json', async (req, res) => {
             const cat = cats.movies.find(c => c.category_name === selectedGenre);
             if (!cat) return res.json({ metas: [] });
 
-            const catParam = `&category_id=${cat.category_id}`;
-            let items = await getStreams(cfg, 'get_vod_streams', catParam);
+            // Reuse the full-list cache if available; fall back to per-category fetch.
+            const catIdStr = String(cat.category_id);
+            const fullList = vodStreamsCache.get(cfg);
+            let items = fullList
+                ? fullList.filter(s => String(s.category_id) === catIdStr)
+                : await getStreams(cfg, 'get_vod_streams', `&category_id=${catIdStr}`);
 
             if (extra.search) {
                 const q = extra.search.toLowerCase();
@@ -632,8 +692,12 @@ app.get('/:config/catalog/:type/:id/:extra?.json', async (req, res) => {
             const cat = cats.series.find(c => c.category_name === selectedGenre);
             if (!cat) return res.json({ metas: [] });
 
-            const catParam = `&category_id=${cat.category_id}`;
-            let items = await getStreams(cfg, 'get_series', catParam);
+            // Reuse the full-list cache if available; fall back to per-category fetch.
+            const catIdStr = String(cat.category_id);
+            const fullList = seriesStreamsCache.get(cfg);
+            let items = fullList
+                ? fullList.filter(s => String(s.category_id) === catIdStr)
+                : await getStreams(cfg, 'get_series', `&category_id=${catIdStr}`);
 
             if (extra.search) {
                 const q = extra.search.toLowerCase();
@@ -665,6 +729,37 @@ app.get('/:config/catalog/:type/:id/:extra?.json', async (req, res) => {
             return res.json({ metas, cacheMaxAge: 300, staleRevalidate: 600 });
         }
 
+        // Global search catalogs - fetch all streams once, filter in memory
+        if (id === 'xtremio_search_movies' && extra.search) {
+            const q = extra.search.toLowerCase();
+            const allMovies = await getAllVodStreams(cfg);
+            const filtered = allMovies.filter(s => s.name?.toLowerCase().includes(q));
+            const page = filtered.slice(skip, skip + PAGE_SIZE);
+            const metas = page.map(s => ({
+                id: `xtremio_movie_${s.stream_id}`,
+                type: 'XT-Movies',
+                name: s.name,
+                poster: s.stream_icon || undefined,
+                posterShape: 'poster'
+            }));
+            return res.json({ metas, cacheMaxAge: 300, staleRevalidate: 600 });
+        }
+
+        if (id === 'xtremio_search_series' && extra.search) {
+            const q = extra.search.toLowerCase();
+            const allSeries = await getAllSeriesStreams(cfg);
+            const filtered = allSeries.filter(s => s.name?.toLowerCase().includes(q));
+            const page = filtered.slice(skip, skip + PAGE_SIZE);
+            const metas = page.map(s => ({
+                id: `xtremio_series_${s.series_id}`,
+                type: 'series',
+                name: s.name,
+                poster: s.cover || undefined,
+                posterShape: 'poster'
+            }));
+            return res.json({ metas, cacheMaxAge: 300, staleRevalidate: 600 });
+        }
+
         res.json({ metas: [] });
     } catch (e) {
         console.error('[catalog] Error:', e.message);
@@ -681,20 +776,8 @@ app.get('/:config/meta/:type/:id.json', async (req, res) => {
     try {
         if (id.startsWith('xtremio_live_')) {
             const streamId = id.replace('xtremio_live_', '');
-            // Try cached live streams first, fall back to fetching
-            let allLive = getCachedLiveStreams(cfg);
-            if (!allLive) {
-                allLive = await getStreams(cfg, 'get_live_streams', '');
-                setCachedLiveStreams(cfg, allLive);
-            }
-
+            const allLive = await getAllLiveStreams(cfg);
             let s = allLive.find(i => String(i.stream_id) === streamId);
-            if (!s) {
-                // Cache may be stale; refresh once and retry by ID.
-                allLive = await getStreams(cfg, 'get_live_streams', '');
-                setCachedLiveStreams(cfg, allLive);
-                s = allLive.find(i => String(i.stream_id) === streamId);
-            }
 
             if (!s) return res.json({ meta: null });
             const meta = {
@@ -713,8 +796,8 @@ app.get('/:config/meta/:type/:id.json', async (req, res) => {
             const streamId = id.replace('xtremio_movie_', '');
             const info = await xtremioGet(cfg, 'get_vod_info', `&vod_id=${streamId}`);
             const movie = info?.info ?? info ?? {};
-            const cast = movie.cast ? movie.cast.split(',').map(c => c.trim()).filter(Boolean) : [];
-            const backdrop = Array.isArray(movie.backdrop_path) && movie.backdrop_path[0] ? movie.backdrop_path[0] : undefined;
+            const cast = splitList(movie.cast);
+            const backdrop = pickBackdrop(movie.backdrop_path);
 
             const meta = {
                 id: `xtremio_movie_${streamId}`,
@@ -725,7 +808,7 @@ app.get('/:config/meta/:type/:id.json', async (req, res) => {
                 background: backdrop,
                 description: movie.plot || movie.description || undefined,
                 releaseInfo: movie.releasedate ? String(movie.releasedate) : undefined,
-                genres: movie.genre ? movie.genre.split(',').map(g => g.trim()).filter(Boolean) : [],
+                genres: splitList(movie.genre),
                 runtime: movie.duration ? String(movie.duration) + ' min' : (movie.episode_run_time ? String(movie.episode_run_time) + ' min' : undefined),
                 director: movie.director || undefined,
                 cast,
@@ -771,8 +854,8 @@ app.get('/:config/meta/:type/:id.json', async (req, res) => {
                 return res.json({ meta: null });
             }
 
-            const cast = series.cast ? series.cast.split(',').map(c => c.trim()).filter(Boolean) : [];
-            const backdrop = Array.isArray(series.backdrop_path) && series.backdrop_path[0] ? series.backdrop_path[0] : undefined;
+            const cast = splitList(series.cast);
+            const backdrop = pickBackdrop(series.backdrop_path);
 
             const meta = {
                 id: `xtremio_series_${seriesId}`,
@@ -783,7 +866,7 @@ app.get('/:config/meta/:type/:id.json', async (req, res) => {
                 background: backdrop,
                 description: series.plot || undefined,
                 releaseInfo: series.releaseDate ? String(series.releaseDate) : undefined,
-                genres: series.genre ? series.genre.split(',').map(g => g.trim()).filter(Boolean) : [],
+                genres: splitList(series.genre),
                 runtime: series.episode_run_time ? String(series.episode_run_time) + ' min' : undefined,
                 director: series.director || undefined,
                 cast,
@@ -806,7 +889,8 @@ app.get('/:config/stream/:type/:id.json', async (req, res) => {
     if (!cfg) return res.json({ streams: [] });
     const { id, type } = req.params;
     console.log(`[stream] type=${type} id=${id}`);
-    const { serverUrl, username, password } = cfg;
+    const { username, password } = cfg;
+    const serverUrl = normalizeUrl(cfg.serverUrl);
 
     // --- Handle xTremio's own IDs ---
     if (id.startsWith('xtremio_live_')) {
