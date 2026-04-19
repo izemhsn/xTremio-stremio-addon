@@ -38,9 +38,9 @@ Example: `PORT=4000 HOST=127.0.0.1 npm start`.
 
 | Path | Purpose |
 |---|---|
-| `/` | Info payload (configure and manifest URLs) |
+| `/` | Landing page with project overview and install CTA |
 | `/health` | Liveness probe for hosting platforms |
-| `/configure` | HTML form to enter Xtream credentials and get an install link |
+| `/configure` | HTML form to enter Xtream credentials and get an install link (includes disclaimer banner) |
 | `/manifest.json` | Unconfigured Stremio manifest |
 | `/:config/manifest.json` | Configured manifest with populated genres |
 | `/:config/catalog/:type/:id/:extra?.json` | Catalog items |
