@@ -158,7 +158,7 @@ async function getManifest(baseUrl = `http://localhost:${PORT}`, cfg = null) {
 
     return {
         id: ADDON_ID,
-        version: '1.0.1',
+        version: '1.0.2',
         name: 'xTremio',
         description: 'xTremio addon for Stremio',
         resources: ['catalog', 'meta', 'stream'],

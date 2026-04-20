@@ -1,6 +1,6 @@
 {
   "name": "xtremio-stremio-addon",
-  "version": "1.0.1",
+  "version": "1.0.2",
   "description": "Stremio addon that exposes an Xtream Codes (IPTV) provider as Live TV, Movies and Series catalogs.",
   "main": "index.js",
   "scripts": {
