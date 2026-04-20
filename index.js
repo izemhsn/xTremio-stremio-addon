@@ -1,4 +1,5 @@
 const express = require('express');
+const { Readable } = require('stream');
 
 const app = express();
 app.use(express.urlencoded({ extended: true }));
@@ -186,6 +187,19 @@ function normalizeUrl(url) {
     if (!/^https?:\/\//.test(url)) url = 'http://' + url;
     return url;
 }
+
+// Per Stremio SDK: notWebReady must be true when the URL is http:// or
+// the file is not an MP4 container. Without this, the player may stop
+// after a short period (e.g. ~1 min) and Stremio treats it as "ended",
+// returning to details (movies) or auto-advancing (series episodes).
+function isNotWebReady(url, ext) {
+    const isHttps = /^https:\/\//i.test(url);
+    const isMp4 = String(ext || '').toLowerCase() === 'mp4';
+    return !(isHttps && isMp4);
+}
+
+// Browser-like UA — many Xtream CDNs reject or shortchange non-browser UAs.
+const PROXY_USER_AGENT = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0 Safari/537.36';
 
 async function xtremioGet(cfg, action, extraParams = '', { timeoutMs = 15000 } = {}) {
     const base = normalizeUrl(cfg.serverUrl);
@@ -930,11 +944,18 @@ app.get('/:config/stream/:type/:id.json', async (req, res) => {
         const streamId = id.replace('xtremio_movie_', '');
         const info = await xtremioGet(cfg, 'get_vod_info', `&vod_id=${streamId}`);
         const ext = info?.movie_data?.container_extension || 'mp4';
+        const proxyUrl = `${getBaseUrl(req)}/${req.params.config}/proxy/movie/${streamId}.${ext}`;
         return res.json({
             streams: [
-                { url: `${serverUrl}/movie/${username}/${password}/${streamId}.${ext}`, title: '▶ Play' }
-            ],
-            cacheMaxAge: 86400
+                {
+                    url: proxyUrl,
+                    title: '▶ Play',
+                    behaviorHints: {
+                        notWebReady: isNotWebReady(proxyUrl, ext),
+                        bingeGroup: `xtremio-movie-${ext}`
+                    }
+                }
+            ]
         });
     }
 
@@ -959,15 +980,116 @@ app.get('/:config/stream/:type/:id.json', async (req, res) => {
             ext = 'mp4';
         }
 
+        const proxyUrl = `${getBaseUrl(req)}/${req.params.config}/proxy/series/${episodeId}.${ext}`;
         return res.json({
             streams: [
-                { url: `${serverUrl}/series/${username}/${password}/${episodeId}.${ext}`, title: '▶ Play' }
-            ],
-            cacheMaxAge: 3600
+                {
+                    url: proxyUrl,
+                    title: '▶ Play',
+                    behaviorHints: {
+                        notWebReady: isNotWebReady(proxyUrl, ext),
+                        bingeGroup: `xtremio-series-${seriesId}-${ext}`
+                    }
+                }
+            ]
         });
     }
 
     res.json({ streams: [] });
+});
+
+// Stream proxy. Xtream providers 302-redirect to a CDN URL that carries
+// a short-lived signed token (~60s). Handing that URL directly to
+// Stremio causes "playback error" after ~1 minute when the token
+// expires. By proxying every range request through the addon, we
+// re-resolve the origin URL (and get a fresh token) for each request.
+app.all('/:config/proxy/:kind/:file', async (req, res) => {
+    if (req.method !== 'GET' && req.method !== 'HEAD') {
+        return res.status(405).end('method not allowed');
+    }
+    const cfg = decodeConfig(req.params.config);
+    if (!cfg) return res.status(401).end('unauthorized');
+
+    const { kind, file } = req.params;
+    if (!['movie', 'series', 'live'].includes(kind)) {
+        return res.status(400).end('bad kind');
+    }
+    const match = /^([^./]+)\.([A-Za-z0-9]+)$/.exec(file);
+    if (!match) return res.status(400).end('bad file');
+    const [, streamId, ext] = match;
+
+    const serverUrl = normalizeUrl(cfg.serverUrl);
+    const upstreamUrl = `${serverUrl}/${kind}/${encodeURIComponent(cfg.username)}/${encodeURIComponent(cfg.password)}/${streamId}.${ext}`;
+
+    const headers = { 'User-Agent': PROXY_USER_AGENT };
+    if (req.headers.range) headers['Range'] = req.headers.range;
+    if (req.headers['if-range']) headers['If-Range'] = req.headers['if-range'];
+
+    const controller = new AbortController();
+    const abort = () => {
+        if (!controller.signal.aborted) {
+            try { controller.abort(); } catch {}
+        }
+    };
+    req.on('close', abort);
+    req.on('aborted', abort);
+
+    const isAbortErr = (e) => e && (e.name === 'AbortError' || e.code === 'ABORT_ERR' || controller.signal.aborted);
+
+    let upstream;
+    try {
+        upstream = await fetch(upstreamUrl, {
+            method: 'GET',
+            headers,
+            redirect: 'follow',
+            signal: controller.signal
+        });
+    } catch (e) {
+        if (!isAbortErr(e)) {
+            console.warn(`[proxy] upstream fetch failed for ${kind}/${streamId}.${ext}: ${e.message}`);
+        }
+        if (!res.headersSent) res.status(502).end('upstream fetch failed');
+        return;
+    }
+
+    res.status(upstream.status);
+
+    // Forward headers relevant for seekable playback.
+    const forward = [
+        'content-type',
+        'content-length',
+        'content-range',
+        'accept-ranges',
+        'last-modified',
+        'etag'
+    ];
+    for (const h of forward) {
+        const v = upstream.headers.get(h);
+        if (v) res.setHeader(h, v);
+    }
+    if (!upstream.headers.get('accept-ranges')) {
+        res.setHeader('Accept-Ranges', 'bytes');
+    }
+    res.setHeader('Cache-Control', 'no-store');
+
+    if (req.method === 'HEAD' || !upstream.body) {
+        return res.end();
+    }
+
+    const nodeStream = Readable.fromWeb(upstream.body);
+    nodeStream.on('error', (e) => {
+        if (!isAbortErr(e)) {
+            console.warn(`[proxy] stream error for ${kind}/${streamId}.${ext}: ${e.message}`);
+        }
+        if (!res.headersSent) res.status(502);
+        res.end();
+    });
+    res.on('error', () => abort());
+    res.on('close', () => {
+        abort();
+        nodeStream.destroy();
+    });
+    nodeStream.pipe(res);
 });
 
 app.get('/', (req, res) => {
@@ -1108,5 +1230,12 @@ server.on('error', (err) => {
 
 process.on('SIGTERM', () => { console.log('SIGTERM received, shutting down...'); server.close(() => process.exit(0)); });
 process.on('SIGINT', () => { console.log('SIGINT received, shutting down...'); server.close(() => process.exit(0)); });
-process.on('uncaughtException', (err) => { console.error('Uncaught exception:', err); });
-process.on('unhandledRejection', (err) => { console.error('Unhandled rejection:', err); });
+process.on('uncaughtException', (err) => {
+    // AbortErrors are expected when a client disconnects mid-stream from the proxy.
+    if (err && (err.name === 'AbortError' || err.code === 'ABORT_ERR')) return;
+    console.error('Uncaught exception:', err);
+});
+process.on('unhandledRejection', (err) => {
+    if (err && (err.name === 'AbortError' || err.code === 'ABORT_ERR')) return;
+    console.error('Unhandled rejection:', err);
+});
