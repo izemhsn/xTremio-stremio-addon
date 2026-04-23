@@ -925,77 +925,83 @@ app.get('/:config/stream/:type/:id.json', async (req, res) => {
     if (!cfg) return res.json({ streams: [] });
     const { id, type } = req.params;
     console.log(`[stream] type=${type} id=${id}`);
-    const { username, password } = cfg;
-    const serverUrl = normalizeUrl(cfg.serverUrl);
 
-    // --- Handle xTremio's own IDs ---
-    if (id.startsWith('xtremio_live_')) {
-        const streamId = id.replace('xtremio_live_', '');
-        return res.json({
-            streams: [
-                { url: `${serverUrl}/live/${username}/${password}/${streamId}.m3u8`, title: 'HLS' },
-                { url: `${serverUrl}/live/${username}/${password}/${streamId}.ts`, title: 'MPEG-TS' }
-            ],
-            cacheMaxAge: 3600
-        });
-    }
+    try {
+        const { username, password } = cfg;
+        const serverUrl = normalizeUrl(cfg.serverUrl);
 
-    if (id.startsWith('xtremio_movie_')) {
-        const streamId = id.replace('xtremio_movie_', '');
-        const info = await xtremioGet(cfg, 'get_vod_info', `&vod_id=${streamId}`);
-        const ext = info?.movie_data?.container_extension || 'mp4';
-        const proxyUrl = `${getBaseUrl(req)}/${req.params.config}/proxy/movie/${streamId}.${ext}`;
-        return res.json({
-            streams: [
-                {
-                    url: proxyUrl,
-                    title: '▶ Play',
-                    behaviorHints: {
-                        notWebReady: isNotWebReady(proxyUrl, ext),
-                        bingeGroup: `xtremio-movie-${ext}`
-                    }
-                }
-            ]
-        });
-    }
-
-    if (id.startsWith('xtremio_episode_')) {
-        // Format: xtremio_episode_{seriesId}:{season}:{episodeId}
-        const [seriesId, , episodeId] = id.replace('xtremio_episode_', '').split(':');
-
-        const findExt = (data) => {
-            const episodes = data?.episodes ?? {};
-            for (const eps of Object.values(episodes)) {
-                if (!Array.isArray(eps)) continue;
-                const ep = eps.find(e => String(e.id) === episodeId);
-                if (ep) return ep.container_extension || 'mp4';
-            }
-            return null;
-        };
-
-        const info = await getSeriesInfo(cfg, seriesId);
-        let ext = findExt(info);
-        if (!ext) {
-            console.warn(`[stream] episode ${episodeId} not found in series ${seriesId} info; defaulting to mp4`);
-            ext = 'mp4';
+        // --- Handle xTremio's own IDs ---
+        if (id.startsWith('xtremio_live_')) {
+            const streamId = id.replace('xtremio_live_', '');
+            return res.json({
+                streams: [
+                    { url: `${serverUrl}/live/${username}/${password}/${streamId}.m3u8`, title: 'HLS' },
+                    { url: `${serverUrl}/live/${username}/${password}/${streamId}.ts`, title: 'MPEG-TS' }
+                ],
+                cacheMaxAge: 3600
+            });
         }
 
-        const proxyUrl = `${getBaseUrl(req)}/${req.params.config}/proxy/series/${episodeId}.${ext}`;
-        return res.json({
-            streams: [
-                {
-                    url: proxyUrl,
-                    title: '▶ Play',
-                    behaviorHints: {
-                        notWebReady: isNotWebReady(proxyUrl, ext),
-                        bingeGroup: `xtremio-series-${seriesId}-${ext}`
+        if (id.startsWith('xtremio_movie_')) {
+            const streamId = id.replace('xtremio_movie_', '');
+            const info = await xtremioGet(cfg, 'get_vod_info', `&vod_id=${streamId}`);
+            const ext = info?.movie_data?.container_extension || 'mp4';
+            const proxyUrl = `${getBaseUrl(req)}/${req.params.config}/proxy/movie/${streamId}.${ext}`;
+            return res.json({
+                streams: [
+                    {
+                        url: proxyUrl,
+                        title: '▶ Play',
+                        behaviorHints: {
+                            notWebReady: isNotWebReady(proxyUrl, ext),
+                            bingeGroup: `xtremio-movie-${ext}`
+                        }
                     }
-                }
-            ]
-        });
-    }
+                ]
+            });
+        }
 
-    res.json({ streams: [] });
+        if (id.startsWith('xtremio_episode_')) {
+            // Format: xtremio_episode_{seriesId}:{season}:{episodeId}
+            const [seriesId, , episodeId] = id.replace('xtremio_episode_', '').split(':');
+
+            const findExt = (data) => {
+                const episodes = data?.episodes ?? {};
+                for (const eps of Object.values(episodes)) {
+                    if (!Array.isArray(eps)) continue;
+                    const ep = eps.find(e => String(e.id) === episodeId);
+                    if (ep) return ep.container_extension || 'mp4';
+                }
+                return null;
+            };
+
+            const info = await getSeriesInfo(cfg, seriesId);
+            let ext = findExt(info);
+            if (!ext) {
+                console.warn(`[stream] episode ${episodeId} not found in series ${seriesId} info; defaulting to mp4`);
+                ext = 'mp4';
+            }
+
+            const proxyUrl = `${getBaseUrl(req)}/${req.params.config}/proxy/series/${episodeId}.${ext}`;
+            return res.json({
+                streams: [
+                    {
+                        url: proxyUrl,
+                        title: '▶ Play',
+                        behaviorHints: {
+                            notWebReady: isNotWebReady(proxyUrl, ext),
+                            bingeGroup: `xtremio-series-${seriesId}-${ext}`
+                        }
+                    }
+                ]
+            });
+        }
+
+        res.json({ streams: [] });
+    } catch (e) {
+        console.error('[stream] Error:', e.message);
+        res.json({ streams: [] });
+    }
 });
 
 // Stream proxy. Xtream providers 302-redirect to a CDN URL that carries
