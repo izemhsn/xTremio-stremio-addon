@@ -242,10 +242,17 @@ function pickBackdrop(value) {
 // All in-memory caches share the same TTL.
 const CACHE_TTL = 30 * 60 * 1000;
 
+// Keys must include credentials so two users on the same Xtream host don't
+// share cached catalogs/streams (different accounts can see different content).
+function accountCacheKey(cfg) {
+    return `${cfg.serverUrl}\n${cfg.username}\n${cfg.password}`;
+}
+
 const catCache = new Map();
 
 async function getCategories(cfg) {
-    const cached = catCache.get(cfg.serverUrl);
+    const key = accountCacheKey(cfg);
+    const cached = catCache.get(key);
     if (cached && cached.ts > Date.now() - CACHE_TTL) return cached;
     const results = await Promise.allSettled([
         xtremioGet(cfg, 'get_live_categories'),
@@ -264,7 +271,7 @@ async function getCategories(cfg) {
         series: pick(results[2]),
         ts: Date.now()
     };
-    catCache.set(cfg.serverUrl, entry);
+    catCache.set(key, entry);
     return entry;
 }
 
@@ -273,12 +280,12 @@ function createStreamListCache() {
     const map = new Map();
     return {
         get(cfg) {
-            const cached = map.get(cfg.serverUrl);
+            const cached = map.get(accountCacheKey(cfg));
             if (cached && cached.ts > Date.now() - CACHE_TTL) return cached.data;
             return null;
         },
         set(cfg, items) {
-            map.set(cfg.serverUrl, { data: items, ts: Date.now() });
+            map.set(accountCacheKey(cfg), { data: items, ts: Date.now() });
         }
     };
 }
@@ -473,7 +480,7 @@ function renderConfigPage({ serverUrl = '', username = '', password = '', status
                 <div class="status-section">
                     <div class="status-banner status-error">
                         <svg fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="3" d="M6 18L18 6M6 6l12 12"/></svg>
-                        <span class="status-text">${status.error}</span>
+                        <span class="status-text">${escapeHtml(status.error)}</span>
                     </div>
                 </div>`;
         }
