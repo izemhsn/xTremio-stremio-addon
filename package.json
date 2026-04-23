@@ -31,6 +31,6 @@
   },
   "homepage": "https://github.com/izemhsn/xTremio-stremio-addon#readme",
   "dependencies": {
-    "express": "^4.22.1"
+    "express": "^5.2.1"
   }
 }

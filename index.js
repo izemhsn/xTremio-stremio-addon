@@ -628,7 +628,7 @@ app.post('/configure', async (req, res) => {
     }
 });
 
-app.get('/:config/catalog/:type/:id/:extra?.json', async (req, res) => {
+app.get(['/:config/catalog/:type/:id.json', '/:config/catalog/:type/:id/:extra.json'], async (req, res) => {
     const cfg = decodeConfig(req.params.config);
     if (!cfg) return res.json({ metas: [] });
 
