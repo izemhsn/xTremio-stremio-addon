@@ -1,5 +1,8 @@
 const express = require('express');
 const { Readable } = require('stream');
+const crypto = require('crypto');
+const dns = require('dns').promises;
+const net = require('net');
 
 const app = express();
 app.use(express.urlencoded({ extended: true }));
@@ -14,6 +17,18 @@ app.use((req, res, next) => {
 const PORT = process.env.PORT || 3000;
 const HOST = process.env.HOST || '0.0.0.0';
 const ADDON_ID = 'org.xtremio.addon';
+const CONFIG_TOKEN_VERSION = 'v2';
+const RAW_CONFIG_SECRET = process.env.CONFIG_SECRET || process.env.XTREMIO_CONFIG_SECRET;
+const CONFIG_SECRET = RAW_CONFIG_SECRET
+    ? Buffer.from(RAW_CONFIG_SECRET, 'utf8')
+    : crypto.randomBytes(32);
+const CONFIG_ENC_KEY = crypto.createHash('sha256').update('xtremio-config-enc').update(CONFIG_SECRET).digest();
+const CONFIG_MAC_KEY = crypto.createHash('sha256').update('xtremio-config-mac').update(CONFIG_SECRET).digest();
+const ALLOW_PRIVATE_NETWORKS = process.env.ALLOW_PRIVATE_NETWORKS === 'true';
+
+if (!RAW_CONFIG_SECRET) {
+    console.warn('[security] CONFIG_SECRET is not set; install URLs will be invalid after restart. Set CONFIG_SECRET to a long random value for persistent encrypted config tokens.');
+}
 
 function getBaseUrl(req) {
     const proto = req.headers['x-forwarded-proto'] || req.protocol || 'http';
@@ -25,21 +40,61 @@ function escapeHtml(str) {
     return String(str || '').replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;').replace(/'/g, '&#039;');
 }
 
+function validateConfig(cfg) {
+    if (!cfg || typeof cfg !== 'object') return null;
+    const { serverUrl, username, password } = cfg;
+    if (typeof serverUrl !== 'string' || typeof username !== 'string' || typeof password !== 'string') return null;
+    if (!serverUrl || !username || !password) return null;
+    return { serverUrl, username, password };
+}
+
+function signTokenBody(body) {
+    return crypto.createHmac('sha256', CONFIG_MAC_KEY).update(body).digest('base64url');
+}
+
+function timingSafeEqualString(a, b) {
+    const ab = Buffer.from(a);
+    const bb = Buffer.from(b);
+    return ab.length === bb.length && crypto.timingSafeEqual(ab, bb);
+}
+
 function encodeConfig(cfg) {
-    return Buffer.from(JSON.stringify({
-        serverUrl: cfg.serverUrl,
-        username: cfg.username,
-        password: cfg.password
-    })).toString('base64url');
+    const clean = validateConfig(cfg);
+    if (!clean) throw new Error('Invalid config');
+
+    const iv = crypto.randomBytes(12);
+    const cipher = crypto.createCipheriv('aes-256-gcm', CONFIG_ENC_KEY, iv);
+    const ciphertext = Buffer.concat([
+        cipher.update(JSON.stringify(clean), 'utf8'),
+        cipher.final()
+    ]);
+    const tag = cipher.getAuthTag();
+    const body = [
+        CONFIG_TOKEN_VERSION,
+        iv.toString('base64url'),
+        tag.toString('base64url'),
+        ciphertext.toString('base64url')
+    ].join('.');
+    return `${body}.${signTokenBody(body)}`;
 }
 
 function decodeConfig(encoded) {
     if (!encoded) return null;
+    if (typeof encoded !== 'string' || encoded.length > 4096) return null;
     try {
-        const cfg = JSON.parse(Buffer.from(encoded, 'base64url').toString('utf8'));
-        if (!cfg || typeof cfg !== 'object') return null;
-        if (!cfg.serverUrl || !cfg.username || !cfg.password) return null;
-        return cfg;
+        const parts = encoded.split('.');
+        if (parts.length !== 5 || parts[0] !== CONFIG_TOKEN_VERSION) return null;
+        const [version, ivPart, tagPart, ciphertextPart, macPart] = parts;
+        const body = [version, ivPart, tagPart, ciphertextPart].join('.');
+        if (!timingSafeEqualString(signTokenBody(body), macPart)) return null;
+
+        const decipher = crypto.createDecipheriv('aes-256-gcm', CONFIG_ENC_KEY, Buffer.from(ivPart, 'base64url'));
+        decipher.setAuthTag(Buffer.from(tagPart, 'base64url'));
+        const plaintext = Buffer.concat([
+            decipher.update(Buffer.from(ciphertextPart, 'base64url')),
+            decipher.final()
+        ]).toString('utf8');
+        return validateConfig(JSON.parse(plaintext));
     } catch {
         return null;
     }
@@ -183,9 +238,51 @@ app.get('/:config/manifest.json', async (req, res) => {
 });
 
 function normalizeUrl(url) {
-    url = url.trim().replace(/\/+$/, '');
+    url = String(url || '').trim().replace(/\/+$/, '');
+    if (!url) throw new Error('serverUrl is required');
     if (!/^https?:\/\//.test(url)) url = 'http://' + url;
     return url;
+}
+
+function buildUrl(base, pathname, params = {}) {
+    const url = new URL(pathname, base);
+    for (const [key, value] of Object.entries(params)) {
+        if (value !== undefined && value !== null) {
+            url.searchParams.set(key, String(value));
+        }
+    }
+    return url.toString();
+}
+
+function buildXtremioApiUrl(cfg, action, params = {}) {
+    return buildUrl(normalizeUrl(cfg.serverUrl), '/player_api.php', {
+        username: cfg.username,
+        password: cfg.password,
+        action,
+        ...params
+    });
+}
+
+function isNumericId(value) {
+    return /^\d+$/.test(String(value || ''));
+}
+
+function getPrefixedNumericId(id, prefix) {
+    if (!String(id || '').startsWith(prefix)) return null;
+    const value = id.slice(prefix.length);
+    return isNumericId(value) ? value : null;
+}
+
+function parseEpisodeId(id) {
+    if (!String(id || '').startsWith('xtremio_episode_')) return null;
+    const parts = id.slice('xtremio_episode_'.length).split(':');
+    if (parts.length !== 3 || !parts.every(isNumericId)) return null;
+    return { seriesId: parts[0], seasonNum: parts[1], episodeId: parts[2] };
+}
+
+function normalizeContainerExt(ext) {
+    const clean = String(ext || 'mp4').trim();
+    return /^[A-Za-z0-9]+$/.test(clean) ? clean : 'mp4';
 }
 
 // Per Stremio SDK: notWebReady must be true when the URL is http:// or
@@ -201,13 +298,76 @@ function isNotWebReady(url, ext) {
 // Browser-like UA — many Xtream CDNs reject or shortchange non-browser UAs.
 const PROXY_USER_AGENT = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0 Safari/537.36';
 
-async function xtremioGet(cfg, action, extraParams = '', { timeoutMs = 15000 } = {}) {
-    const base = normalizeUrl(cfg.serverUrl);
-    const url = `${base}/player_api.php?username=${encodeURIComponent(cfg.username)}&password=${encodeURIComponent(cfg.password)}&action=${action}${extraParams}`;
+function ipv4ToLong(ip) {
+    return ip.split('.').reduce((acc, part) => ((acc << 8) + Number(part)) >>> 0, 0);
+}
+
+function isPrivateIp(ip) {
+    if (net.isIP(ip) === 4) {
+        const n = ipv4ToLong(ip);
+        return (
+            (n >= ipv4ToLong('0.0.0.0') && n <= ipv4ToLong('0.255.255.255')) ||
+            (n >= ipv4ToLong('10.0.0.0') && n <= ipv4ToLong('10.255.255.255')) ||
+            (n >= ipv4ToLong('100.64.0.0') && n <= ipv4ToLong('100.127.255.255')) ||
+            (n >= ipv4ToLong('127.0.0.0') && n <= ipv4ToLong('127.255.255.255')) ||
+            (n >= ipv4ToLong('169.254.0.0') && n <= ipv4ToLong('169.254.255.255')) ||
+            (n >= ipv4ToLong('172.16.0.0') && n <= ipv4ToLong('172.31.255.255')) ||
+            (n >= ipv4ToLong('192.168.0.0') && n <= ipv4ToLong('192.168.255.255')) ||
+            (n >= ipv4ToLong('224.0.0.0') && n <= ipv4ToLong('255.255.255.255'))
+        );
+    }
+
+    const lower = String(ip || '').toLowerCase();
+    if (lower.startsWith('::ffff:')) return isPrivateIp(lower.slice(7));
+    return lower === '::' ||
+        lower === '::1' ||
+        lower.startsWith('fc') ||
+        lower.startsWith('fd') ||
+        lower.startsWith('fe80:') ||
+        lower.startsWith('ff');
+}
+
+async function assertSafeOutboundUrl(inputUrl) {
+    const url = new URL(inputUrl);
+    if (!['http:', 'https:'].includes(url.protocol)) {
+        throw new Error(`Blocked unsupported outbound protocol: ${url.protocol}`);
+    }
+    if (ALLOW_PRIVATE_NETWORKS) return url;
+
+    const hostname = url.hostname.replace(/^\[|\]$/g, '');
+    const directIp = net.isIP(hostname) ? [{ address: hostname }] : null;
+    const addresses = directIp || await dns.lookup(hostname, { all: true, verbatim: true });
+    if (!addresses.length) throw new Error(`Could not resolve outbound host: ${hostname}`);
+
+    for (const { address } of addresses) {
+        if (isPrivateIp(address)) {
+            throw new Error(`Blocked private outbound address for ${hostname}`);
+        }
+    }
+    return url;
+}
+
+async function safeFetch(inputUrl, options = {}, { maxRedirects = 3 } = {}) {
+    let url = await assertSafeOutboundUrl(inputUrl);
+    for (let redirects = 0; redirects <= maxRedirects; redirects++) {
+        const res = await fetch(url, { ...options, redirect: 'manual' });
+        if (![301, 302, 303, 307, 308].includes(res.status)) return res;
+
+        const location = res.headers.get('location');
+        if (!location) return res;
+        if (redirects === maxRedirects) throw new Error('Too many redirects');
+
+        url = await assertSafeOutboundUrl(new URL(location, url).toString());
+    }
+    throw new Error('Too many redirects');
+}
+
+async function xtremioGet(cfg, action, params = {}, { timeoutMs = 15000 } = {}) {
+    const url = buildXtremioApiUrl(cfg, action, params);
     const controller = new AbortController();
     const timer = setTimeout(() => controller.abort(), timeoutMs);
     try {
-        const res = await fetch(url, { signal: controller.signal, redirect: 'follow' });
+        const res = await safeFetch(url, { signal: controller.signal });
         if (!res.ok) throw new Error(`xtremio ${action} failed: HTTP ${res.status}`);
         const data = await res.json();
 
@@ -297,7 +457,7 @@ const seriesStreamsCache = createStreamListCache();
 async function getAllVodStreams(cfg) {
     let items = vodStreamsCache.get(cfg);
     if (!items) {
-        items = await getStreams(cfg, 'get_vod_streams', '');
+        items = await getStreams(cfg, 'get_vod_streams');
         vodStreamsCache.set(cfg, items);
     }
     return items;
@@ -306,7 +466,7 @@ async function getAllVodStreams(cfg) {
 async function getAllSeriesStreams(cfg) {
     let items = seriesStreamsCache.get(cfg);
     if (!items) {
-        items = await getStreams(cfg, 'get_series', '');
+        items = await getStreams(cfg, 'get_series');
         seriesStreamsCache.set(cfg, items);
     }
     return items;
@@ -315,7 +475,7 @@ async function getAllSeriesStreams(cfg) {
 async function getAllLiveStreams(cfg) {
     let items = liveStreamsCache.get(cfg);
     if (!items) {
-        items = await getStreams(cfg, 'get_live_streams', '');
+        items = await getStreams(cfg, 'get_live_streams');
         liveStreamsCache.set(cfg, items);
     }
     return items;
@@ -334,8 +494,8 @@ function parseExtra(extra) {
 
 const PAGE_SIZE = 100;
 
-async function getStreams(cfg, action, catParam = '') {
-    const data = await xtremioGet(cfg, action, catParam);
+async function getStreams(cfg, action, params = {}) {
+    const data = await xtremioGet(cfg, action, params);
     return Array.isArray(data) ? data : [];
 }
 
@@ -381,7 +541,7 @@ async function getSeriesInfo(cfg, seriesId) {
     let lastError = null;
     for (let attempt = 1; attempt <= SERIES_INFO_MAX_ATTEMPTS; attempt++) {
         try {
-            const info = await xtremioGet(cfg, 'get_series_info', `&series_id=${seriesId}`, { timeoutMs: 8000 });
+            const info = await xtremioGet(cfg, 'get_series_info', { series_id: seriesId }, { timeoutMs: 8000 });
             if (isUsableSeriesInfo(info)) {
                 setCachedSeriesInfo(cfg, seriesId, info);
                 return info;
@@ -403,14 +563,14 @@ async function getSeriesInfo(cfg, seriesId) {
 
 async function validateXtremioCredentials(serverUrl, username, password) {
     const base = normalizeUrl(serverUrl);
-    const path = `/player_api.php?username=${encodeURIComponent(username)}&password=${encodeURIComponent(password)}`;
     const urls = [base, base.replace(/^https?/, m => m === 'https' ? 'http' : 'https')];
 
     for (const url of urls) {
         const controller = new AbortController();
         const timer = setTimeout(() => controller.abort(), 15000);
         try {
-            const res = await fetch(url + path, { signal: controller.signal, redirect: 'follow' });
+            const apiUrl = buildUrl(url, '/player_api.php', { username, password });
+            const res = await safeFetch(apiUrl, { signal: controller.signal });
             const json = await res.json();
 
             if (!json.user_info) return { valid: false, error: 'Not a valid xTremio server' };
@@ -563,7 +723,7 @@ function renderConfigPage({ serverUrl = '', username = '', password = '', status
                     <ul>
                         <li>You must have a valid, legally obtained Xtream Codes account.</li>
                         <li>You are solely responsible for the content accessed through your provider.</li>
-                        <li>Credentials are encoded into your install URL &mdash; keep it private, do not share it.</li>
+                        <li>Credentials are encrypted into your install URL &mdash; keep it private, do not share it.</li>
                     </ul>
                 </div>
                 <form method="POST">
@@ -696,7 +856,7 @@ app.get(['/:config/catalog/:type/:id.json', '/:config/catalog/:type/:id/:extra.j
             const fullList = vodStreamsCache.get(cfg);
             let items = fullList
                 ? fullList.filter(s => String(s.category_id) === catIdStr)
-                : await getStreams(cfg, 'get_vod_streams', `&category_id=${catIdStr}`);
+                : await getStreams(cfg, 'get_vod_streams', { category_id: catIdStr });
 
             if (extra.search) {
                 const q = extra.search.toLowerCase();
@@ -740,7 +900,7 @@ app.get(['/:config/catalog/:type/:id.json', '/:config/catalog/:type/:id/:extra.j
             const fullList = seriesStreamsCache.get(cfg);
             let items = fullList
                 ? fullList.filter(s => String(s.category_id) === catIdStr)
-                : await getStreams(cfg, 'get_series', `&category_id=${catIdStr}`);
+                : await getStreams(cfg, 'get_series', { category_id: catIdStr });
 
             if (extra.search) {
                 const q = extra.search.toLowerCase();
@@ -818,7 +978,8 @@ app.get('/:config/meta/:type/:id.json', async (req, res) => {
 
     try {
         if (id.startsWith('xtremio_live_')) {
-            const streamId = id.replace('xtremio_live_', '');
+            const streamId = getPrefixedNumericId(id, 'xtremio_live_');
+            if (!streamId) return res.status(400).json({ meta: null });
             const allLive = await getAllLiveStreams(cfg);
             let s = allLive.find(i => String(i.stream_id) === streamId);
 
@@ -836,8 +997,9 @@ app.get('/:config/meta/:type/:id.json', async (req, res) => {
         }
 
         if (id.startsWith('xtremio_movie_')) {
-            const streamId = id.replace('xtremio_movie_', '');
-            const info = await xtremioGet(cfg, 'get_vod_info', `&vod_id=${streamId}`);
+            const streamId = getPrefixedNumericId(id, 'xtremio_movie_');
+            if (!streamId) return res.status(400).json({ meta: null });
+            const info = await xtremioGet(cfg, 'get_vod_info', { vod_id: streamId });
             const movie = info?.info ?? info ?? {};
             const cast = splitList(movie.cast);
             const backdrop = pickBackdrop(movie.backdrop_path);
@@ -864,7 +1026,8 @@ app.get('/:config/meta/:type/:id.json', async (req, res) => {
         }
 
         if (id.startsWith('xtremio_series_')) {
-            const seriesId = id.replace('xtremio_series_', '');
+            const seriesId = getPrefixedNumericId(id, 'xtremio_series_');
+            if (!seriesId) return res.status(400).json({ meta: null });
             let info = null;
             try {
                 info = await getSeriesInfo(cfg, seriesId);
@@ -939,20 +1102,24 @@ app.get('/:config/stream/:type/:id.json', async (req, res) => {
 
         // --- Handle xTremio's own IDs ---
         if (id.startsWith('xtremio_live_')) {
-            const streamId = id.replace('xtremio_live_', '');
+            const streamId = getPrefixedNumericId(id, 'xtremio_live_');
+            if (!streamId) return res.status(400).json({ streams: [] });
+            const encodedUser = encodeURIComponent(username);
+            const encodedPass = encodeURIComponent(password);
             return res.json({
                 streams: [
-                    { url: `${serverUrl}/live/${username}/${password}/${streamId}.m3u8`, title: 'HLS' },
-                    { url: `${serverUrl}/live/${username}/${password}/${streamId}.ts`, title: 'MPEG-TS' }
+                    { url: `${serverUrl}/live/${encodedUser}/${encodedPass}/${streamId}.m3u8`, title: 'HLS' },
+                    { url: `${serverUrl}/live/${encodedUser}/${encodedPass}/${streamId}.ts`, title: 'MPEG-TS' }
                 ],
                 cacheMaxAge: 3600
             });
         }
 
         if (id.startsWith('xtremio_movie_')) {
-            const streamId = id.replace('xtremio_movie_', '');
-            const info = await xtremioGet(cfg, 'get_vod_info', `&vod_id=${streamId}`);
-            const ext = info?.movie_data?.container_extension || 'mp4';
+            const streamId = getPrefixedNumericId(id, 'xtremio_movie_');
+            if (!streamId) return res.status(400).json({ streams: [] });
+            const info = await xtremioGet(cfg, 'get_vod_info', { vod_id: streamId });
+            const ext = normalizeContainerExt(info?.movie_data?.container_extension);
             const proxyUrl = `${getBaseUrl(req)}/${req.params.config}/proxy/movie/${streamId}.${ext}`;
             return res.json({
                 streams: [
@@ -970,16 +1137,15 @@ app.get('/:config/stream/:type/:id.json', async (req, res) => {
 
         if (id.startsWith('xtremio_episode_')) {
             // Format: xtremio_episode_{seriesId}:{season}:{episodeId}
-            const [seriesId, , episodeId] = id.replace('xtremio_episode_', '').split(':');
+            const parsed = parseEpisodeId(id);
+            if (!parsed) return res.status(400).json({ streams: [] });
+            const { seriesId, seasonNum, episodeId } = parsed;
 
             const findExt = (data) => {
-                const episodes = data?.episodes ?? {};
-                for (const eps of Object.values(episodes)) {
-                    if (!Array.isArray(eps)) continue;
-                    const ep = eps.find(e => String(e.id) === episodeId);
-                    if (ep) return ep.container_extension || 'mp4';
-                }
-                return null;
+                const eps = (data?.episodes ?? {})[seasonNum];
+                if (!Array.isArray(eps)) return null;
+                const ep = eps.find(e => String(e.id) === episodeId);
+                return ep ? normalizeContainerExt(ep.container_extension) : null;
             };
 
             const info = await getSeriesInfo(cfg, seriesId);
@@ -1030,9 +1196,13 @@ app.all('/:config/proxy/:kind/:file', async (req, res) => {
     const match = /^([^./]+)\.([A-Za-z0-9]+)$/.exec(file);
     if (!match) return res.status(400).end('bad file');
     const [, streamId, ext] = match;
+    if (!isNumericId(streamId)) return res.status(400).end('bad stream id');
 
     const serverUrl = normalizeUrl(cfg.serverUrl);
-    const upstreamUrl = `${serverUrl}/${kind}/${encodeURIComponent(cfg.username)}/${encodeURIComponent(cfg.password)}/${streamId}.${ext}`;
+    const upstreamUrl = new URL(
+        `/${kind}/${encodeURIComponent(cfg.username)}/${encodeURIComponent(cfg.password)}/${streamId}.${ext}`,
+        serverUrl
+    ).toString();
 
     const headers = { 'User-Agent': PROXY_USER_AGENT };
     if (req.headers.range) headers['Range'] = req.headers.range;
@@ -1051,10 +1221,9 @@ app.all('/:config/proxy/:kind/:file', async (req, res) => {
 
     let upstream;
     try {
-        upstream = await fetch(upstreamUrl, {
+        upstream = await safeFetch(upstreamUrl, {
             method: 'GET',
             headers,
-            redirect: 'follow',
             signal: controller.signal
         });
     } catch (e) {
