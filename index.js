@@ -417,6 +417,12 @@ function pickBackdrop(value) {
 // All in-memory caches share the same TTL.
 const CACHE_TTL = 30 * 60 * 1000;
 
+// A category fetch that partly or wholly failed must not be held for the full
+// TTL: one transient upstream blip would otherwise leave the user with empty
+// catalogs and an empty genre list for 30 minutes, with no way to force a
+// refresh. Retry those soon instead.
+const CACHE_FAILURE_TTL = 60 * 1000;
+
 // Keys must include credentials so two users on the same Xtream host don't
 // share cached catalogs/streams (different accounts can see different content).
 function accountCacheKey(cfg) {
@@ -427,25 +433,33 @@ const catCache = new Map();
 
 async function getCategories(cfg) {
     const key = accountCacheKey(cfg);
+    // Kept even once expired: stale categories beat empty ones if a refresh fails.
     const cached = catCache.get(key);
-    if (cached && cached.ts > Date.now() - CACHE_TTL) return cached;
+    if (cached && cached.ts > Date.now() - cached.ttl) return cached;
+
     const results = await Promise.allSettled([
         xtremioGet(cfg, 'get_live_categories'),
         xtremioGet(cfg, 'get_vod_categories'),
         xtremioGet(cfg, 'get_series_categories')
     ]);
-    const pick = r => (r.status === 'fulfilled' && Array.isArray(r.value)) ? r.value : [];
+    const pick = (r, stale) => (r.status === 'fulfilled' && Array.isArray(r.value)) ? r.value : (stale || []);
     results.forEach((r, i) => {
         if (r.status === 'rejected') {
             console.error(`[getCategories] source ${i} failed:`, r.reason?.message || r.reason);
         }
     });
+
+    const failed = results.some(r => r.status !== 'fulfilled' || !Array.isArray(r.value));
     const entry = {
-        live: pick(results[0]),
-        movies: pick(results[1]),
-        series: pick(results[2]),
-        ts: Date.now()
+        live: pick(results[0], cached?.live),
+        movies: pick(results[1], cached?.movies),
+        series: pick(results[2], cached?.series),
+        ts: Date.now(),
+        ttl: failed ? CACHE_FAILURE_TTL : CACHE_TTL
     };
+    if (failed) {
+        console.warn(`[getCategories] partial or total failure; serving ${cached ? 'stale' : 'empty'} data, retrying in ${CACHE_FAILURE_TTL / 1000}s`);
+    }
     catCache.set(key, entry);
     return entry;
 }
@@ -774,7 +788,15 @@ function renderConfigPage({ serverUrl = '', username = '', password = '', status
     </body></html>`;
 }
 
+// The configure page echoes back the password and embeds the install token.
+// Keep it out of shared caches, browser history, and outbound Referer headers.
+function setPrivateHeaders(res) {
+    res.setHeader('Cache-Control', 'no-store');
+    res.setHeader('Referrer-Policy', 'no-referrer');
+}
+
 app.get('/configure', (req, res) => {
+    setPrivateHeaders(res);
     const existing = decodeConfig(req.query.config) || {};
     res.send(renderConfigPage({
         serverUrl: req.query.serverUrl || existing.serverUrl || '',
@@ -785,6 +807,7 @@ app.get('/configure', (req, res) => {
 });
 
 app.post('/configure', async (req, res) => {
+    setPrivateHeaders(res);
     const rawServerUrl = (req.body.serverUrl || '').trim().replace(/\/+$/, '');
     const username = req.body.username || '';
     const password = req.body.password || '';
