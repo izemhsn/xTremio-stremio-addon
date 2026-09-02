@@ -1438,32 +1438,69 @@ app.get('/health', (req, res) => {
     res.json({ status: 'ok', uptime: process.uptime() });
 });
 
-const server = app.listen(PORT, HOST, () => {
-    console.log(`Addon running at http://${HOST === '0.0.0.0' ? 'localhost' : HOST}:${PORT}`);
-    console.log(`Configure: http://localhost:${PORT}/configure`);
-});
+// Only bind the port and install process-wide handlers when run directly, so
+// `require('./index.js')` from a test can exercise the internals below without
+// starting a server or hijacking the test runner's exception handling.
+if (require.main === module) {
+    const server = app.listen(PORT, HOST, () => {
+        console.log(`Addon running at http://${HOST === '0.0.0.0' ? 'localhost' : HOST}:${PORT}`);
+        console.log(`Configure: http://localhost:${PORT}/configure`);
+    });
 
-server.on('error', (err) => {
-    if (err.code === 'EADDRINUSE') {
-        console.error(`Port ${PORT} is already in use. Kill the existing process or use a different port: PORT=3001 npm start`);
-    } else {
-        console.error('Server error:', err.message);
-    }
-    process.exit(1);
-});
+    server.on('error', (err) => {
+        if (err.code === 'EADDRINUSE') {
+            console.error(`Port ${PORT} is already in use. Kill the existing process or use a different port: PORT=3001 npm start`);
+        } else {
+            console.error('Server error:', err.message);
+        }
+        process.exit(1);
+    });
 
-process.on('SIGTERM', () => { console.log('SIGTERM received, shutting down...'); server.close(() => process.exit(0)); });
-process.on('SIGINT', () => { console.log('SIGINT received, shutting down...'); server.close(() => process.exit(0)); });
-process.on('uncaughtException', (err) => {
-    // AbortErrors are expected when a client disconnects mid-stream from the proxy.
-    if (err && (err.name === 'AbortError' || err.code === 'ABORT_ERR')) return;
-    // Process state is undefined after an uncaught throw. Exiting lets the
-    // platform restart us; staying up serves requests from a wedged process
-    // that /health would still report as healthy.
-    console.error('Uncaught exception, exiting:', err);
-    process.exit(1);
-});
-process.on('unhandledRejection', (err) => {
-    if (err && (err.name === 'AbortError' || err.code === 'ABORT_ERR')) return;
-    console.error('Unhandled rejection:', err);
-});
+    process.on('SIGTERM', () => { console.log('SIGTERM received, shutting down...'); server.close(() => process.exit(0)); });
+    process.on('SIGINT', () => { console.log('SIGINT received, shutting down...'); server.close(() => process.exit(0)); });
+    process.on('uncaughtException', (err) => {
+        // AbortErrors are expected when a client disconnects mid-stream from the proxy.
+        if (err && (err.name === 'AbortError' || err.code === 'ABORT_ERR')) return;
+        // Process state is undefined after an uncaught throw. Exiting lets the
+        // platform restart us; staying up serves requests from a wedged process
+        // that /health would still report as healthy.
+        console.error('Uncaught exception, exiting:', err);
+        process.exit(1);
+    });
+    process.on('unhandledRejection', (err) => {
+        if (err && (err.name === 'AbortError' || err.code === 'ABORT_ERR')) return;
+        console.error('Unhandled rejection:', err);
+    });
+}
+
+// Exported for the test suite only — nothing here is a public API.
+module.exports = {
+    app,
+    encodeConfig,
+    decodeConfig,
+    validateConfig,
+    getBaseUrl,
+    escapeHtml,
+    normalizeUrl,
+    buildUrl,
+    buildXtremioApiUrl,
+    isNumericId,
+    getPrefixedNumericId,
+    parseEpisodeId,
+    normalizeContainerExt,
+    isNotWebReady,
+    isPrivateIp,
+    assertSafeOutboundUrl,
+    parseExtra,
+    parseYear,
+    toIsoDate,
+    splitList,
+    pickBackdrop,
+    isUsableSeriesInfo,
+    getCategories,
+    accountCacheKey,
+    catCache,
+    CACHE_TTL,
+    CACHE_FAILURE_TTL,
+    PAGE_SIZE
+};
