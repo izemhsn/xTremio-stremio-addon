@@ -25,15 +25,30 @@ const CONFIG_SECRET = RAW_CONFIG_SECRET
 const CONFIG_ENC_KEY = crypto.createHash('sha256').update('xtremio-config-enc').update(CONFIG_SECRET).digest();
 const CONFIG_MAC_KEY = crypto.createHash('sha256').update('xtremio-config-mac').update(CONFIG_SECRET).digest();
 const ALLOW_PRIVATE_NETWORKS = process.env.ALLOW_PRIVATE_NETWORKS === 'true';
+const PUBLIC_URL = process.env.PUBLIC_URL ? normalizeUrl(process.env.PUBLIC_URL) : null;
 
 if (!RAW_CONFIG_SECRET) {
     console.warn('[security] CONFIG_SECRET is not set; install URLs will be invalid after restart. Set CONFIG_SECRET to a long random value for persistent encrypted config tokens.');
 }
 
+// Host and X-Forwarded-* are attacker-controllable unless a trusted proxy sets
+// them, and the result is embedded in the install link handed out by
+// /configure — a poisoned host would send users' config tokens elsewhere.
+// Accept only a plain host[:port] (or bracketed IPv6); set PUBLIC_URL to pin it.
+const SAFE_HOST = /^[A-Za-z0-9._~[\]:-]+$/;
+
+// Proxies may append to these headers ("https,http"); the first value is ours.
+function firstHeaderValue(value) {
+    return String(value || '').split(',')[0].trim();
+}
+
 function getBaseUrl(req) {
-    const proto = req.headers['x-forwarded-proto'] || req.protocol || 'http';
-    const host = req.headers['x-forwarded-host'] || req.headers.host || `localhost:${PORT}`;
-    return `${proto}://${host}`;
+    if (PUBLIC_URL) return PUBLIC_URL;
+    const proto = firstHeaderValue(req.headers['x-forwarded-proto']) || req.protocol || 'http';
+    const host = firstHeaderValue(req.headers['x-forwarded-host']) || req.headers.host || '';
+    const safeProto = /^https?$/.test(proto) ? proto : 'http';
+    const safeHost = SAFE_HOST.test(host) ? host : `localhost:${PORT}`;
+    return `${safeProto}://${safeHost}`;
 }
 
 function escapeHtml(str) {
@@ -481,12 +496,15 @@ async function getAllLiveStreams(cfg) {
     return items;
 }
 
+// Express has already percent-decoded the :extra route param, so pairs are
+// split as-is. Decoding a second time corrupts values containing a literal '%'
+// and throws URIError on ones like "100%" (a legitimate search term).
 function parseExtra(extra) {
     const params = {};
     if (extra) {
         extra.split('&').forEach(p => {
             const [k, ...rest] = p.split('=');
-            params[decodeURIComponent(k)] = decodeURIComponent(rest.join('='));
+            params[k] = rest.join('=');
         });
     }
     return params;
@@ -618,8 +636,8 @@ function renderConfigPage({ serverUrl = '', username = '', password = '', status
     if (status) {
         if (status.valid) {
             const encoded = encodeConfig({ serverUrl, username, password });
-            const installUrl = `stremio://${baseUrl.replace(/^https?:\/\//, '')}/${encoded}/manifest.json`;
-            const httpUrl = `${baseUrl}/${encoded}/manifest.json`;
+            const installUrl = escapeHtml(`stremio://${baseUrl.replace(/^https?:\/\//, '')}/${encoded}/manifest.json`);
+            const httpUrl = escapeHtml(`${baseUrl}/${encoded}/manifest.json`);
             statusHtml = `
                 <div class="status-section">
                     <div class="status-banner status-success">
@@ -800,11 +818,12 @@ app.get(['/:config/catalog/:type/:id.json', '/:config/catalog/:type/:id/:extra.j
     if (!cfg) return res.json({ metas: [] });
 
     const { id } = req.params;
-    const extra = parseExtra(req.params.extra);
-    const skip = parseInt(extra.skip) || 0;
-    const genre = extra.genre;
 
     try {
+        const extra = parseExtra(req.params.extra);
+        const skip = Math.max(0, parseInt(extra.skip) || 0);
+        const genre = extra.genre;
+
         if (id === 'xtremio_live') {
             const cats = await getCategories(cfg);
             const selectedGenre = genre || (cats.live[0] && cats.live[0].category_name);
@@ -1415,7 +1434,11 @@ process.on('SIGINT', () => { console.log('SIGINT received, shutting down...'); s
 process.on('uncaughtException', (err) => {
     // AbortErrors are expected when a client disconnects mid-stream from the proxy.
     if (err && (err.name === 'AbortError' || err.code === 'ABORT_ERR')) return;
-    console.error('Uncaught exception:', err);
+    // Process state is undefined after an uncaught throw. Exiting lets the
+    // platform restart us; staying up serves requests from a wedged process
+    // that /health would still report as healthy.
+    console.error('Uncaught exception, exiting:', err);
+    process.exit(1);
 });
 process.on('unhandledRejection', (err) => {
     if (err && (err.name === 'AbortError' || err.code === 'ABORT_ERR')) return;

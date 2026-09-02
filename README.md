@@ -31,6 +31,7 @@ Catalog sections (Live TV, XT-Movies, XT-Series) then appear in Stremio's sideba
 |---|---|---|
 | `PORT` | `3000` | Port the HTTP server binds to |
 | `HOST` | `0.0.0.0` | Interface to bind |
+| `PUBLIC_URL` | *(derived from request headers)* | Pins the externally visible base URL used in install links. Recommended behind a reverse proxy — without it the addon derives the base URL from `X-Forwarded-Host`/`Host`, which a client can supply. |
 
 Example: `PORT=4000 HOST=127.0.0.1 npm start`.
 
