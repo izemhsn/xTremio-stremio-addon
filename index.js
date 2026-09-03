@@ -705,12 +705,12 @@ async function validateXtremioCredentials(serverUrl, username, password) {
             };
         } catch (e) {
             if (url === urls[0] && urls.length > 1) continue;
-            const msg = e.name === 'AbortError' ? 'Connection timed out'
-                : e.cause?.code === 'ECONNREFUSED' ? 'Connection refused — check server URL and port'
-                    : e.cause?.code === 'ENOTFOUND' ? 'Server not found — check the URL'
-                        : e.cause?.code === 'ECONNRESET' ? 'Connection reset by server'
-                            : e.message || 'Cannot connect to server';
-            return { valid: false, error: msg };
+            // Distinguishing ECONNREFUSED / ENOTFOUND / timeout back to an
+            // unauthenticated caller turns this page into a port scanner: the
+            // reply says whether an arbitrary host:port is closed, nonexistent,
+            // or filtered. The operator still gets the detail in the log.
+            console.warn(`[configure] connection to ${new URL(url).host} failed: ${e.name === 'AbortError' ? 'timeout' : e.cause?.code || e.message}`);
+            return { valid: false, error: 'Cannot reach that server — check the URL and port.' };
         } finally {
             clearTimeout(timer);
         }
@@ -871,6 +871,54 @@ function setPrivateHeaders(res) {
     res.setHeader('Referrer-Policy', 'no-referrer');
 }
 
+// POST /configure makes an outbound request to a host the caller chooses, with
+// credentials the caller chooses, before any authentication. Unmetered, that
+// makes the instance a port scanner and a credential-stuffing relay running on
+// this server's IP. A handful of attempts per minute is far more than a human
+// configuring an addon needs.
+const CONFIGURE_RATE_LIMIT = Math.max(1, Number(process.env.CONFIGURE_RATE_LIMIT) || 10);
+const CONFIGURE_RATE_WINDOW_MS = Math.max(1000, Number(process.env.CONFIGURE_RATE_WINDOW_MS) || 60 * 1000);
+// Bound the map so the limiter cannot itself become a memory-exhaustion vector;
+// once full, new clients are let through rather than locking out the instance.
+const CONFIGURE_RATE_MAX_CLIENTS = 10000;
+const configureAttempts = new Map();
+
+// X-Forwarded-For is client-suppliable, so honoring it without a proxy in front
+// would let anyone reset their own bucket by varying the header. Off by default;
+// behind a proxy every request otherwise shares the proxy's bucket.
+const TRUST_PROXY = process.env.TRUST_PROXY === 'true';
+
+function clientKey(req) {
+    if (TRUST_PROXY) {
+        const fwd = firstHeaderValue(req.headers['x-forwarded-for']);
+        if (fwd) return fwd;
+    }
+    return req.socket?.remoteAddress || 'unknown';
+}
+
+// Fixed window: on the first hit of a window the count resets. Sweeping expired
+// entries on each call keeps the map proportional to *active* clients.
+function rateLimitConfigure(req) {
+    const now = Date.now();
+    for (const [key, entry] of configureAttempts) {
+        if (entry.resetAt <= now) configureAttempts.delete(key);
+    }
+
+    const key = clientKey(req);
+    const entry = configureAttempts.get(key);
+    if (!entry) {
+        if (configureAttempts.size >= CONFIGURE_RATE_MAX_CLIENTS) return { allowed: true, retryAfter: 0 };
+        configureAttempts.set(key, { count: 1, resetAt: now + CONFIGURE_RATE_WINDOW_MS });
+        return { allowed: true, retryAfter: 0 };
+    }
+
+    entry.count += 1;
+    if (entry.count > CONFIGURE_RATE_LIMIT) {
+        return { allowed: false, retryAfter: Math.ceil((entry.resetAt - now) / 1000) };
+    }
+    return { allowed: true, retryAfter: 0 };
+}
+
 app.get('/configure', (req, res) => {
     setPrivateHeaders(res);
     const existing = decodeConfig(req.query.config) || {};
@@ -887,6 +935,19 @@ app.post('/configure', async (req, res) => {
     const rawServerUrl = (req.body.serverUrl || '').trim().replace(/\/+$/, '');
     const username = req.body.username || '';
     const password = req.body.password || '';
+
+    const limit = rateLimitConfigure(req);
+    if (!limit.allowed) {
+        res.status(429);
+        res.setHeader('Retry-After', String(limit.retryAfter));
+        return res.send(renderConfigPage({
+            serverUrl: rawServerUrl,
+            username,
+            password,
+            status: { valid: false, error: `Too many attempts. Try again in ${limit.retryAfter} second${limit.retryAfter === 1 ? '' : 's'}.` },
+            baseUrl: getBaseUrl(req)
+        }));
+    }
 
     try {
         const validation = await validateXtremioCredentials(rawServerUrl, username, password);
@@ -1602,5 +1663,11 @@ module.exports = {
     seriesInfoCache,
     CACHE_TTL,
     CACHE_FAILURE_TTL,
-    PAGE_SIZE
+    PAGE_SIZE,
+    rateLimitConfigure,
+    configureAttempts,
+    clientKey,
+    CONFIGURE_RATE_LIMIT,
+    CONFIGURE_RATE_WINDOW_MS,
+    CONFIGURE_RATE_MAX_CLIENTS
 };
