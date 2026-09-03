@@ -32,6 +32,8 @@ Catalog sections (Live TV, XT-Movies, XT-Series) then appear in Stremio's sideba
 | `PORT` | `3000` | Port the HTTP server binds to |
 | `HOST` | `0.0.0.0` | Interface to bind |
 | `PUBLIC_URL` | *(derived from request headers)* | Pins the externally visible base URL used in install links. Recommended behind a reverse proxy — without it the addon derives the base URL from `X-Forwarded-Host`/`Host`, which a client can supply. |
+| `MAX_UPSTREAM_MB` | `64` | Ceiling on a single JSON response read from the Xtream provider. Raise it only if a very large provider legitimately exceeds it; a 50k-title catalog is roughly 25 MB. |
+| `PROXY_HEADER_TIMEOUT_MS` | `20000` | How long the stream proxy waits for upstream response *headers*. Does not limit the body, so long playback is unaffected. |
 
 Example: `PORT=4000 HOST=127.0.0.1 npm start`.
 

@@ -313,6 +313,10 @@ function isNotWebReady(url, ext) {
 // Browser-like UA — many Xtream CDNs reject or shortchange non-browser UAs.
 const PROXY_USER_AGENT = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0 Safari/537.36';
 
+// How long to wait for upstream response headers in the proxy. Applies to the
+// headers only — never to the body, which is a legitimate long-lived stream.
+const PROXY_HEADER_TIMEOUT_MS = Math.max(1000, Number(process.env.PROXY_HEADER_TIMEOUT_MS) || 20000);
+
 function ipv4ToLong(ip) {
     return ip.split('.').reduce((acc, part) => ((acc << 8) + Number(part)) >>> 0, 0);
 }
@@ -377,6 +381,38 @@ async function safeFetch(inputUrl, options = {}, { maxRedirects = 3 } = {}) {
     throw new Error('Too many redirects');
 }
 
+// The upstream host is supplied by the user and reachable before any
+// authentication, so an unbounded res.json() lets a hostile or broken provider
+// stream until the process runs out of memory. Large providers legitimately
+// return tens of MB for get_vod_streams, so the cap is generous but finite.
+const MAX_UPSTREAM_BYTES = Math.max(1, Number(process.env.MAX_UPSTREAM_MB) || 64) * 1024 * 1024;
+
+async function readJsonCapped(res, label, maxBytes = MAX_UPSTREAM_BYTES) {
+    // Trust a declared length to reject early, before reading a single byte.
+    const declared = Number(res.headers?.get?.('content-length'));
+    if (Number.isFinite(declared) && declared > maxBytes) {
+        throw new Error(`${label} response too large: ${declared} bytes exceeds ${maxBytes}`);
+    }
+    // A stub or a body-less response has nothing to meter; fall back.
+    if (!res.body || typeof res.body.getReader !== 'function') return res.json();
+
+    const reader = res.body.getReader();
+    const chunks = [];
+    let total = 0;
+    for (;;) {
+        const { done, value } = await reader.read();
+        if (done) break;
+        total += value.byteLength;
+        if (total > maxBytes) {
+            // Stop pulling from the socket rather than finishing the download.
+            await reader.cancel().catch(() => {});
+            throw new Error(`${label} response exceeded ${maxBytes} bytes`);
+        }
+        chunks.push(Buffer.from(value));
+    }
+    return JSON.parse(Buffer.concat(chunks).toString('utf8'));
+}
+
 async function xtremioGet(cfg, action, params = {}, { timeoutMs = 15000 } = {}) {
     const url = buildXtremioApiUrl(cfg, action, params);
     const controller = new AbortController();
@@ -384,7 +420,7 @@ async function xtremioGet(cfg, action, params = {}, { timeoutMs = 15000 } = {}) 
     try {
         const res = await safeFetch(url, { signal: controller.signal });
         if (!res.ok) throw new Error(`xtremio ${action} failed: HTTP ${res.status}`);
-        const data = await res.json();
+        const data = await readJsonCapped(res, `xtremio ${action}`);
 
         console.log(`[xtremioGet] ${action} (${Array.isArray(data) ? data.length : '?'} items)`);
 
@@ -641,7 +677,9 @@ async function validateXtremioCredentials(serverUrl, username, password) {
         try {
             const apiUrl = buildUrl(url, '/player_api.php', { username, password });
             const res = await safeFetch(apiUrl, { signal: controller.signal });
-            const json = await res.json();
+            // Unauthenticated entry point against a user-supplied host: a small
+            // cap here, since an auth response is tiny and anything large is abuse.
+            const json = await readJsonCapped(res, 'credential check', 1024 * 1024);
 
             if (!json.user_info) return { valid: false, error: 'Not a valid xTremio server' };
             if (json.user_info.auth !== 1) return { valid: false, error: 'Invalid username or password' };
@@ -1300,6 +1338,12 @@ app.all('/:config/proxy/:kind/:file', async (req, res) => {
     const isAbortErr = (e) => e && (e.name === 'AbortError' || e.code === 'ABORT_ERR' || controller.signal.aborted);
 
     let upstream;
+    // Bound the wait for response *headers* only. An upstream that accepts the
+    // connection and then stalls would otherwise pin this request and its
+    // socket forever. The timer is cleared as soon as headers arrive so the
+    // body itself can stream for as long as playback needs.
+    let headersTimedOut = false;
+    const headerTimer = setTimeout(() => { headersTimedOut = true; abort(); }, PROXY_HEADER_TIMEOUT_MS);
     try {
         upstream = await safeFetch(upstreamUrl, {
             method: 'GET',
@@ -1307,11 +1351,18 @@ app.all('/:config/proxy/:kind/:file', async (req, res) => {
             signal: controller.signal
         });
     } catch (e) {
+        if (headersTimedOut) {
+            console.warn(`[proxy] upstream headers timed out after ${PROXY_HEADER_TIMEOUT_MS}ms for ${kind}/${streamId}.${ext}`);
+            if (!res.headersSent) res.status(504).end('upstream timeout');
+            return;
+        }
         if (!isAbortErr(e)) {
             console.warn(`[proxy] upstream fetch failed for ${kind}/${streamId}.${ext}: ${e.message}`);
         }
         if (!res.headersSent) res.status(502).end('upstream fetch failed');
         return;
+    } finally {
+        clearTimeout(headerTimer);
     }
 
     res.status(upstream.status);
@@ -1528,6 +1579,8 @@ module.exports = {
     normalizeContainerExt,
     isNotWebReady,
     isPrivateIp,
+    readJsonCapped,
+    MAX_UPSTREAM_BYTES,
     assertSafeOutboundUrl,
     parseExtra,
     parseYear,
