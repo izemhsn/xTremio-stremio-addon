@@ -431,10 +431,19 @@ function accountCacheKey(cfg) {
 
 const catCache = new Map();
 
-async function getCategories(cfg) {
+const categoriesSingleFlight = createSingleFlight();
+
+function getCategories(cfg) {
     const key = accountCacheKey(cfg);
     // Kept even once expired: stale categories beat empty ones if a refresh fails.
     const cached = catCache.get(key);
+    if (cached && cached.ts > Date.now() - cached.ttl) return Promise.resolve(cached);
+    return categoriesSingleFlight(key, () => refreshCategories(cfg, key));
+}
+
+async function refreshCategories(cfg, key) {
+    const cached = catCache.get(key);
+    // A concurrent flight may have refreshed it while we queued.
     if (cached && cached.ts > Date.now() - cached.ttl) return cached;
 
     const results = await Promise.allSettled([
@@ -464,9 +473,26 @@ async function getCategories(cfg) {
     return entry;
 }
 
+// Deduplicates concurrent misses for the same key. Stremio opens many catalog
+// requests in parallel on install, and without this each one fires its own
+// multi-megabyte upstream fetch for a list the others are already loading.
+function createSingleFlight() {
+    const pending = new Map();
+    return function singleFlight(key, fn) {
+        const existing = pending.get(key);
+        if (existing) return existing;
+        // Errors are not cached: the entry is dropped either way, so the next
+        // caller retries rather than inheriting a stale rejection.
+        const promise = Promise.resolve().then(fn).finally(() => pending.delete(key));
+        pending.set(key, promise);
+        return promise;
+    };
+}
+
 // Stream list caches - populated on first fetch, reused for catalogs, search and meta
 function createStreamListCache() {
     const map = new Map();
+    const singleFlight = createSingleFlight();
     return {
         get(cfg) {
             const cached = map.get(accountCacheKey(cfg));
@@ -475,6 +501,20 @@ function createStreamListCache() {
         },
         set(cfg, items) {
             map.set(accountCacheKey(cfg), { data: items, ts: Date.now() });
+        },
+        // Cache-aside read: serves a warm entry, otherwise runs `fetcher` once
+        // no matter how many callers arrive while it is in flight.
+        load(cfg, fetcher) {
+            const cached = this.get(cfg);
+            if (cached) return Promise.resolve(cached);
+            return singleFlight(accountCacheKey(cfg), async () => {
+                // Re-check: a concurrent flight may have populated it already.
+                const warm = this.get(cfg);
+                if (warm) return warm;
+                const items = await fetcher();
+                this.set(cfg, items);
+                return items;
+            });
         }
     };
 }
@@ -483,31 +523,16 @@ const liveStreamsCache = createStreamListCache();
 const vodStreamsCache = createStreamListCache();
 const seriesStreamsCache = createStreamListCache();
 
-async function getAllVodStreams(cfg) {
-    let items = vodStreamsCache.get(cfg);
-    if (!items) {
-        items = await getStreams(cfg, 'get_vod_streams');
-        vodStreamsCache.set(cfg, items);
-    }
-    return items;
+function getAllVodStreams(cfg) {
+    return vodStreamsCache.load(cfg, () => getStreams(cfg, 'get_vod_streams'));
 }
 
-async function getAllSeriesStreams(cfg) {
-    let items = seriesStreamsCache.get(cfg);
-    if (!items) {
-        items = await getStreams(cfg, 'get_series');
-        seriesStreamsCache.set(cfg, items);
-    }
-    return items;
+function getAllSeriesStreams(cfg) {
+    return seriesStreamsCache.load(cfg, () => getStreams(cfg, 'get_series'));
 }
 
-async function getAllLiveStreams(cfg) {
-    let items = liveStreamsCache.get(cfg);
-    if (!items) {
-        items = await getStreams(cfg, 'get_live_streams');
-        liveStreamsCache.set(cfg, items);
-    }
-    return items;
+function getAllLiveStreams(cfg) {
+    return liveStreamsCache.load(cfg, () => getStreams(cfg, 'get_live_streams'));
 }
 
 // Express has already percent-decoded the :extra route param, so pairs are
@@ -565,7 +590,20 @@ function setCachedSeriesInfo(cfg, seriesId, data) {
     seriesInfoCache.set(seriesInfoCacheKey(cfg, seriesId), { data, ts: Date.now() });
 }
 
-async function getSeriesInfo(cfg, seriesId) {
+const seriesInfoSingleFlight = createSingleFlight();
+
+// Opening a series fires meta and stream requests that both land here, and a
+// miss costs up to 3 upstream attempts with backoff — worth deduplicating.
+function getSeriesInfo(cfg, seriesId) {
+    const hit = getCachedSeriesInfo(cfg, seriesId);
+    if (hit) return Promise.resolve(hit);
+    return seriesInfoSingleFlight(
+        seriesInfoCacheKey(cfg, seriesId),
+        () => fetchSeriesInfo(cfg, seriesId)
+    );
+}
+
+async function fetchSeriesInfo(cfg, seriesId) {
     const hit = getCachedSeriesInfo(cfg, seriesId);
     if (hit) return hit;
 
@@ -1498,8 +1536,17 @@ module.exports = {
     pickBackdrop,
     isUsableSeriesInfo,
     getCategories,
+    getAllVodStreams,
+    getAllSeriesStreams,
+    getAllLiveStreams,
+    getSeriesInfo,
+    createSingleFlight,
     accountCacheKey,
     catCache,
+    vodStreamsCache,
+    seriesStreamsCache,
+    liveStreamsCache,
+    seriesInfoCache,
     CACHE_TTL,
     CACHE_FAILURE_TTL,
     PAGE_SIZE
