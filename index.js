@@ -465,7 +465,85 @@ function accountCacheKey(cfg) {
     return `${cfg.serverUrl}\n${cfg.username}\n${cfg.password}`;
 }
 
-const catCache = new Map();
+// Every cache below was previously an unbounded Map whose TTL was only checked
+// on read, so nothing was ever deleted: memory grew with every distinct account
+// and every series ever opened, and never shrank when users went away.
+//
+// Extending Map keeps the whole existing surface (`get`/`set`/`size`/iteration)
+// working unchanged. Map iterates in insertion order, so re-inserting an entry
+// when it is read makes the *first* key the least recently used one — which is
+// the one to drop when the cache is full.
+class BoundedMap extends Map {
+    constructor({ maxEntries, maxAgeMs = null }) {
+        super();
+        this.maxEntries = maxEntries;
+        this.maxAgeMs = maxAgeMs;
+    }
+
+    get(key) {
+        const entry = super.get(key);
+        if (entry === undefined) return undefined;
+        // Touch: delete + re-insert moves this key to the most-recent end.
+        super.delete(key);
+        super.set(key, entry);
+        return entry;
+    }
+
+    // Read without disturbing LRU order, for callers that are only inspecting.
+    peek(key) {
+        return super.get(key);
+    }
+
+    set(key, value) {
+        super.delete(key);
+        super.set(key, value);
+        while (this.size > this.maxEntries) {
+            // Map keys iterate oldest-first; the first is the LRU victim.
+            const oldest = this.keys().next();
+            if (oldest.done) break;
+            super.delete(oldest.value);
+        }
+        return this;
+    }
+
+    // Drops entries past maxAgeMs. Caches whose expired entries are still
+    // useful (see catCache) pass a deliberately generous age, or none at all.
+    sweep(now = Date.now()) {
+        if (!this.maxAgeMs) return 0;
+        let dropped = 0;
+        for (const [key, entry] of this) {
+            if (entry && typeof entry.ts === 'number' && entry.ts <= now - this.maxAgeMs) {
+                super.delete(key);
+                dropped++;
+            }
+        }
+        return dropped;
+    }
+}
+
+// Category lists are small (a few KB per account), so the bound here is about
+// account count, not bytes.
+const CACHE_MAX_ACCOUNTS = Math.max(1, Number(process.env.CACHE_MAX_ACCOUNTS) || 100);
+
+// Full stream lists run 10-50 MB *per account per kind*, so this bound is the
+// one that actually caps memory. Evicting costs one upstream refetch; keeping
+// too many costs the process.
+const CACHE_MAX_STREAM_ACCOUNTS = Math.max(1, Number(process.env.CACHE_MAX_STREAM_ACCOUNTS) || 4);
+
+// One entry per series *per account* — the only dimension that grows without
+// bound for a single user just browsing.
+const CACHE_MAX_SERIES_INFO = Math.max(1, Number(process.env.CACHE_MAX_SERIES_INFO) || 500);
+
+// getCategories intentionally serves expired categories when a refresh fails
+// (stale beats empty — see CACHE_FAILURE_TTL), so age-sweeping catCache on the
+// normal TTL would destroy that fallback. This hard age only reclaims accounts
+// that have genuinely stopped being used.
+const CACHE_STALE_MAX_AGE_MS = 24 * 60 * 60 * 1000;
+
+const catCache = new BoundedMap({
+    maxEntries: CACHE_MAX_ACCOUNTS,
+    maxAgeMs: CACHE_STALE_MAX_AGE_MS
+});
 
 const categoriesSingleFlight = createSingleFlight();
 
@@ -527,9 +605,16 @@ function createSingleFlight() {
 
 // Stream list caches - populated on first fetch, reused for catalogs, search and meta
 function createStreamListCache() {
-    const map = new Map();
+    // Expired entries here are never served as a fallback (`get` returns null
+    // once past the TTL), so they can be swept on the normal TTL — and these
+    // are by far the largest entries, so reclaiming them matters most.
+    const map = new BoundedMap({
+        maxEntries: CACHE_MAX_STREAM_ACCOUNTS,
+        maxAgeMs: CACHE_TTL
+    });
     const singleFlight = createSingleFlight();
     return {
+        map,
         get(cfg) {
             const cached = map.get(accountCacheKey(cfg));
             if (cached && cached.ts > Date.now() - CACHE_TTL) return cached.data;
@@ -610,7 +695,33 @@ function isUsableSeriesInfo(info) {
 const SERIES_INFO_MAX_ATTEMPTS = 3;
 const SERIES_INFO_BACKOFF_MS = 500;
 
-const seriesInfoCache = new Map();
+const seriesInfoCache = new BoundedMap({
+    maxEntries: CACHE_MAX_SERIES_INFO,
+    maxAgeMs: CACHE_TTL
+});
+
+// The LRU bound caps the worst case, but on its own it only reclaims memory
+// when something new arrives. An instance whose users have all gone away would
+// hold its last entries forever, so sweep on a timer too.
+const CACHE_SWEEP_INTERVAL_MS = Math.max(30 * 1000, Number(process.env.CACHE_SWEEP_INTERVAL_MS) || 5 * 60 * 1000);
+
+function sweepCaches(now = Date.now()) {
+    return catCache.sweep(now)
+        + seriesInfoCache.sweep(now)
+        + liveStreamsCache.map.sweep(now)
+        + vodStreamsCache.map.sweep(now)
+        + seriesStreamsCache.map.sweep(now);
+}
+
+function startCacheSweeper() {
+    const timer = setInterval(() => {
+        const dropped = sweepCaches();
+        if (dropped) console.log(`[cache] swept ${dropped} expired entr${dropped === 1 ? 'y' : 'ies'}`);
+    }, CACHE_SWEEP_INTERVAL_MS);
+    // Never hold the process open for a cache sweep.
+    timer.unref();
+    return timer;
+}
 
 function seriesInfoCacheKey(cfg, seriesId) {
     return `${cfg.serverUrl}\n${cfg.username}\n${cfg.password}\n${seriesId}`;
@@ -1592,6 +1703,10 @@ app.get('/health', (req, res) => {
 // `require('./index.js')` from a test can exercise the internals below without
 // starting a server or hijacking the test runner's exception handling.
 if (require.main === module) {
+    // Only when actually serving: importing this module for tests should not
+    // leave a timer running.
+    startCacheSweeper();
+
     const server = app.listen(PORT, HOST, () => {
         console.log(`Addon running at http://${HOST === '0.0.0.0' ? 'localhost' : HOST}:${PORT}`);
         console.log(`Configure: http://localhost:${PORT}/configure`);
@@ -1664,6 +1779,13 @@ module.exports = {
     CACHE_TTL,
     CACHE_FAILURE_TTL,
     PAGE_SIZE,
+    BoundedMap,
+    sweepCaches,
+    startCacheSweeper,
+    CACHE_MAX_ACCOUNTS,
+    CACHE_MAX_STREAM_ACCOUNTS,
+    CACHE_MAX_SERIES_INFO,
+    CACHE_STALE_MAX_AGE_MS,
     rateLimitConfigure,
     configureAttempts,
     clientKey,

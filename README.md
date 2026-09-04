@@ -4,7 +4,7 @@ A self-hosted [Stremio](https://www.stremio.com/) addon that exposes any [Xtream
 
 - **Stateless** — credentials are encrypted into the install URL; the server keeps no user files or database.
 - **Multi-user** — one running instance serves many users; each one has their own install URL.
-- **Fast** — in-memory caching for categories, full stream lists, and series info (30-minute TTL).
+- **Fast** — in-memory caching for categories, full stream lists, and series info (30-minute TTL, LRU-bounded).
 - **Global search** — search across all movies and series with a single upstream call per kind.
 - **Resilient** — retries `get_series_info` up to 3× with backoff on transient failures.
 
@@ -36,6 +36,10 @@ Catalog sections (Live TV, XT-Movies, XT-Series) then appear in Stremio's sideba
 | `TRUST_PROXY` | `false` | Set to `true` only when a reverse proxy you control sits in front, so `X-Forwarded-For` identifies the client for rate limiting. Left off, the socket address is used — behind a proxy that means every user shares one bucket. Turned on with no proxy in front, anyone can vary the header to get unlimited fresh buckets. |
 | `CONFIGURE_RATE_LIMIT` | `10` | Maximum `POST /configure` attempts per client per window. |
 | `CONFIGURE_RATE_WINDOW_MS` | `60000` | Length of that window, in milliseconds. |
+| `CACHE_MAX_STREAM_ACCOUNTS` | `4` | How many accounts' full stream lists to hold. These are the largest cached objects (10-50 MB per account per kind), so this is the setting that actually caps memory. Raise it if you serve more than a few concurrent accounts and have the RAM. |
+| `CACHE_MAX_ACCOUNTS` | `100` | How many accounts' category lists to hold. Entries are small. |
+| `CACHE_MAX_SERIES_INFO` | `500` | How many per-series detail entries to hold across all accounts. |
+| `CACHE_SWEEP_INTERVAL_MS` | `300000` | How often expired cache entries are reclaimed. Minimum 30 s. |
 | `PUBLIC_URL` | *(derived from request headers)* | Pins the externally visible base URL used in install links. Recommended behind a reverse proxy — without it the addon derives the base URL from `X-Forwarded-Host`/`Host`, which a client can supply. |
 | `MAX_UPSTREAM_MB` | `64` | Ceiling on a single JSON response read from the Xtream provider. Raise it only if a very large provider legitimately exceeds it; a 50k-title catalog is roughly 25 MB. |
 | `PROXY_HEADER_TIMEOUT_MS` | `20000` | How long the stream proxy waits for upstream response *headers*. Does not limit the body, so long playback is unaffected. |
