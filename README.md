@@ -44,6 +44,10 @@ Catalog sections (Live TV, XT-Movies, XT-Series) then appear in Stremio's sideba
 | `PUBLIC_URL` | *(derived from request headers)* | Pins the externally visible base URL used in install links. Recommended behind a reverse proxy — without it the addon derives the base URL from `X-Forwarded-Host`/`Host`, which a client can supply. |
 | `MAX_UPSTREAM_MB` | `64` | Ceiling on a single JSON response read from the Xtream provider. Raise it only if a very large provider legitimately exceeds it; a 50k-title catalog is roughly 25 MB. |
 | `PROXY_HEADER_TIMEOUT_MS` | `20000` | How long the stream proxy waits for upstream response *headers*. Does not limit the body, so long playback is unaffected. |
+| `SHUTDOWN_TIMEOUT_MS` | `10000` | Grace period on `SIGTERM`/`SIGINT` before the process exits regardless. Without a deadline a single in-flight movie stream keeps the socket open and blocks shutdown until the platform sends `SIGKILL`. |
+| `KEEPALIVE_TIMEOUT_MS` | `65000` | How long an idle keep-alive connection is held. Deliberately longer than the 60 s idle timeout most load balancers use, so the balancer is the side that closes first — otherwise a request can land on a socket the server just tore down and surface as a 502. |
+| `HEADERS_TIMEOUT_MS` | `66000` | How long a client may take to send request headers. Raised automatically to stay above `KEEPALIVE_TIMEOUT_MS`. |
+| `REQUEST_TIMEOUT_MS` | `120000` | How long a client may take to send a whole request. Does not limit the *response*, so proxied playback can run for hours. Raised automatically to stay at or above `HEADERS_TIMEOUT_MS`. |
 
 Example: `PORT=4000 HOST=127.0.0.1 npm start`.
 
@@ -70,7 +74,7 @@ instead of a stack trace with filesystem paths.
 | Path | Purpose |
 |---|---|
 | `/` | Landing page with project overview and install CTA |
-| `/health` | Liveness probe for hosting platforms |
+| `/health` | Health probe. `200 {"status":"ok"}` normally; `503 {"status":"shutting_down"}` once a shutdown signal has been received, so a load balancer drains this instance before it stops serving. |
 | `/configure` | HTML form to enter Xtream credentials and get an install link (includes disclaimer banner) |
 | `/manifest.json` | Unconfigured Stremio manifest |
 | `/:config/manifest.json` | Configured manifest with populated genres |

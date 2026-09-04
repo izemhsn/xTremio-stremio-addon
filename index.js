@@ -295,6 +295,37 @@ function parseEpisodeId(id) {
     return { seriesId: parts[0], seasonNum: parts[1], episodeId: parts[2] };
 }
 
+// Stremio's `:type` path segment is advisory here — every route dispatches on
+// the id prefix instead — but without a check a mismatched pair (say
+// type=XT-Movies with a live id) is happily served under the wrong type.
+// Series are declared under `XT-Series` in the manifest's catalog list yet emit
+// `series` metas, so both spellings are accepted wherever a series is involved.
+const ID_PREFIX_TYPES = {
+    'xtremio_episode_': ['series', 'XT-Series'],
+    'xtremio_series_': ['series', 'XT-Series'],
+    'xtremio_movie_': ['XT-Movies'],
+    'xtremio_live_': ['Live TV']
+};
+
+function typeMatchesId(type, id) {
+    const str = String(id || '');
+    const prefix = Object.keys(ID_PREFIX_TYPES).find(p => str.startsWith(p));
+    // An id we do not recognise is left to the route, which already answers it
+    // with the empty payload rather than an error.
+    if (!prefix) return true;
+    return ID_PREFIX_TYPES[prefix].includes(String(type));
+}
+
+// Catalog ids are not item ids and overlap their prefixes (`xtremio_series_new`
+// starts with `xtremio_series_`), so catalogs get their own map.
+function catalogTypesFor(id) {
+    const str = String(id || '');
+    if (str === 'xtremio_live') return ['Live TV'];
+    if (str === 'xtremio_search_movies' || str.startsWith('xtremio_movies_')) return ['XT-Movies'];
+    if (str === 'xtremio_search_series' || str.startsWith('xtremio_series_')) return ['XT-Series', 'series'];
+    return null;
+}
+
 function normalizeContainerExt(ext) {
     const clean = String(ext || 'mp4').trim();
     return /^[A-Za-z0-9]+$/.test(clean) ? clean : 'mp4';
@@ -1177,7 +1208,13 @@ app.get(['/:config/catalog/:type/:id.json', '/:config/catalog/:type/:id/:extra.j
     const cfg = decodeConfig(req.params.config);
     if (!cfg) return res.json({ metas: [] });
 
-    const { id } = req.params;
+    const { id, type } = req.params;
+
+    const allowedTypes = catalogTypesFor(id);
+    if (allowedTypes && !allowedTypes.includes(type)) {
+        console.warn(`[catalog] type/id mismatch: type=${type} id=${id}`);
+        return res.json({ metas: [] });
+    }
 
     try {
         const extra = parseExtra(req.params.extra);
@@ -1355,6 +1392,11 @@ app.get('/:config/meta/:type/:id.json', async (req, res) => {
     const { id, type } = req.params;
     console.log(`[meta] type=${type} id=${id}`);
 
+    if (!typeMatchesId(type, id)) {
+        console.warn(`[meta] type/id mismatch: type=${type} id=${id}`);
+        return res.status(404).json({ meta: null });
+    }
+
     try {
         if (id.startsWith('xtremio_live_')) {
             const streamId = getPrefixedNumericId(id, 'xtremio_live_');
@@ -1418,9 +1460,21 @@ app.get('/:config/meta/:type/:id.json', async (req, res) => {
 
             const videos = [];
             const episodes = info?.episodes ?? {};
+            let skippedEpisodes = 0;
             for (const [seasonNum, eps] of Object.entries(episodes)) {
                 if (!Array.isArray(eps)) continue;
+                // parseEpisodeId requires all three components to be numeric, so an
+                // episode built from a non-numeric season key or episode id would
+                // render in the UI and then 400 on play. Drop it here instead.
+                if (!isNumericId(seasonNum)) {
+                    skippedEpisodes += eps.length;
+                    continue;
+                }
                 for (const ep of eps) {
+                    if (!isNumericId(ep?.id)) {
+                        skippedEpisodes++;
+                        continue;
+                    }
                     videos.push({
                         id: `xtremio_episode_${seriesId}:${seasonNum}:${ep.id}`,
                         title: ep.title || `Episode ${ep.episode_num}`,
@@ -1431,6 +1485,9 @@ app.get('/:config/meta/:type/:id.json', async (req, res) => {
                         thumbnail: ep.info?.movie_image || undefined
                     });
                 }
+            }
+            if (skippedEpisodes) {
+                console.warn(`[meta] series ${seriesId}: skipped ${skippedEpisodes} episode(s) with non-numeric season/episode ids`);
             }
 
             const hasContent = Boolean(series.name || videos.length);
@@ -1474,6 +1531,11 @@ app.get('/:config/stream/:type/:id.json', async (req, res) => {
     if (!cfg) return res.json({ streams: [] });
     const { id, type } = req.params;
     console.log(`[stream] type=${type} id=${id}`);
+
+    if (!typeMatchesId(type, id)) {
+        console.warn(`[stream] type/id mismatch: type=${type} id=${id}`);
+        return res.status(404).json({ streams: [] });
+    }
 
     try {
         const { username, password } = cfg;
@@ -1784,8 +1846,76 @@ app.get('/', (req, res) => {
 </html>`);
 });
 
+// --- Server lifecycle ---
+// This process is a streaming proxy, not a plain JSON API: a single request can
+// hold a socket open for the length of a movie. That changes what the right
+// timeout and shutdown behaviour are, so both are stated explicitly rather than
+// left on Node's defaults.
+
+const SHUTDOWN_TIMEOUT_MS = Math.max(1000, Number(process.env.SHUTDOWN_TIMEOUT_MS) || 10000);
+// Deliberately longer than the 60 s idle timeout most load balancers use, so the
+// balancer is always the side that closes an idle connection. If we closed first
+// there is a race where a request arrives on a socket we have just torn down,
+// which the balancer reports to the user as a 502.
+const KEEPALIVE_TIMEOUT_MS = Math.max(1000, Number(process.env.KEEPALIVE_TIMEOUT_MS) || 65000);
+// Must exceed keepAliveTimeout, or a socket idling between keep-alive requests
+// is killed as if it were a slow header write.
+const HEADERS_TIMEOUT_MS = Math.max(KEEPALIVE_TIMEOUT_MS + 1000, Number(process.env.HEADERS_TIMEOUT_MS) || 66000);
+// Caps how long we will spend receiving a *request*. The response body is not
+// affected, so a proxied stream may still run for hours.
+const REQUEST_TIMEOUT_MS = Math.max(HEADERS_TIMEOUT_MS, Number(process.env.REQUEST_TIMEOUT_MS) || 120000);
+
+let shuttingDown = false;
+function isShuttingDown() { return shuttingDown; }
+// Test-only: the flag is process-wide, so a test that exercises the drain path
+// needs a way back.
+function setShuttingDown(value) { shuttingDown = Boolean(value); }
+
+function applyServerTimeouts(server) {
+    server.keepAliveTimeout = KEEPALIVE_TIMEOUT_MS;
+    server.headersTimeout = HEADERS_TIMEOUT_MS;
+    server.requestTimeout = REQUEST_TIMEOUT_MS;
+    // Already Node's default, but stated because a non-zero socket inactivity
+    // timeout here would kill a paused or slow-buffering stream mid-playback.
+    server.timeout = 0;
+    return server;
+}
+
+function createShutdownHandler(server, { timeoutMs = SHUTDOWN_TIMEOUT_MS, exit = (code) => process.exit(code), log = console } = {}) {
+    let started = false;
+    return function shutdown(signal) {
+        if (started) return;
+        started = true;
+        setShuttingDown(true);   // /health starts failing, so a balancer drains us
+        log.log(`${signal} received, shutting down...`);
+
+        // An in-flight movie stream can hold its socket for hours, so server.close()
+        // on its own waits until the platform loses patience and SIGKILLs us
+        // mid-write. Give real requests a window, then leave regardless.
+        const forced = setTimeout(() => {
+            log.warn(`Shutdown still pending after ${timeoutMs} ms, forcing exit.`);
+            exit(1);
+        }, timeoutMs);
+        if (typeof forced.unref === 'function') forced.unref();
+
+        server.close(() => {
+            clearTimeout(forced);
+            exit(0);
+        });
+        // Sockets parked between keep-alive requests have nothing to drain, but
+        // would still make close() wait out the full window.
+        if (typeof server.closeIdleConnections === 'function') server.closeIdleConnections();
+    };
+}
+
 app.get('/health', (req, res) => {
-    res.json({ status: 'ok', uptime: process.uptime() });
+    // Reporting unhealthy while draining is the point: it takes this instance out
+    // of the load balancer pool before the process actually goes away, instead of
+    // letting it keep receiving requests it is about to drop.
+    const draining = isShuttingDown();
+    res.status(draining ? 503 : 200)
+        .set('Cache-Control', 'no-store')
+        .json({ status: draining ? 'shutting_down' : 'ok', uptime: process.uptime() });
 });
 
 // Only bind the port and install process-wide handlers when run directly, so
@@ -1796,10 +1926,10 @@ if (require.main === module) {
     // leave a timer running.
     startCacheSweeper();
 
-    const server = app.listen(PORT, HOST, () => {
+    const server = applyServerTimeouts(app.listen(PORT, HOST, () => {
         console.log(`Addon running at http://${HOST === '0.0.0.0' ? 'localhost' : HOST}:${PORT}`);
         console.log(`Configure: http://localhost:${PORT}/configure`);
-    });
+    }));
 
     server.on('error', (err) => {
         if (err.code === 'EADDRINUSE') {
@@ -1810,8 +1940,9 @@ if (require.main === module) {
         process.exit(1);
     });
 
-    process.on('SIGTERM', () => { console.log('SIGTERM received, shutting down...'); server.close(() => process.exit(0)); });
-    process.on('SIGINT', () => { console.log('SIGINT received, shutting down...'); server.close(() => process.exit(0)); });
+    const shutdown = createShutdownHandler(server);
+    process.on('SIGTERM', () => shutdown('SIGTERM'));
+    process.on('SIGINT', () => shutdown('SIGINT'));
     process.on('uncaughtException', (err) => {
         // AbortErrors are expected when a client disconnects mid-stream from the proxy.
         if (err && (err.name === 'AbortError' || err.code === 'ABORT_ERR')) return;
@@ -1841,6 +1972,8 @@ module.exports = {
     isNumericId,
     getPrefixedNumericId,
     parseEpisodeId,
+    typeMatchesId,
+    catalogTypesFor,
     normalizeContainerExt,
     isNotWebReady,
     isPrivateIp,
@@ -1891,5 +2024,13 @@ module.exports = {
     clientKey,
     CONFIGURE_RATE_LIMIT,
     CONFIGURE_RATE_WINDOW_MS,
-    CONFIGURE_RATE_MAX_CLIENTS
+    CONFIGURE_RATE_MAX_CLIENTS,
+    applyServerTimeouts,
+    createShutdownHandler,
+    isShuttingDown,
+    setShuttingDown,
+    SHUTDOWN_TIMEOUT_MS,
+    KEEPALIVE_TIMEOUT_MS,
+    HEADERS_TIMEOUT_MS,
+    REQUEST_TIMEOUT_MS
 };
