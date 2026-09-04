@@ -40,6 +40,7 @@ Catalog sections (Live TV, XT-Movies, XT-Series) then appear in Stremio's sideba
 | `CACHE_MAX_ACCOUNTS` | `100` | How many accounts' category lists to hold. Entries are small. |
 | `CACHE_MAX_SERIES_INFO` | `500` | How many per-series detail entries to hold across all accounts. |
 | `CACHE_SWEEP_INTERVAL_MS` | `300000` | How often expired cache entries are reclaimed. Minimum 30 s. |
+| `SERIES_INFO_NEGATIVE_TTL_MS` | `300000` | How long a series whose details could not be loaded is remembered as broken, so repeated requests skip the 3 retries. Lower it if your provider recovers quickly. |
 | `PUBLIC_URL` | *(derived from request headers)* | Pins the externally visible base URL used in install links. Recommended behind a reverse proxy — without it the addon derives the base URL from `X-Forwarded-Host`/`Host`, which a client can supply. |
 | `MAX_UPSTREAM_MB` | `64` | Ceiling on a single JSON response read from the Xtream provider. Raise it only if a very large provider legitimately exceeds it; a 50k-title catalog is roughly 25 MB. |
 | `PROXY_HEADER_TIMEOUT_MS` | `20000` | How long the stream proxy waits for upstream response *headers*. Does not limit the body, so long playback is unaffected. |
@@ -152,12 +153,13 @@ Set `CONFIG_SECRET` and `NODE_ENV=production` on any of these — see [Environme
 
 ## Troubleshooting
 
-- **"No streams available"** on an episode — check server logs for `[stream] ...` and `[getSeriesInfo] ... failed`. Usually a specific series triggers an Xtream error; retry resolves most cases.
+- **"No streams available"** on an episode — check server logs for `[stream] ...` and `[getSeriesInfo] ... failed`. Usually a specific series triggers an Xtream error; retry resolves most cases. A series that fails all 3 attempts is remembered as broken for 5 minutes (logged as `failed recently; skipping 3 retries`) so it stops costing a retry storm on every request — if you have just fixed things upstream, wait out that window or lower `SERIES_INFO_NEGATIVE_TTL_MS`.
 - **Manifest looks empty** after configuring — your Xtream provider may be blocking category calls. The manifest falls back to minimal catalogs without genre options. Failed category lookups are only cached for 60 seconds (successful ones for 30 minutes), so this clears itself within about a minute.
 - **Every install URL broke after a restart or redeploy** — `CONFIG_SECRET` was not set, so the addon generated a new random one at boot and can no longer decrypt tokens issued under the old key. See [Set `CONFIG_SECRET` before you deploy](#set-config_secret-before-you-deploy). Users must reconfigure once; setting it prevents a recurrence.
 - **Port already in use** — set `PORT=3001` (or any free port) before `npm start`.
 - **"Too many attempts" on the configure page** — you hit the `POST /configure` rate limit (10 per minute by default). Wait out the window shown in the message, or raise `CONFIGURE_RATE_LIMIT`. If it fires for unrelated users, you are behind a proxy and need `TRUST_PROXY=true` so they are counted separately.
 - **"Cannot reach that server"** — the client-facing message is deliberately identical for a bad hostname, a closed port, and a blocked private address, so the page cannot be used to scan hosts. Check the server log for the actual cause.
+- **"Connected over http, not https"** — you entered an `https://` URL but the addon ended up on plain http, either because the https connection failed or because your provider's own `server_info` names http. That choice is saved into the install link, so your Xtream username and password are sent in cleartext on every request. If the provider does support https, correct the URL and configure again to get a new link; the old one keeps using http.
 - **Premature episode auto-advance** — caused by Stremio's player with direct Xtream streams. Disable "Play next episode automatically" in Stremio settings, or use Stremio Desktop (better MKV handling than web).
 
 ## License

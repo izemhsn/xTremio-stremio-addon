@@ -695,6 +695,17 @@ function isUsableSeriesInfo(info) {
 const SERIES_INFO_MAX_ATTEMPTS = 3;
 const SERIES_INFO_BACKOFF_MS = 500;
 
+// A series that never returns usable data costs 3 sequential upstream calls
+// plus 1.5 s of backoff — and, uncached, pays that on *every* request. Single
+// flight collapses concurrent callers but does nothing for sequential ones, so
+// remember the failure briefly.
+//
+// Longer than CACHE_FAILURE_TTL (the category equivalent) because that case is
+// three parallel calls with no backoff, while this one is sequential and sleeps;
+// far shorter than the 30-minute positive TTL so a provider-side fix is picked
+// up soon rather than being pinned for half an hour.
+const SERIES_INFO_NEGATIVE_TTL = Math.max(1000, Number(process.env.SERIES_INFO_NEGATIVE_TTL_MS) || 5 * 60 * 1000);
+
 const seriesInfoCache = new BoundedMap({
     maxEntries: CACHE_MAX_SERIES_INFO,
     maxAgeMs: CACHE_TTL
@@ -727,14 +738,37 @@ function seriesInfoCacheKey(cfg, seriesId) {
     return `${cfg.serverUrl}\n${cfg.username}\n${cfg.password}\n${seriesId}`;
 }
 
-function getCachedSeriesInfo(cfg, seriesId) {
+// Entries carry their own ttl (as catCache's do) because a remembered failure
+// must expire far sooner than a good payload.
+function readSeriesInfoEntry(cfg, seriesId) {
     const entry = seriesInfoCache.get(seriesInfoCacheKey(cfg, seriesId));
-    if (entry && entry.ts > Date.now() - CACHE_TTL) return entry.data;
-    return null;
+    if (!entry) return null;
+    const ttl = typeof entry.ttl === 'number' ? entry.ttl : CACHE_TTL;
+    return entry.ts > Date.now() - ttl ? entry : null;
+}
+
+function getCachedSeriesInfo(cfg, seriesId) {
+    const entry = readSeriesInfoEntry(cfg, seriesId);
+    // Only a good payload is a "hit" here; negative entries are replayed by
+    // fetchSeriesInfo, which knows how to reproduce the original outcome.
+    return entry && !entry.negative ? entry.data : null;
 }
 
 function setCachedSeriesInfo(cfg, seriesId, data) {
-    seriesInfoCache.set(seriesInfoCacheKey(cfg, seriesId), { data, ts: Date.now() });
+    seriesInfoCache.set(seriesInfoCacheKey(cfg, seriesId), { data, ts: Date.now(), ttl: CACHE_TTL });
+}
+
+// Remembers *how* the series failed, so a cached failure reproduces exactly what
+// an uncached one would have returned: an unusable-but-present payload is
+// replayed, and a total failure re-throws.
+function setNegativeSeriesInfo(cfg, seriesId, { data, error }) {
+    seriesInfoCache.set(seriesInfoCacheKey(cfg, seriesId), {
+        data,
+        error,
+        negative: true,
+        ts: Date.now(),
+        ttl: SERIES_INFO_NEGATIVE_TTL
+    });
 }
 
 const seriesInfoSingleFlight = createSingleFlight();
@@ -751,8 +785,13 @@ function getSeriesInfo(cfg, seriesId) {
 }
 
 async function fetchSeriesInfo(cfg, seriesId) {
-    const hit = getCachedSeriesInfo(cfg, seriesId);
-    if (hit) return hit;
+    const cached = readSeriesInfoEntry(cfg, seriesId);
+    if (cached) {
+        if (!cached.negative) return cached.data;
+        console.log(`[getSeriesInfo] series ${seriesId} failed recently; skipping ${SERIES_INFO_MAX_ATTEMPTS} retries`);
+        if (cached.data !== null) return cached.data;
+        throw new Error(cached.error);
+    }
 
     let lastInfo = null;
     let lastError = null;
@@ -774,8 +813,29 @@ async function fetchSeriesInfo(cfg, seriesId) {
             await new Promise(r => setTimeout(r, SERIES_INFO_BACKOFF_MS * attempt));
         }
     }
+    const failure = lastError || new Error(`get_series_info failed for series ${seriesId}`);
+
+    setNegativeSeriesInfo(cfg, seriesId, {
+        data: lastInfo,
+        error: failure.message
+    });
+
     if (lastInfo !== null) return lastInfo;
-    throw lastError || new Error(`get_series_info failed for series ${seriesId}`);
+    throw failure;
+}
+
+function schemeOf(url) {
+    return String(url || '').startsWith('https:') ? 'https' : 'http';
+}
+
+// A downgrade can arrive by two routes, and both end up baked into the config
+// token permanently: the https attempt failing and the http retry succeeding,
+// or the provider's own server_info naming http. Neither used to be visible to
+// the user, so credentials could travel in cleartext forever because https
+// hiccuped once during setup.
+function describeDowngrade(requested, finalUrl, source) {
+    if (schemeOf(requested) !== 'https' || schemeOf(finalUrl) !== 'http') return null;
+    return { from: 'https', to: 'http', source };
 }
 
 async function validateXtremioCredentials(serverUrl, username, password) {
@@ -809,10 +869,20 @@ async function validateXtremioCredentials(serverUrl, username, password) {
                 resolvedUrl = port ? `${proto}://${si.url}:${port}` : `${proto}://${si.url}`;
             }
 
+            const finalUrl = resolvedUrl || url;
+            // Attribute the downgrade to whichever step actually caused it: the
+            // http retry, or the provider overriding a scheme that just worked.
+            const downgrade = describeDowngrade(base, url, 'fallback')
+                || describeDowngrade(url, finalUrl, 'provider');
+            if (downgrade) {
+                console.warn(`[configure] ${new URL(finalUrl).host}: https→http downgrade (${downgrade.source}); credentials will travel in cleartext`);
+            }
+
             return {
                 valid: true,
                 userInfo: json.user_info,
-                resolvedUrl: resolvedUrl || url
+                resolvedUrl: finalUrl,
+                downgrade
             };
         } catch (e) {
             if (url === urls[0] && urls.length > 1) continue;
@@ -839,12 +909,29 @@ function renderConfigPage({ serverUrl = '', username = '', password = '', status
             const encoded = encodeConfig({ serverUrl, username, password });
             const installUrl = escapeHtml(`stremio://${baseUrl.replace(/^https?:\/\//, '')}/${encoded}/manifest.json`);
             const httpUrl = escapeHtml(`${baseUrl}/${encoded}/manifest.json`);
+            // The connection was downgraded to http and that choice is now baked
+            // into the install token, so say so plainly rather than letting the
+            // green "Connected!" banner imply everything is fine.
+            const downgradeHtml = status.downgrade ? `
+                    <div class="status-banner status-warning">
+                        <svg fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2.5" d="M12 9v4m0 4h.01M10.29 3.86L1.82 18a2 2 0 001.71 3h16.94a2 2 0 001.71-3L13.71 3.86a2 2 0 00-3.42 0z"/></svg>
+                        <span class="status-text">
+                            <strong>Connected over http, not https.</strong>
+                            ${status.downgrade.source === 'fallback'
+                                ? 'The https connection failed, so http was used instead.'
+                                : 'Your provider asked for http even though https worked.'}
+                            Your username and password will be sent in cleartext on every request, and this choice is saved into the install link below.
+                            ${status.downgrade.source === 'fallback'
+                                ? 'If your provider does support https, fix the URL and configure again.'
+                                : ''}
+                        </span>
+                    </div>` : '';
             statusHtml = `
                 <div class="status-section">
                     <div class="status-banner status-success">
                         <svg fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="3" d="M5 13l4 4L19 7"/></svg>
                         <span class="status-text">Connected! Welcome, ${escapeHtml(status.userInfo.username || username)}</span>
-                    </div>
+                    </div>${downgradeHtml}
                     <a href="${installUrl}" class="btn full install-link">
                         <svg fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M4 16v1a3 3 0 003 3h10a3 3 0 003-3v-1m-4-4l-4 4m0 0l-4-4m4 4V4"/></svg>
                         Install in Stremio
@@ -914,6 +1001,8 @@ function renderConfigPage({ serverUrl = '', username = '', password = '', status
             .status-banner .status-text { font-size: 14px; font-weight: 500; text-align: left; }
             .status-success { background: #e8f5e9; color: #2e7d32; }
             .status-error { background: #ffebee; color: #c62828; }
+            .status-warning { background: #fff8e1; color: #8a5a00; }
+            .status-warning .status-text { line-height: 1.5; }
             .install-link { margin-top: 4px; }
             .disclaimer {
                 background: #fff8e1;
@@ -1786,6 +1875,17 @@ module.exports = {
     CACHE_MAX_STREAM_ACCOUNTS,
     CACHE_MAX_SERIES_INFO,
     CACHE_STALE_MAX_AGE_MS,
+    readSeriesInfoEntry,
+    setNegativeSeriesInfo,
+    getCachedSeriesInfo,
+    setCachedSeriesInfo,
+    fetchSeriesInfo,
+    SERIES_INFO_NEGATIVE_TTL,
+    SERIES_INFO_MAX_ATTEMPTS,
+    validateXtremioCredentials,
+    describeDowngrade,
+    schemeOf,
+    renderConfigPage,
     rateLimitConfigure,
     configureAttempts,
     clientKey,
