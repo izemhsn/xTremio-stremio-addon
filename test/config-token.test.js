@@ -5,7 +5,7 @@ process.env.CONFIG_SECRET = 'test-secret-for-unit-tests';
 const test = require('node:test');
 const assert = require('node:assert');
 
-const { encodeConfig, decodeConfig, validateConfig } = require('../index.js');
+const { encodeConfig, decodeConfig, validateConfig, CONFIG_TOKEN_VERSION } = require('../index.js');
 
 const CFG = { serverUrl: 'http://example.com:8080', username: 'user', password: 'pass' };
 
@@ -20,11 +20,22 @@ test('encoding is non-deterministic (fresh IV per token)', () => {
     assert.deepStrictEqual(decodeConfig(encodeConfig(CFG)), CFG);
 });
 
-test('token has the expected v2 five-part shape', () => {
+test('token has the expected five-part shape, stamped with the current version', () => {
     const parts = encodeConfig(CFG).split('.');
     assert.strictEqual(parts.length, 5);
-    assert.strictEqual(parts[0], 'v2');
+    assert.strictEqual(parts[0], CONFIG_TOKEN_VERSION);
     assert.ok(parts.every(p => p.length > 0));
+});
+
+test('a v2 token no longer decodes', () => {
+    // v2 is the pre-scrypt derivation. This token was minted by that build and is
+    // kept as a fixture: the version bump has to be a real break, not a rename
+    // that still accepts old ciphertext under the old, weaker keys.
+    const v2 = 'v2.q9Vf9SN04Nl0bBlH.BTym1Up_IjiRPlPBX-l-sw.2fiyK_ckFA51bHtKufoGX7o2'
+        + 'HG5gKhCJhMNvA5qwca-EZAVeN3aauwJCao9Ftl-hWZlLEoEBiklnzLCPTEPM8H19_SfLGFO80Q'
+        + '.qCaWmtL9bYh8pG9JnBiWPum4zzaHvZ75N6YTlmCtFtA';
+    assert.notStrictEqual(CONFIG_TOKEN_VERSION, 'v2');
+    assert.strictEqual(decodeConfig(v2), null);
 });
 
 test('credentials do not appear in plaintext anywhere in the token', () => {
@@ -53,20 +64,30 @@ test('a stripped or altered version prefix is rejected', () => {
 });
 
 test('malformed input is rejected without throwing', () => {
-    for (const bad of ['', null, undefined, 'notatoken', 'v2.a.b.c', 'v2.a.b.c.d.e', {}, 42]) {
+    const V = CONFIG_TOKEN_VERSION;
+    for (const bad of ['', null, undefined, 'notatoken', `${V}.a.b.c`, `${V}.a.b.c.d.e`, {}, 42]) {
         assert.strictEqual(decodeConfig(bad), null, `not rejected: ${String(bad)}`);
     }
 });
 
 test('over-long input is rejected before any crypto work', () => {
-    assert.strictEqual(decodeConfig('v2.' + 'A'.repeat(5000)), null);
+    assert.strictEqual(decodeConfig(`${CONFIG_TOKEN_VERSION}.` + 'A'.repeat(5000)), null);
 });
 
-test('a token from a different secret does not decode', () => {
-    // Simulates a restart with a new CONFIG_SECRET, or a forged token.
-    const foreign = 'v2.q9Vf9SN04Nl0bBlH.BTym1Up_IjiRPlPBX-l-sw.2fiyK_ckFA51bHtKufoGX7o2'
-        + 'HG5gKhCJhMNvA5qwca-EZAVeN3aauwJCao9Ftl-hWZlLEoEBiklnzLCPTEPM8H19_SfLGFO80Q'
-        + '.qCaWmtL9bYh8pG9JnBiWPum4zzaHvZ75N6YTlmCtFtA';
+test('a token minted under a different secret does not decode', () => {
+    // Simulates a restart with a new CONFIG_SECRET, or a forged token. Minted in a
+    // child process so it is a genuine current-version token rather than a fixture
+    // that a version bump would silently reduce to a version-mismatch test.
+    const { execFileSync } = require('node:child_process');
+    const foreign = execFileSync(process.execPath, ['-e', `
+        const m = require(${JSON.stringify(require.resolve('../index.js'))});
+        process.stdout.write(m.encodeConfig(${JSON.stringify(CFG)}));
+    `], {
+        env: { ...process.env, CONFIG_SECRET: 'a-completely-different-secret-value-here' },
+        encoding: 'utf8'
+    }).trim();
+
+    assert.ok(foreign.startsWith(`${CONFIG_TOKEN_VERSION}.`), `expected a current-version token, got ${foreign.slice(0, 16)}`);
     assert.strictEqual(decodeConfig(foreign), null);
 });
 

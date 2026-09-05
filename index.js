@@ -6,7 +6,27 @@ const net = require('net');
 
 const app = express();
 app.use(express.urlencoded({ extended: true }));
+
+// The Stremio addon protocol is called cross-origin by web.stremio.com, so its
+// JSON resources genuinely need a wildcard. Nothing else here does: /configure
+// handles plaintext credentials, and the landing page and health probe are read
+// by people and orchestrators, not by scripts on other origins.
+const CORS_PATH = /^\/(?:[^/]+\/)?(?:manifest\.json|catalog\/|meta\/|stream\/)/;
+
+// The byte proxy is deliberately excluded. CORS is not what stops someone
+// spending your bandwidth — a plain <video src> or a server-side fetch needs no
+// CORS at all, so the token is the only real gate. Set PROXY_CORS=true if a
+// player turns out to need it (an MSE-based one, or a crossorigin video element).
+const PROXY_CORS = process.env.PROXY_CORS === 'true';
+const PROXY_PATH = /^\/[^/]+\/proxy\//;
+
+function corsApplies(path) {
+    if (PROXY_PATH.test(path)) return PROXY_CORS;
+    return CORS_PATH.test(path);
+}
+
 app.use((req, res, next) => {
+    if (!corsApplies(req.path)) return next();
     res.setHeader('Access-Control-Allow-Origin', '*');
     res.setHeader('Access-Control-Allow-Headers', 'Content-Type');
     res.setHeader('Access-Control-Allow-Methods', 'GET, POST, OPTIONS');
@@ -17,18 +37,68 @@ app.use((req, res, next) => {
 const PORT = process.env.PORT || 3000;
 const HOST = process.env.HOST || '0.0.0.0';
 const ADDON_ID = 'org.xtremio.addon';
-const CONFIG_TOKEN_VERSION = 'v2';
+// v3, not v2: the key derivation below changed, so tokens issued by an older
+// build no longer decode. That is a deliberate break — see the README.
+const CONFIG_TOKEN_VERSION = 'v3';
 const RAW_CONFIG_SECRET = process.env.CONFIG_SECRET || process.env.XTREMIO_CONFIG_SECRET;
 const CONFIG_SECRET = RAW_CONFIG_SECRET
     ? Buffer.from(RAW_CONFIG_SECRET, 'utf8')
     : crypto.randomBytes(32);
-const CONFIG_ENC_KEY = crypto.createHash('sha256').update('xtremio-config-enc').update(CONFIG_SECRET).digest();
-const CONFIG_MAC_KEY = crypto.createHash('sha256').update('xtremio-config-mac').update(CONFIG_SECRET).digest();
+const CONFIG_SECRET_MIN_BYTES = 32;
+const IS_PRODUCTION = process.env.NODE_ENV === 'production';
+
+// scrypt rather than a bare SHA-256. Every install URL carries ciphertext and a
+// MAC, which is everything an attacker needs to test candidate secrets offline;
+// a single hash makes each guess essentially free, so a memorable passphrase
+// falls quickly. N=32768/r=8 costs ~80 ms and 32 MB per guess, and being
+// memory-hard it resists GPU parallelism too. Two derivations put ~170 ms on
+// startup, paid once.
+// The salts are fixed strings because the keys must be re-derivable at boot from
+// the secret alone — there is nowhere to persist a random salt. That is what the
+// per-purpose labels stand in for: they keep the two keys independent.
+const SCRYPT_PARAMS = { N: 32768, r: 8, p: 1, maxmem: 96 * 1024 * 1024 };
+
+function deriveConfigKey(label) {
+    return crypto.scryptSync(CONFIG_SECRET, `xtremio-${label}-${CONFIG_TOKEN_VERSION}`, 32, SCRYPT_PARAMS);
+}
+
+const CONFIG_ENC_KEY = deriveConfigKey('config-enc');
+const CONFIG_MAC_KEY = deriveConfigKey('config-mac');
 const ALLOW_PRIVATE_NETWORKS = process.env.ALLOW_PRIVATE_NETWORKS === 'true';
 const PUBLIC_URL = process.env.PUBLIC_URL ? normalizeUrl(process.env.PUBLIC_URL) : null;
 
-if (!RAW_CONFIG_SECRET) {
-    console.warn('[security] CONFIG_SECRET is not set; install URLs will be invalid after restart. Set CONFIG_SECRET to a long random value for persistent encrypted config tokens.');
+// What is wrong with the configured secret, if anything. Split out from the
+// enforcement below so the policy can be tested without exiting the process.
+// `raw` is required rather than defaulted: a default would make an explicit
+// `configSecretProblems(undefined)` silently check the real environment instead
+// of the missing-secret case the caller meant.
+function configSecretProblems(raw) {
+    const problems = [];
+    if (!raw) {
+        problems.push('CONFIG_SECRET is not set, so a random one was generated at boot — every install URL will break on restart.');
+        return problems;
+    }
+    const bytes = Buffer.byteLength(raw, 'utf8');
+    if (bytes < CONFIG_SECRET_MIN_BYTES) {
+        problems.push(`CONFIG_SECRET is ${bytes} bytes; ${CONFIG_SECRET_MIN_BYTES} or more are required. A short secret can be brute-forced offline from a single install URL.`);
+    }
+    return problems;
+}
+
+// Warn in development, refuse to start in production. Being strict everywhere
+// would break local development and the test suite for a risk that only matters
+// once real credentials are involved; being lax everywhere is how a placeholder
+// secret reaches production unnoticed.
+function enforceConfigSecretPolicy({ raw = RAW_CONFIG_SECRET, production = IS_PRODUCTION, log = console, exit = (code) => process.exit(code) } = {}) {
+    const problems = configSecretProblems(raw);
+    if (!problems.length) return true;
+    for (const problem of problems) log.warn(`[security] ${problem}`);
+    if (production) {
+        log.error('[security] Refusing to start with NODE_ENV=production. Generate a secret with: node -e "console.log(require(\'crypto\').randomBytes(32).toString(\'hex\'))"');
+        exit(1);
+        return false;
+    }
+    return true;
 }
 
 // Host and X-Forwarded-* are attacker-controllable unless a trusted proxy sets
@@ -1914,6 +1984,10 @@ app.get('/health', (req, res) => {
 // `require('./index.js')` from a test can exercise the internals below without
 // starting a server or hijacking the test runner's exception handling.
 if (require.main === module) {
+    // Before binding a port: a production deploy with a weak or absent secret
+    // should fail loudly at startup, not quietly issue forgeable install URLs.
+    enforceConfigSecretPolicy();
+
     // Only when actually serving: importing this module for tests should not
     // leave a timer running.
     startCacheSweeper();
@@ -1935,9 +2009,12 @@ if (require.main === module) {
     const shutdown = createShutdownHandler(server);
     process.on('SIGTERM', () => shutdown('SIGTERM'));
     process.on('SIGINT', () => shutdown('SIGINT'));
+    // No AbortError exemption. Client disconnects are handled where they happen —
+    // the proxy route aborts its own upstream fetch and filters the resulting
+    // errors at each failure point — so an abort reaching here would mean a real
+    // gap, and swallowing it would hide exactly the `write after end` class of bug
+    // this handler exists to catch.
     process.on('uncaughtException', (err) => {
-        // AbortErrors are expected when a client disconnects mid-stream from the proxy.
-        if (err && (err.name === 'AbortError' || err.code === 'ABORT_ERR')) return;
         // Process state is undefined after an uncaught throw. Exiting lets the
         // platform restart us; staying up serves requests from a wedged process
         // that /health would still report as healthy.
@@ -1945,7 +2022,6 @@ if (require.main === module) {
         process.exit(1);
     });
     process.on('unhandledRejection', (err) => {
-        if (err && (err.name === 'AbortError' || err.code === 'ABORT_ERR')) return;
         console.error('Unhandled rejection:', err);
     });
 }
@@ -1957,6 +2033,13 @@ module.exports = {
     encodeConfig,
     decodeConfig,
     validateConfig,
+    configSecretProblems,
+    enforceConfigSecretPolicy,
+    corsApplies,
+    deriveConfigKey,
+    CONFIG_TOKEN_VERSION,
+    CONFIG_SECRET_MIN_BYTES,
+    SCRYPT_PARAMS,
     getBaseUrl,
     escapeHtml,
     normalizeUrl,

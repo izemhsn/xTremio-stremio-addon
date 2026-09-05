@@ -29,7 +29,9 @@ Catalog sections (Live TV, XT-Movies, XT-Series) then appear in Stremio's sideba
 
 | Variable | Default | Purpose |
 |---|---|---|
-| `CONFIG_SECRET` | *(random per boot — see below)* | **Effectively mandatory.** Secret from which the config-token encryption and MAC keys are derived. `XTREMIO_CONFIG_SECRET` is accepted as an alias. |
+| `CONFIG_SECRET` | *(random per boot — see below)* | **Mandatory under `NODE_ENV=production`**, where the addon refuses to start without it or with fewer than 32 bytes. Secret from which the config-token encryption and MAC keys are derived, via scrypt. `XTREMIO_CONFIG_SECRET` is accepted as an alias. |
+| `NODE_ENV` | *(unset)* | Set to `production` in deployment. Enforces the `CONFIG_SECRET` policy above, and makes Express return a bare 500 instead of a stack trace. |
+| `PROXY_CORS` | `false` | Escape hatch. `Access-Control-Allow-Origin: *` is sent on the Stremio addon resources (manifest, catalog, meta, stream) but **not** on `/proxy`, `/configure`, `/health` or the landing page. Set to `true` if a player turns out to need CORS on the byte proxy. Note that CORS is not what limits who can spend your bandwidth — a plain `<video src>` needs none — the install token is. |
 | `PORT` | `3000` | Port the HTTP server binds to |
 | `HOST` | `0.0.0.0` | Interface to bind |
 | `ALLOW_PRIVATE_NETWORKS` | `false` | Set to `true` to let the addon reach private/loopback addresses. Needed only for an Xtream server on your LAN during development — it disables the SSRF guard, so never enable it on a public deployment. |
@@ -62,12 +64,24 @@ to reconfigure. Set it once, to a long random value, and keep it stable:
 CONFIG_SECRET=$(openssl rand -base64 48)   # generate once, then store it in your platform config
 ```
 
-Use at least 32 bytes: the keys are a plain SHA-256 of this value, so a short passphrase can
-be brute-forced offline from a single install URL. Changing `CONFIG_SECRET` later invalidates
-all existing install URLs, as does bumping `CONFIG_TOKEN_VERSION` in the source.
+**At least 32 bytes is required, not advised.** Every install URL carries ciphertext and a MAC,
+which is everything an attacker needs to test candidate secrets offline. The keys are derived
+with scrypt (N=32768, r=8) rather than a plain hash, so each guess costs roughly 80 ms and 32 MB
+instead of being free — but that only buys time for a secret with real entropy behind it. With
+`NODE_ENV=production` the addon **refuses to start** if `CONFIG_SECRET` is missing or shorter
+than 32 bytes; without it, you get a warning and a running server, so local development and the
+test suite still work.
+
+Changing `CONFIG_SECRET` later invalidates all existing install URLs, as does bumping
+`CONFIG_TOKEN_VERSION` in the source.
 
 Also set `NODE_ENV=production` in deployment, so an unhandled route error returns a bare 500
 instead of a stack trace with filesystem paths.
+
+> **Upgrading from an earlier build:** tokens moved from `v2` to `v3` when the key derivation
+> changed from SHA-256 to scrypt. Every install URL issued by a `v2` build stops working and
+> each user has to visit `/configure` once more. Carrying `CONFIG_SECRET` across does *not*
+> preserve them — the derivation itself changed.
 
 ## Endpoints
 
@@ -92,9 +106,10 @@ becomes the first path segment of every request:
 stremio://your-host/<config-token>/manifest.json
 ```
 
-The token is a five-part `v2.iv.tag.ciphertext.mac` string: the credentials are encrypted with
+The token is a five-part `v3.iv.tag.ciphertext.mac` string: the credentials are encrypted with
 AES-256-GCM under a random per-token IV, then the whole body is signed with a separate HMAC key
-(encrypt-then-MAC). Both keys derive from `CONFIG_SECRET`. A token that fails its MAC check, its
+(encrypt-then-MAC). Both keys are derived from `CONFIG_SECRET` with scrypt, under different
+per-purpose labels so they stay independent. A token that fails its MAC check, its
 GCM tag, or its version prefix is rejected, and the route degrades to empty results rather than
 an error — Stremio surfaces raw errors to the user.
 
