@@ -412,6 +412,103 @@ const PROXY_USER_AGENT = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/
 // headers only — never to the body, which is a legitimate long-lived stream.
 const PROXY_HEADER_TIMEOUT_MS = Math.max(1000, Number(process.env.PROXY_HEADER_TIMEOUT_MS) || 20000);
 
+// --- HLS playlist proxying -------------------------------------------------
+//
+// Live channels are served as either a continuous MPEG-TS body (.ts), which
+// relays byte-for-byte, or an HLS playlist (.m3u8), which does not. A playlist
+// is a manifest of further URLs, and an Xtream one names segments by absolute
+// URLs that embed /username/password/ themselves. Relaying such a body
+// unchanged would move the credential disclosure from the URL into the body
+// rather than fixing it, so playlists are rewritten: every URI inside is
+// resolved and replaced with a link back through this server.
+//
+// Those rewritten links must not turn the proxy into an open relay for
+// arbitrary URLs, so each target is HMAC-signed and the signature is checked
+// before any outbound request. The `hls:` prefix domain-separates these from
+// config-token MACs, which use the same key: without it a value valid in one
+// position could be replayed in the other.
+function signHlsTarget(payload) {
+    return crypto.createHmac('sha256', CONFIG_MAC_KEY).update(`hls:${payload}`).digest('base64url');
+}
+
+function encodeHlsTarget(absoluteUrl) {
+    const payload = Buffer.from(absoluteUrl, 'utf8').toString('base64url');
+    return { u: payload, s: signHlsTarget(payload) };
+}
+
+// Returns the URL only when the signature verifies, so a caller cannot point
+// this server at a host of their choosing even holding a valid config token.
+function decodeHlsTarget(payload, signature) {
+    if (typeof payload !== 'string' || typeof signature !== 'string') return null;
+    if (payload.length > 4096) return null;
+    if (!timingSafeEqualString(signHlsTarget(payload), signature)) return null;
+    try {
+        const url = new URL(Buffer.from(payload, 'base64url').toString('utf8'));
+        if (!['http:', 'https:'].includes(url.protocol)) return null;
+        return url.toString();
+    } catch {
+        return null;
+    }
+}
+
+const HLS_CONTENT_TYPES = /^(application\/(vnd\.apple\.mpegurl|x-mpegurl)|audio\/(mpegurl|x-mpegurl))/i;
+
+// The extension is the hint that matters: providers commonly return
+// text/plain or octet-stream for a playlist, so content-type alone would miss
+// them. The body check is what keeps a mislabelled .m3u8 that is really a
+// video stream from being buffered and mangled.
+function looksLikePlaylist(ext, contentType) {
+    if (String(ext || '').toLowerCase() === 'm3u8') return true;
+    return HLS_CONTENT_TYPES.test(String(contentType || ''));
+}
+
+// Playlists are kilobytes; anything far larger is not one. Bounded because the
+// rewrite has to buffer the whole body, unlike the streaming path.
+const MAX_PLAYLIST_BYTES = 4 * 1024 * 1024;
+
+// URI="..." appears on EXT-X-KEY, EXT-X-MAP, EXT-X-MEDIA, EXT-X-PART and
+// friends; those are sub-resources exactly like segment lines and leak the
+// same credentials if left alone.
+const HLS_URI_ATTR = /URI="([^"]*)"/gi;
+
+// `toProxyUrl` maps one absolute upstream URL to a URL on this server.
+// Anything that will not resolve, or is not http(s), is left untouched rather
+// than dropped: a malformed line is the provider's business, and removing it
+// would silently corrupt the playlist.
+function rewriteHlsPlaylist(text, baseUrl, toProxyUrl) {
+    const mapUri = (raw) => {
+        const uri = String(raw).trim();
+        if (!uri) return null;
+        let absolute;
+        try {
+            absolute = new URL(uri, baseUrl);
+        } catch {
+            return null;
+        }
+        if (!['http:', 'https:'].includes(absolute.protocol)) return null;
+        return toProxyUrl(absolute.toString());
+    };
+
+    return text.split('\n').map((line) => {
+        // Preserve CRLF exactly: some players are strict about the line ending.
+        const cr = line.endsWith('\r') ? '\r' : '';
+        const body = cr ? line.slice(0, -1) : line;
+
+        if (!body.trim()) return line;
+        if (body.startsWith('#')) {
+            // replace() manages the global regex's lastIndex itself, and
+            // returns the line untouched when there is no URI attribute.
+            return body.replace(HLS_URI_ATTR, (whole, uri) => {
+                const mapped = mapUri(uri);
+                return mapped ? `URI="${mapped}"` : whole;
+            }) + cr;
+        }
+
+        const mapped = mapUri(body);
+        return mapped ? mapped + cr : line;
+    }).join('\n');
+}
+
 function ipv4ToLong(ip) {
     return ip.split('.').reduce((acc, part) => ((acc << 8) + Number(part)) >>> 0, 0);
 }
@@ -461,14 +558,26 @@ async function assertSafeOutboundUrl(inputUrl) {
     return url;
 }
 
-async function safeFetch(inputUrl, options = {}, { maxRedirects = 3 } = {}) {
+// `onFinalUrl` reports the URL that actually produced the returned response,
+// after any redirects. HLS playlists carry relative URIs that must be resolved
+// against *that* URL, not the one we asked for — a provider's /live/... request
+// typically lands on a CDN path several segments deep, so resolving against the
+// original would point every segment at the wrong host. Response.url is not
+// relied on here because redirects are followed manually, one fetch each.
+async function safeFetch(inputUrl, options = {}, { maxRedirects = 3, onFinalUrl } = {}) {
     let url = await assertSafeOutboundUrl(inputUrl);
     for (let redirects = 0; redirects <= maxRedirects; redirects++) {
         const res = await fetch(url, { ...options, redirect: 'manual' });
-        if (![301, 302, 303, 307, 308].includes(res.status)) return res;
+        if (![301, 302, 303, 307, 308].includes(res.status)) {
+            onFinalUrl?.(url.toString());
+            return res;
+        }
 
         const location = res.headers.get('location');
-        if (!location) return res;
+        if (!location) {
+            onFinalUrl?.(url.toString());
+            return res;
+        }
         if (redirects === maxRedirects) throw new Error('Too many redirects');
 
         url = await assertSafeOutboundUrl(new URL(location, url).toString());
@@ -1600,20 +1709,37 @@ app.get('/:config/stream/:type/:id.json', async (req, res) => {
     }
 
     try {
-        const { username, password } = cfg;
-        const serverUrl = normalizeUrl(cfg.serverUrl);
+        // No credentials are read here any more: every stream this route hands
+        // out is a proxy URL on this server, and the proxy is what holds them.
 
         // --- Handle xTremio's own IDs ---
         if (id.startsWith('xtremio_live_')) {
             const streamId = getPrefixedNumericId(id, 'xtremio_live_');
             if (!streamId) return res.status(400).json({ streams: [] });
-            const encodedUser = encodeURIComponent(username);
-            const encodedPass = encodeURIComponent(password);
+            // Live goes through the proxy for the same reason movies and
+            // episodes do, plus one of its own: the upstream URL embeds the
+            // account username and password, and handing it to Stremio put
+            // those in client logs and — for the http-only providers that are
+            // the norm — in cleartext on the wire. Neither format is MP4, so
+            // both are notWebReady; isNotWebReady is used rather than a
+            // hardcoded true so the rule stays stated in one place.
+            const proxyBase = `${getBaseUrl(req)}/${req.params.config}/proxy/live/${streamId}`;
+            const variants = [
+                { ext: 'm3u8', title: 'HLS' },
+                { ext: 'ts', title: 'MPEG-TS' }
+            ];
             return res.json({
-                streams: [
-                    { url: `${serverUrl}/live/${encodedUser}/${encodedPass}/${streamId}.m3u8`, title: 'HLS' },
-                    { url: `${serverUrl}/live/${encodedUser}/${encodedPass}/${streamId}.ts`, title: 'MPEG-TS' }
-                ],
+                streams: variants.map(({ ext, title }) => {
+                    const url = `${proxyBase}.${ext}`;
+                    return {
+                        url,
+                        title,
+                        behaviorHints: {
+                            notWebReady: isNotWebReady(url, ext),
+                            bingeGroup: `xtremio-live-${ext}`
+                        }
+                    };
+                }),
                 cacheMaxAge: 3600
             });
         }
@@ -1680,36 +1806,44 @@ app.get('/:config/stream/:type/:id.json', async (req, res) => {
     }
 });
 
-// Stream proxy. Xtream providers 302-redirect to a CDN URL that carries
-// a short-lived signed token (~60s). Handing that URL directly to
-// Stremio causes "playback error" after ~1 minute when the token
-// expires. By proxying every range request through the addon, we
-// re-resolve the origin URL (and get a fresh token) for each request.
-app.all('/:config/proxy/:kind/:file', async (req, res) => {
-    if (req.method !== 'GET' && req.method !== 'HEAD') {
-        return res.status(405).end('method not allowed');
+// Read a capped body for rewriting. Unlike the streaming path this has to hold
+// the whole thing in memory, so an upstream that mislabels a video as a
+// playlist must not be allowed to fill the heap.
+async function readTextCapped(body, maxBytes) {
+    const reader = body.getReader();
+    const chunks = [];
+    let total = 0;
+    for (;;) {
+        const { done, value } = await reader.read();
+        if (done) break;
+        total += value.byteLength;
+        if (total > maxBytes) {
+            await reader.cancel().catch(() => {});
+            throw new Error(`playlist exceeded ${maxBytes} bytes`);
+        }
+        chunks.push(Buffer.from(value));
     }
-    const cfg = decodeConfig(req.params.config);
-    if (!cfg) return res.status(401).end('unauthorized');
+    return Buffer.concat(chunks).toString('utf8');
+}
 
-    const { kind, file } = req.params;
-    if (!['movie', 'series', 'live'].includes(kind)) {
-        return res.status(400).end('bad kind');
-    }
-    const match = /^([^./]+)\.([A-Za-z0-9]+)$/.exec(file);
-    if (!match) return res.status(400).end('bad file');
-    const [, streamId, ext] = match;
-    if (!isNumericId(streamId)) return res.status(400).end('bad stream id');
-
-    const serverUrl = normalizeUrl(cfg.serverUrl);
-    const upstreamUrl = new URL(
-        `/${kind}/${encodeURIComponent(cfg.username)}/${encodeURIComponent(cfg.password)}/${streamId}.${ext}`,
-        serverUrl
-    ).toString();
-
+// The shared body of both proxy routes: resolve the upstream, forward the
+// headers that matter for playback, and either rewrite a playlist or stream
+// the bytes through. Both routes need identical abort, timeout and
+// header-forwarding behaviour, so it lives in one place — the difference
+// between them is only how the upstream URL is arrived at.
+//
+// `rewriteFor` is called with the response's final URL and content type; it
+// returns a mapper for playlist URIs, or null to stream the body untouched.
+async function relayUpstream(req, res, { upstreamUrl, label, ext, rewriteFor }) {
     const headers = { 'User-Agent': PROXY_USER_AGENT };
-    if (req.headers.range) headers['Range'] = req.headers.range;
-    if (req.headers['if-range']) headers['If-Range'] = req.headers['if-range'];
+    // A Range on a playlist would yield a partial body that cannot be parsed or
+    // rewritten. Players do not range-request playlists; skip it when we already
+    // know from the extension that one is coming.
+    const expectPlaylist = String(ext || '').toLowerCase() === 'm3u8';
+    if (!expectPlaylist) {
+        if (req.headers.range) headers['Range'] = req.headers.range;
+        if (req.headers['if-range']) headers['If-Range'] = req.headers['if-range'];
+    }
 
     const controller = new AbortController();
     const abort = () => {
@@ -1723,6 +1857,7 @@ app.all('/:config/proxy/:kind/:file', async (req, res) => {
     const isAbortErr = (e) => e && (e.name === 'AbortError' || e.code === 'ABORT_ERR' || controller.signal.aborted);
 
     let upstream;
+    let finalUrl = upstreamUrl;
     // Bound the wait for response *headers* only. An upstream that accepts the
     // connection and then stalls would otherwise pin this request and its
     // socket forever. The timer is cleared as soon as headers arrive so the
@@ -1734,20 +1869,57 @@ app.all('/:config/proxy/:kind/:file', async (req, res) => {
             method: 'GET',
             headers,
             signal: controller.signal
-        });
+        }, { onFinalUrl: (u) => { finalUrl = u; } });
     } catch (e) {
         if (headersTimedOut) {
-            console.warn(`[proxy] upstream headers timed out after ${PROXY_HEADER_TIMEOUT_MS}ms for ${kind}/${streamId}.${ext}`);
+            console.warn(`[proxy] upstream headers timed out after ${PROXY_HEADER_TIMEOUT_MS}ms for ${label}`);
             if (!res.headersSent) res.status(504).end('upstream timeout');
             return;
         }
         if (!isAbortErr(e)) {
-            console.warn(`[proxy] upstream fetch failed for ${kind}/${streamId}.${ext}: ${e.message}`);
+            console.warn(`[proxy] upstream fetch failed for ${label}: ${e.message}`);
         }
         if (!res.headersSent) res.status(502).end('upstream fetch failed');
         return;
     } finally {
         clearTimeout(headerTimer);
+    }
+
+    const contentType = upstream.headers.get('content-type');
+    // Only a complete 200 body is rewritable; a 206 is a fragment, and an error
+    // body is not a playlist whatever the extension says.
+    const mapper = (upstream.status === 200 && upstream.body && rewriteFor)
+        ? rewriteFor(finalUrl, contentType)
+        : null;
+
+    // Fail closed on a playlist we cannot rewrite. The sub-resource route has
+    // to forward Range, because EXT-X-BYTERANGE segments depend on it, so a
+    // ranged request for a nested playlist would come back 206 and skip the
+    // rewrite above — relaying the provider's credential-bearing URIs verbatim,
+    // which is the one thing this whole path exists to prevent. Players do not
+    // range-request playlists, so refusing costs nothing real.
+    if (!mapper && upstream.status === 206 && looksLikePlaylist(ext, contentType)) {
+        console.warn(`[proxy] refusing to relay a partial playlist for ${label}`);
+        if (!res.headersSent) res.status(502).end('partial playlist');
+        return;
+    }
+
+    if (mapper && req.method !== 'HEAD') {
+        let text;
+        try {
+            text = await readTextCapped(upstream.body, MAX_PLAYLIST_BYTES);
+        } catch (e) {
+            if (!isAbortErr(e)) console.warn(`[proxy] playlist read failed for ${label}: ${e.message}`);
+            if (!res.headersSent) res.status(502).end('bad playlist');
+            return;
+        }
+        const rewritten = rewriteHlsPlaylist(text, finalUrl, mapper);
+        res.status(upstream.status);
+        // Deliberately not forwarding content-length: the rewritten body is a
+        // different size. Nor accept-ranges — a playlist is not seekable.
+        if (contentType) res.setHeader('Content-Type', contentType);
+        res.setHeader('Cache-Control', 'no-store');
+        return res.end(Buffer.from(rewritten, 'utf8'));
     }
 
     res.status(upstream.status);
@@ -1777,7 +1949,7 @@ app.all('/:config/proxy/:kind/:file', async (req, res) => {
     const nodeStream = Readable.fromWeb(upstream.body);
     nodeStream.on('error', (e) => {
         if (!isAbortErr(e)) {
-            console.warn(`[proxy] stream error for ${kind}/${streamId}.${ext}: ${e.message}`);
+            console.warn(`[proxy] stream error for ${label}: ${e.message}`);
         }
         if (!res.headersSent) res.status(502);
         res.end();
@@ -1788,6 +1960,83 @@ app.all('/:config/proxy/:kind/:file', async (req, res) => {
         nodeStream.destroy();
     });
     nodeStream.pipe(res);
+}
+
+// Stream proxy. Xtream providers 302-redirect to a CDN URL that carries
+// a short-lived signed token (~60s). Handing that URL directly to
+// Stremio causes "playback error" after ~1 minute when the token
+// expires. By proxying every range request through the addon, we
+// re-resolve the origin URL (and get a fresh token) for each request.
+//
+// It also keeps the account credentials on the server: the upstream path
+// embeds username and password, and this is what stops that URL reaching the
+// player. Live channels use it for the same reason (see the stream route).
+app.all('/:config/proxy/:kind/:file', async (req, res) => {
+    if (req.method !== 'GET' && req.method !== 'HEAD') {
+        return res.status(405).end('method not allowed');
+    }
+    const cfg = decodeConfig(req.params.config);
+    if (!cfg) return res.status(401).end('unauthorized');
+
+    const { kind, file } = req.params;
+    if (!['movie', 'series', 'live'].includes(kind)) {
+        return res.status(400).end('bad kind');
+    }
+    const match = /^([^./]+)\.([A-Za-z0-9]+)$/.exec(file);
+    if (!match) return res.status(400).end('bad file');
+    const [, streamId, ext] = match;
+    if (!isNumericId(streamId)) return res.status(400).end('bad stream id');
+
+    const serverUrl = normalizeUrl(cfg.serverUrl);
+    const upstreamUrl = new URL(
+        `/${kind}/${encodeURIComponent(cfg.username)}/${encodeURIComponent(cfg.password)}/${streamId}.${ext}`,
+        serverUrl
+    ).toString();
+
+    const base = getBaseUrl(req);
+    await relayUpstream(req, res, {
+        upstreamUrl,
+        label: `${kind}/${streamId}.${ext}`,
+        ext,
+        rewriteFor: (finalUrl, contentType) => {
+            if (!looksLikePlaylist(ext, contentType)) return null;
+            return (absolute) => {
+                const { u, s } = encodeHlsTarget(absolute);
+                return `${base}/${req.params.config}/proxy/hls?u=${u}&s=${s}`;
+            };
+        }
+    });
+});
+
+// Sub-resources of a proxied playlist: variant playlists, segments and keys.
+// Reached only through URLs this server generated and signed, so the target is
+// not caller-chosen despite being carried in the query string. A nested
+// playlist is rewritten in turn, which is what makes master playlists work.
+app.all('/:config/proxy/hls', async (req, res) => {
+    if (req.method !== 'GET' && req.method !== 'HEAD') {
+        return res.status(405).end('method not allowed');
+    }
+    const cfg = decodeConfig(req.params.config);
+    if (!cfg) return res.status(401).end('unauthorized');
+
+    const upstreamUrl = decodeHlsTarget(req.query.u, req.query.s);
+    if (!upstreamUrl) return res.status(400).end('bad target');
+
+    const base = getBaseUrl(req);
+    await relayUpstream(req, res, {
+        upstreamUrl,
+        label: 'hls sub-resource',
+        // Unknown ahead of time — a segment must keep its Range support, so the
+        // decision rests on the response's content type alone.
+        ext: null,
+        rewriteFor: (finalUrl, contentType) => {
+            if (!looksLikePlaylist(null, contentType)) return null;
+            return (absolute) => {
+                const { u, s } = encodeHlsTarget(absolute);
+                return `${base}/${req.params.config}/proxy/hls?u=${u}&s=${s}`;
+            };
+        }
+    });
 });
 
 app.get('/', (req, res) => {
@@ -2058,6 +2307,13 @@ module.exports = {
     selectCatalogGenre,
     normalizeContainerExt,
     isNotWebReady,
+    signTokenBody,
+    rewriteHlsPlaylist,
+    looksLikePlaylist,
+    encodeHlsTarget,
+    decodeHlsTarget,
+    signHlsTarget,
+    MAX_PLAYLIST_BYTES,
     isPrivateIp,
     readJsonCapped,
     MAX_UPSTREAM_BYTES,

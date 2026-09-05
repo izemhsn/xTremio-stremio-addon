@@ -95,7 +95,8 @@ instead of a stack trace with filesystem paths.
 | `/:config/catalog/:type/:id/:extra?.json` | Catalog items |
 | `/:config/meta/:type/:id.json` | Meta for a live channel, movie, or series |
 | `/:config/stream/:type/:id.json` | Playable stream URLs |
-| `/:config/proxy/:kind/:file` | Relays movie and episode bytes from the provider (see [Streaming](#streaming)) |
+| `/:config/proxy/:kind/:file` | Relays movie, episode and live bytes from the provider (see [Streaming](#streaming)) |
+| `/:config/proxy/hls` | Relays the segments and keys of a proxied HLS playlist. Only follows targets this server signed |
 
 ## How install URLs work
 
@@ -122,14 +123,29 @@ an error — Stremio surfaces raw errors to the user.
 
 ## Streaming
 
-Movies and series are **not** handed to Stremio as provider URLs. Xtream providers 302-redirect
-to a CDN URL carrying a token that expires in about a minute, so those streams are served as
+Nothing is handed to Stremio as a provider URL. Xtream providers 302-redirect to a CDN URL
+carrying a token that expires in about a minute, so streams are served as
 `/:config/proxy/:kind/:file` URLs on this server, and each range request re-resolves the origin
-to get a fresh token. Live TV is the exception — it returns direct `.m3u8`/`.ts` URLs.
+to get a fresh token.
 
-The practical consequence is that **all movie and series bandwidth flows through your host**,
-which drives both platform choice and cost. A single 1080p stream is roughly 5-10 Mbps sustained
-in *and* out. Platforms that meter egress, or that cap request duration, are a poor fit.
+Live TV goes through the proxy for a second reason: the provider's live URL embeds the account
+username and password in its path. Returning it directly — as this addon did before — put the
+credentials in the player's logs, and on the wire in cleartext for the http-only providers that
+are the norm. Both formats are still offered:
+
+- **`.ts`** relays byte-for-byte, since a transport stream is just a body.
+- **`.m3u8`** cannot be relayed unchanged. An HLS playlist is a list of further URLs, and an
+  Xtream one names its segments by absolute URLs that carry the same credentials, so passing the
+  body through would move the disclosure from the URL into the body. The playlist is instead
+  rewritten: every segment, key and variant URI is replaced with a `/:config/proxy/hls` link.
+  Those links carry their target HMAC-signed, so the route cannot be used to fetch a URL of the
+  caller's choosing.
+
+The practical consequence is that **all streaming bandwidth flows through your host**, live
+included, which drives both platform choice and cost. A single 1080p stream is roughly 5-10 Mbps
+sustained in *and* out. Platforms that meter egress, or that cap request duration, are a poor fit.
+Live is the heavier case, because a channel left on relays continuously rather than for the
+length of a file.
 
 ## Features
 
@@ -145,9 +161,12 @@ Each per-genre catalog supports genre filtering, pagination (100 items/page), an
 
 ### Meta & Streams
 
-- **Live TV** — returns both HLS (`.m3u8`) and MPEG-TS (`.ts`) stream options.
-- **Movies** — single direct stream URL with the correct container extension.
-- **Series** — full episode list grouped by season; each episode resolves to a direct stream URL. Retries `get_series_info` up to 3 times.
+- **Live TV** — returns both HLS (`.m3u8`) and MPEG-TS (`.ts`) stream options, both proxied.
+- **Movies** — single proxied stream URL with the correct container extension.
+- **Series** — full episode list grouped by season; each episode resolves to a proxied stream URL. Retries `get_series_info` up to 3 times.
+
+All three route through this server rather than the provider, so the account credentials never
+reach the player — see [Streaming](#streaming).
 
 ## Deployment
 
