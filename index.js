@@ -317,14 +317,8 @@ function typeMatchesId(type, id) {
 }
 
 // Catalog ids are not item ids and overlap their prefixes (`xtremio_series_new`
-// starts with `xtremio_series_`), so catalogs get their own map.
-function catalogTypesFor(id) {
-    const str = String(id || '');
-    if (str === 'xtremio_live') return ['Live TV'];
-    if (str === 'xtremio_search_movies' || str.startsWith('xtremio_movies_')) return ['XT-Movies'];
-    if (str === 'xtremio_search_series' || str.startsWith('xtremio_series_')) return ['XT-Series', 'series'];
-    return null;
-}
+// starts with `xtremio_series_`), so catalogs are matched separately — see
+// `catalogTypesFor`, which lives with the catalog table further down.
 
 function normalizeContainerExt(ext) {
     const clean = String(ext || 'mp4').trim();
@@ -1204,182 +1198,180 @@ app.post('/configure', async (req, res) => {
     }
 });
 
+// --- Catalogs ---
+// The three catalog kinds differ only in the fields below. Everything else —
+// genre resolution, the search filter, sorting, pagination and the meta shape —
+// is one code path, so a change to any of it cannot apply to movies and quietly
+// miss series.
+const CATALOG_KINDS = {
+    live: {
+        catalogTypes: ['Live TV'],
+        categoryKey: 'live',
+        loadAll: getAllLiveStreams,
+        listCache: liveStreamsCache,
+        // get_live_streams items may carry category_id, category_name, or neither,
+        // so live also matches on the category name.
+        matchCategoryName: true,
+        idField: 'stream_id',
+        idPrefix: 'xtremio_live_',
+        metaType: 'Live TV',
+        posterField: 'stream_icon',
+        posterShape: 'square',
+        recencyField: null
+    },
+    movies: {
+        catalogTypes: ['XT-Movies'],
+        categoryKey: 'movies',
+        loadAll: getAllVodStreams,
+        listCache: vodStreamsCache,
+        categoryAction: 'get_vod_streams',
+        idField: 'stream_id',
+        idPrefix: 'xtremio_movie_',
+        metaType: 'XT-Movies',
+        posterField: 'stream_icon',
+        posterShape: 'poster',
+        recencyField: 'added'
+    },
+    series: {
+        // Declared under XT-Series in the manifest, but the metas are `series`
+        // because that is the built-in type that gives episodes their UI.
+        catalogTypes: ['XT-Series', 'series'],
+        categoryKey: 'series',
+        loadAll: getAllSeriesStreams,
+        listCache: seriesStreamsCache,
+        categoryAction: 'get_series',
+        idField: 'series_id',
+        idPrefix: 'xtremio_series_',
+        metaType: 'series',
+        posterField: 'cover',
+        posterShape: 'poster',
+        recencyField: 'last_modified'
+    }
+};
+
+// Which kind a catalog id belongs to, and which variant of it. Note the overlap
+// with item id prefixes: `xtremio_series_new` is a catalog id that starts with
+// the item prefix `xtremio_series_`, which is why item ids are matched by
+// `typeMatchesId` and never by this.
+function parseCatalogId(id) {
+    const str = String(id || '');
+    if (str === 'xtremio_live') return { kind: 'live', variant: null, search: false };
+    if (str === 'xtremio_search_movies') return { kind: 'movies', variant: null, search: true };
+    if (str === 'xtremio_search_series') return { kind: 'series', variant: null, search: true };
+    if (str.startsWith('xtremio_movies_')) return { kind: 'movies', variant: str.slice('xtremio_movies_'.length), search: false };
+    if (str.startsWith('xtremio_series_')) return { kind: 'series', variant: str.slice('xtremio_series_'.length), search: false };
+    return null;
+}
+
+function catalogTypesFor(id) {
+    const route = parseCatalogId(id);
+    return route ? CATALOG_KINDS[route.kind].catalogTypes : null;
+}
+
+// Every comparator ends in the item id, making each sort a *total* order. Without
+// that, two items with the same rating keep whatever order the source happened to
+// produce — and the same catalog has two sources (the warm full list or a
+// per-category fetch), so the page you got depended on cache state. That was the
+// audit's L3.
+function catalogComparator(kind, variant) {
+    const idOf = s => parseInt(s[kind.idField]) || 0;
+    const byId = (a, b) => idOf(a) - idOf(b);
+
+    if (variant === 'new' && kind.recencyField) {
+        return (a, b) => ((parseInt(b[kind.recencyField]) || 0) - (parseInt(a[kind.recencyField]) || 0)) || byId(a, b);
+    }
+    if (variant === 'popular') {
+        return (a, b) => ((parseFloat(b.rating) || 0) - (parseFloat(a.rating) || 0)) || byId(a, b);
+    }
+    if (variant === 'featured') {
+        // Seeded on the day so the shuffle holds still while the user paginates.
+        const daySeed = Math.floor(Date.now() / 86400000);
+        const hash = s => ((idOf(s) * 2654435761 + daySeed) & 0x7fffffff);
+        return (a, b) => (hash(a) - hash(b)) || byId(a, b);
+    }
+    return null;
+}
+
+function filterByName(items, search) {
+    if (!search) return items;
+    const q = search.toLowerCase();
+    return items.filter(s => s.name?.toLowerCase().includes(q));
+}
+
+function toCatalogMetas(items, kind) {
+    return items.map(s => ({
+        id: `${kind.idPrefix}${s[kind.idField]}`,
+        type: kind.metaType,
+        name: s.name,
+        poster: s[kind.posterField] || undefined,
+        posterShape: kind.posterShape
+    }));
+}
+
+// Items for one genre, or null when the genre does not resolve to a category.
+async function selectCatalogGenre(cfg, kind, genre) {
+    const cats = await getCategories(cfg);
+    const categories = cats[kind.categoryKey] || [];
+    // Stremio marks genre required, but a bare catalog request still falls back
+    // to the first category rather than showing an empty shelf.
+    const selectedGenre = genre || (categories[0] && categories[0].category_name);
+    const cat = categories.find(c => c.category_name === selectedGenre);
+    if (!cat) return null;
+
+    const catIdStr = String(cat.category_id);
+
+    if (kind.matchCategoryName) {
+        const genreLower = String(selectedGenre || '').toLowerCase();
+        const all = await kind.loadAll(cfg);
+        return all.filter(s => {
+            if (s.category_id != null && s.category_id !== '') return String(s.category_id) === catIdStr;
+            return genreLower && String(s.category_name || '').toLowerCase() === genreLower;
+        });
+    }
+
+    // Reuse the warm full list when there is one; otherwise a per-category fetch
+    // beats pulling 10-50 MB just to filter it down.
+    const fullList = kind.listCache.get(cfg);
+    return fullList
+        ? fullList.filter(s => String(s.category_id) === catIdStr)
+        : await getStreams(cfg, kind.categoryAction, { category_id: catIdStr });
+}
+
 app.get(['/:config/catalog/:type/:id.json', '/:config/catalog/:type/:id/:extra.json'], async (req, res) => {
     const cfg = decodeConfig(req.params.config);
     if (!cfg) return res.json({ metas: [] });
 
     const { id, type } = req.params;
 
-    const allowedTypes = catalogTypesFor(id);
-    if (allowedTypes && !allowedTypes.includes(type)) {
+    const route = parseCatalogId(id);
+    if (route && !CATALOG_KINDS[route.kind].catalogTypes.includes(type)) {
         console.warn(`[catalog] type/id mismatch: type=${type} id=${id}`);
         return res.json({ metas: [] });
     }
+    if (!route) return res.json({ metas: [] });
+
+    const kind = CATALOG_KINDS[route.kind];
 
     try {
         const extra = parseExtra(req.params.extra);
         const skip = Math.max(0, parseInt(extra.skip) || 0);
-        const genre = extra.genre;
 
-        if (id === 'xtremio_live') {
-            const cats = await getCategories(cfg);
-            const selectedGenre = genre || (cats.live[0] && cats.live[0].category_name);
-            let categoryId;
-            if (selectedGenre) {
-                const cat = cats.live.find(c => c.category_name === selectedGenre);
-                if (cat) categoryId = cat.category_id;
-            }
-
-            // No genre selected and none resolvable -> nothing to show.
-            if (!categoryId) return res.json({ metas: [] });
-
-            // Fetch all live channels once (cached), then filter in-memory by selected category.
-            const allItems = await getAllLiveStreams(cfg);
-            const catIdStr = String(categoryId);
-            const selectedGenreLower = (selectedGenre || '').toLowerCase();
-            let items = allItems.filter(s => {
-                if (s.category_id != null && s.category_id !== '') {
-                    return String(s.category_id) === catIdStr;
-                }
-                return selectedGenreLower && String(s.category_name || '').toLowerCase() === selectedGenreLower;
-            });
-
-            if (extra.search) {
-                const q = extra.search.toLowerCase();
-                items = items.filter(s => s.name?.toLowerCase().includes(q));
-            }
-
-            const page = items.slice(skip, skip + PAGE_SIZE);
-            const metas = page.map(s => ({
-                id: `xtremio_live_${s.stream_id}`,
-                type: 'Live TV',
-                name: s.name,
-                poster: s.stream_icon || undefined,
-                posterShape: 'square'
-            }));
-
-            return res.json({ metas, cacheMaxAge: 300, staleRevalidate: 600 });
+        let items;
+        if (route.search) {
+            // Global search: one full-list fetch per account (cached), then an
+            // in-memory filter. This is what makes search cheap.
+            if (!extra.search) return res.json({ metas: [] });
+            items = filterByName(await kind.loadAll(cfg), extra.search);
+        } else {
+            items = await selectCatalogGenre(cfg, kind, extra.genre);
+            if (!items) return res.json({ metas: [] });
+            items = filterByName(items, extra.search);
+            const comparator = catalogComparator(kind, route.variant);
+            if (comparator) items = [...items].sort(comparator);
         }
 
-        if (id.startsWith('xtremio_movies_')) {
-            const cats = await getCategories(cfg);
-            const selectedGenre = genre || (cats.movies[0] && cats.movies[0].category_name);
-            const cat = cats.movies.find(c => c.category_name === selectedGenre);
-            if (!cat) return res.json({ metas: [] });
-
-            // Reuse the full-list cache if available; fall back to per-category fetch.
-            const catIdStr = String(cat.category_id);
-            const fullList = vodStreamsCache.get(cfg);
-            let items = fullList
-                ? fullList.filter(s => String(s.category_id) === catIdStr)
-                : await getStreams(cfg, 'get_vod_streams', { category_id: catIdStr });
-
-            if (extra.search) {
-                const q = extra.search.toLowerCase();
-                items = items.filter(s => s.name?.toLowerCase().includes(q));
-            }
-
-            if (id === 'xtremio_movies_new') {
-                items = [...items].sort((a, b) => (parseInt(b.added) || 0) - (parseInt(a.added) || 0));
-            } else if (id === 'xtremio_movies_popular') {
-                items = [...items].sort((a, b) => (parseFloat(b.rating) || 0) - (parseFloat(a.rating) || 0));
-            } else if (id === 'xtremio_movies_featured') {
-                // Seeded shuffle based on the day so order is stable across pagination
-                const daySeed = Math.floor(Date.now() / 86400000);
-                items = [...items].sort((a, b) => {
-                    const ha = ((parseInt(a.stream_id) || 0) * 2654435761 + daySeed) & 0x7fffffff;
-                    const hb = ((parseInt(b.stream_id) || 0) * 2654435761 + daySeed) & 0x7fffffff;
-                    return ha - hb;
-                });
-            }
-
-            const page = items.slice(skip, skip + PAGE_SIZE);
-            const metas = page.map(s => ({
-                id: `xtremio_movie_${s.stream_id}`,
-                type: 'XT-Movies',
-                name: s.name,
-                poster: s.stream_icon || undefined,
-                posterShape: 'poster'
-            }));
-
-            return res.json({ metas, cacheMaxAge: 300, staleRevalidate: 600 });
-        }
-
-        if (id.startsWith('xtremio_series_')) {
-            const cats = await getCategories(cfg);
-            const selectedGenre = genre || (cats.series[0] && cats.series[0].category_name);
-            const cat = cats.series.find(c => c.category_name === selectedGenre);
-            if (!cat) return res.json({ metas: [] });
-
-            // Reuse the full-list cache if available; fall back to per-category fetch.
-            const catIdStr = String(cat.category_id);
-            const fullList = seriesStreamsCache.get(cfg);
-            let items = fullList
-                ? fullList.filter(s => String(s.category_id) === catIdStr)
-                : await getStreams(cfg, 'get_series', { category_id: catIdStr });
-
-            if (extra.search) {
-                const q = extra.search.toLowerCase();
-                items = items.filter(s => s.name?.toLowerCase().includes(q));
-            }
-
-            if (id === 'xtremio_series_new') {
-                items = [...items].sort((a, b) => (parseInt(b.last_modified) || 0) - (parseInt(a.last_modified) || 0));
-            } else if (id === 'xtremio_series_popular') {
-                items = [...items].sort((a, b) => (parseFloat(b.rating) || 0) - (parseFloat(a.rating) || 0));
-            } else if (id === 'xtremio_series_featured') {
-                const daySeed = Math.floor(Date.now() / 86400000);
-                items = [...items].sort((a, b) => {
-                    const ha = ((parseInt(a.series_id) || 0) * 2654435761 + daySeed) & 0x7fffffff;
-                    const hb = ((parseInt(b.series_id) || 0) * 2654435761 + daySeed) & 0x7fffffff;
-                    return ha - hb;
-                });
-            }
-
-            const page = items.slice(skip, skip + PAGE_SIZE);
-            const metas = page.map(s => ({
-                id: `xtremio_series_${s.series_id}`,
-                type: 'series',
-                name: s.name,
-                poster: s.cover || undefined,
-                posterShape: 'poster'
-            }));
-
-            return res.json({ metas, cacheMaxAge: 300, staleRevalidate: 600 });
-        }
-
-        // Global search catalogs - fetch all streams once, filter in memory
-        if (id === 'xtremio_search_movies' && extra.search) {
-            const q = extra.search.toLowerCase();
-            const allMovies = await getAllVodStreams(cfg);
-            const filtered = allMovies.filter(s => s.name?.toLowerCase().includes(q));
-            const page = filtered.slice(skip, skip + PAGE_SIZE);
-            const metas = page.map(s => ({
-                id: `xtremio_movie_${s.stream_id}`,
-                type: 'XT-Movies',
-                name: s.name,
-                poster: s.stream_icon || undefined,
-                posterShape: 'poster'
-            }));
-            return res.json({ metas, cacheMaxAge: 300, staleRevalidate: 600 });
-        }
-
-        if (id === 'xtremio_search_series' && extra.search) {
-            const q = extra.search.toLowerCase();
-            const allSeries = await getAllSeriesStreams(cfg);
-            const filtered = allSeries.filter(s => s.name?.toLowerCase().includes(q));
-            const page = filtered.slice(skip, skip + PAGE_SIZE);
-            const metas = page.map(s => ({
-                id: `xtremio_series_${s.series_id}`,
-                type: 'series',
-                name: s.name,
-                poster: s.cover || undefined,
-                posterShape: 'poster'
-            }));
-            return res.json({ metas, cacheMaxAge: 300, staleRevalidate: 600 });
-        }
-
-        res.json({ metas: [] });
+        const metas = toCatalogMetas(items.slice(skip, skip + PAGE_SIZE), kind);
+        return res.json({ metas, cacheMaxAge: 300, staleRevalidate: 600 });
     } catch (e) {
         console.error('[catalog] Error:', e.message);
         res.json({ metas: [] });
@@ -1961,6 +1953,7 @@ if (require.main === module) {
 // Exported for the test suite only — nothing here is a public API.
 module.exports = {
     app,
+    getManifest,
     encodeConfig,
     decodeConfig,
     validateConfig,
@@ -1974,6 +1967,12 @@ module.exports = {
     parseEpisodeId,
     typeMatchesId,
     catalogTypesFor,
+    parseCatalogId,
+    CATALOG_KINDS,
+    catalogComparator,
+    filterByName,
+    toCatalogMetas,
+    selectCatalogGenre,
     normalizeContainerExt,
     isNotWebReady,
     isPrivateIp,
