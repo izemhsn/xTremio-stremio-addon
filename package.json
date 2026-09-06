@@ -22,7 +22,7 @@
   "private": true,
   "type": "commonjs",
   "engines": {
-    "node": ">=18.0.0"
+    "node": ">=20.18.1"
   },
   "repository": {
     "type": "git",
@@ -33,6 +33,7 @@
   },
   "homepage": "https://github.com/izemhsn/xTremio-stremio-addon#readme",
   "dependencies": {
-    "express": "^5.2.1"
+    "express": "^5.2.1",
+    "undici": "^7.29.1"
   }
 }

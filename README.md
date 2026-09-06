@@ -30,7 +30,7 @@ Catalog sections (Live TV, XT-Movies, XT-Series) then appear in Stremio's sideba
 | Variable | Default | Purpose |
 |---|---|---|
 | `CONFIG_SECRET` | *(random per boot — see below)* | **Mandatory under `NODE_ENV=production`**, where the addon refuses to start without it or with fewer than 32 bytes. Secret from which the config-token encryption and MAC keys are derived, via scrypt. `XTREMIO_CONFIG_SECRET` is accepted as an alias. |
-| `NODE_ENV` | *(unset)* | Set to `production` in deployment. Enforces the `CONFIG_SECRET` policy above, and makes Express return a bare 500 instead of a stack trace. |
+| `NODE_ENV` | *(unset)* | Set to `production` in deployment. Enforces the `CONFIG_SECRET` policy above. Error responses no longer depend on it: the addon's own error handler returns a bare 400/500 and logs the stack server-side whatever `NODE_ENV` says. |
 | `PROXY_CORS` | `false` | Escape hatch. `Access-Control-Allow-Origin: *` is sent on the Stremio addon resources (manifest, catalog, meta, stream) but **not** on `/proxy`, `/configure`, `/health` or the landing page. Set to `true` if a player turns out to need CORS on the byte proxy. Note that CORS is not what limits who can spend your bandwidth — a plain `<video src>` needs none — the install token is. |
 | `PORT` | `3000` | Port the HTTP server binds to |
 | `HOST` | `0.0.0.0` | Interface to bind |
@@ -170,7 +170,9 @@ reach the player — see [Streaming](#streaming).
 
 ## Deployment
 
-Plain Node.js HTTP server with no persistence. Works on any platform that can run Node 18+:
+Plain Node.js HTTP server with no persistence. Works on any platform that can run Node 20.18.1+
+(the floor comes from `undici`, which supplies the connection agent that pins outbound requests to
+the addresses the SSRF guard vetted):
 
 - **Railway / Render / Fly.io** — push the repo, set the start command to `npm start`.
 - **VPS** — `npm ci --omit=dev && pm2 start index.js --name xtremio`.

@@ -166,8 +166,8 @@ const get = (path) => realFetch(`${base}/${CFG}${path}`);
 
 const proxied = (url) => `PROXY(${url})`;
 
-test('rewriteHlsPlaylist rewrites segment URI lines', () => {
-    const out = rewriteHlsPlaylist(
+test('rewriteHlsPlaylist rewrites segment URI lines', async () => {
+    const out = await rewriteHlsPlaylist(
         '#EXTM3U\n#EXTINF:8.000,\nhttp://cdn.test/a/seg1.ts\n',
         'http://cdn.test/a/play.m3u8',
         proxied
@@ -178,11 +178,11 @@ test('rewriteHlsPlaylist rewrites segment URI lines', () => {
     assert.match(out, /^#EXTINF:8\.000,$/m);
 });
 
-test('relative URIs resolve against the playlist URL, not the requested one', () => {
+test('relative URIs resolve against the playlist URL, not the requested one', async () => {
     // This is why safeFetch reports its final URL: the provider redirects
     // /live/... to a CDN path, and resolving against the original request
     // would point every segment at the wrong place.
-    const out = rewriteHlsPlaylist(
+    const out = await rewriteHlsPlaylist(
         '#EXTM3U\nseg2.ts\n',
         'http://cdn.test/deep/path/play.m3u8',
         proxied
@@ -190,10 +190,10 @@ test('relative URIs resolve against the playlist URL, not the requested one', ()
     assert.match(out, /PROXY\(http:\/\/cdn\.test\/deep\/path\/seg2\.ts\)/);
 });
 
-test('URI="..." attributes are rewritten too', () => {
+test('URI="..." attributes are rewritten too', async () => {
     // EXT-X-KEY is the one that matters most: it is a real sub-resource, and on
     // an Xtream provider its URL carries the credentials like any segment.
-    const out = rewriteHlsPlaylist(
+    const out = await rewriteHlsPlaylist(
         '#EXT-X-KEY:METHOD=AES-128,URI="http://cdn.test/k.bin",IV=0x1\n#EXT-X-MEDIA:TYPE=AUDIO,URI="alt.m3u8"\n',
         'http://cdn.test/play.m3u8',
         proxied
@@ -205,10 +205,10 @@ test('URI="..." attributes are rewritten too', () => {
     assert.match(out, /IV=0x1/);
 });
 
-test('blank lines and CRLF endings are preserved', () => {
+test('blank lines and CRLF endings are preserved', async () => {
     // Some players are strict about line endings; a rewrite that silently
     // normalised them would break playback for reasons nobody would guess.
-    const out = rewriteHlsPlaylist(
+    const out = await rewriteHlsPlaylist(
         '#EXTM3U\r\n\r\nseg.ts\r\n',
         'http://cdn.test/p.m3u8',
         proxied
@@ -218,8 +218,8 @@ test('blank lines and CRLF endings are preserved', () => {
     assert.ok(out.includes('\r\n\r\n'), 'blank line kept');
 });
 
-test('unresolvable or non-http URIs are left alone rather than dropped', () => {
-    const out = rewriteHlsPlaylist(
+test('unresolvable or non-http URIs are left alone rather than dropped', async () => {
+    const out = await rewriteHlsPlaylist(
         '#EXT-X-KEY:METHOD=AES-128,URI="data:text/plain;base64,AAAA"\n',
         'http://cdn.test/p.m3u8',
         proxied

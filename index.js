@@ -3,6 +3,10 @@ const { Readable } = require('stream');
 const crypto = require('crypto');
 const dns = require('dns').promises;
 const net = require('net');
+// Only for the connection-level DNS pin below — outbound requests still go
+// through the global fetch. See PINNED_DISPATCHER for why the two have to come
+// from the same undici major.
+const { Agent: UndiciAgent } = require('undici');
 
 const app = express();
 app.use(express.urlencoded({ extended: true }));
@@ -322,6 +326,13 @@ app.get('/:config/manifest.json', async (req, res) => {
     res.json(await getManifest(getBaseUrl(req), cfg));
 });
 
+// Query and body values arrive as string, array, object or undefined depending
+// on what the client sent. Anything that is not a string is treated as absent
+// rather than coerced: `String(['a','b'])` would silently accept "a,b".
+function asString(value) {
+    return typeof value === 'string' ? value : '';
+}
+
 function normalizeUrl(url) {
     url = String(url || '').trim().replace(/\/+$/, '');
     if (!url) throw new Error('serverUrl is required');
@@ -475,8 +486,10 @@ const HLS_URI_ATTR = /URI="([^"]*)"/gi;
 // Anything that will not resolve, or is not http(s), is left untouched rather
 // than dropped: a malformed line is the provider's business, and removing it
 // would silently corrupt the playlist.
-function rewriteHlsPlaylist(text, baseUrl, toProxyUrl) {
-    const mapUri = (raw) => {
+// `toProxyUrl` may be async — the mapper used in production resolves DNS to
+// check the target before signing it — so this is async throughout.
+async function rewriteHlsPlaylist(text, baseUrl, toProxyUrl) {
+    const mapUri = async (raw) => {
         const uri = String(raw).trim();
         if (!uri) return null;
         let absolute;
@@ -489,24 +502,42 @@ function rewriteHlsPlaylist(text, baseUrl, toProxyUrl) {
         return toProxyUrl(absolute.toString());
     };
 
-    return text.split('\n').map((line) => {
+    // replace() cannot await, so URI attributes are walked by hand. The regex is
+    // built per call rather than shared: awaiting mid-scan would otherwise let a
+    // concurrent rewrite move lastIndex out from under this one.
+    const rewriteUriAttrs = async (body) => {
+        const scanner = new RegExp(HLS_URI_ATTR.source, HLS_URI_ATTR.flags);
+        const parts = [];
+        let cursor = 0;
+        let match;
+        while ((match = scanner.exec(body)) !== null) {
+            const mapped = await mapUri(match[1]);
+            parts.push(body.slice(cursor, match.index), mapped ? `URI="${mapped}"` : match[0]);
+            cursor = match.index + match[0].length;
+        }
+        parts.push(body.slice(cursor));
+        return parts.join('');
+    };
+
+    const out = [];
+    for (const line of text.split('\n')) {
         // Preserve CRLF exactly: some players are strict about the line ending.
         const cr = line.endsWith('\r') ? '\r' : '';
         const body = cr ? line.slice(0, -1) : line;
 
-        if (!body.trim()) return line;
+        if (!body.trim()) {
+            out.push(line);
+            continue;
+        }
         if (body.startsWith('#')) {
-            // replace() manages the global regex's lastIndex itself, and
-            // returns the line untouched when there is no URI attribute.
-            return body.replace(HLS_URI_ATTR, (whole, uri) => {
-                const mapped = mapUri(uri);
-                return mapped ? `URI="${mapped}"` : whole;
-            }) + cr;
+            out.push(await rewriteUriAttrs(body) + cr);
+            continue;
         }
 
-        const mapped = mapUri(body);
-        return mapped ? mapped + cr : line;
-    }).join('\n');
+        const mapped = await mapUri(body);
+        out.push(mapped ? mapped + cr : line);
+    }
+    return out.join('\n');
 }
 
 function ipv4ToLong(ip) {
@@ -538,6 +569,93 @@ function isPrivateIp(ip) {
         lower.startsWith('ff');
 }
 
+// --- DNS pinning -----------------------------------------------------------
+//
+// Vetting an address and then calling fetch() resolves the hostname twice:
+// once in assertSafeOutboundUrl, once inside the HTTP client, independently.
+// A record with a near-zero TTL can answer the first lookup with a public
+// address and the second with 169.254.169.254 — the check passes and the
+// connection lands inside the network anyway. Since the proxy relays upstream
+// bodies back to the caller, winning that race is not blind SSRF but full
+// response exfiltration.
+//
+// So the addresses that passed the check are remembered here and handed to the
+// connector, which performs no lookup of its own. The hostname itself is left
+// alone in the URL and the TLS options, so SNI and certificate validation still
+// happen against the real name rather than a bare IP.
+const DNS_PIN_TTL_MS = 60 * 1000;
+const DNS_PIN_MAX_HOSTS = 1000;
+const dnsPins = new Map();
+
+function pinResolvedAddresses(hostname, addresses) {
+    const now = Date.now();
+    for (const [host, entry] of dnsPins) {
+        if (entry.expiresAt <= now) dnsPins.delete(host);
+    }
+    // Re-inserting rather than updating in place keeps insertion order equal to
+    // recency, so the eviction below drops the least recently vetted host.
+    dnsPins.delete(hostname);
+    while (dnsPins.size >= DNS_PIN_MAX_HOSTS) {
+        dnsPins.delete(dnsPins.keys().next().value);
+    }
+    dnsPins.set(hostname, {
+        addresses: addresses.map(({ address, family }) => ({ address, family: family || net.isIP(address) })),
+        expiresAt: now + DNS_PIN_TTL_MS
+    });
+}
+
+function pinnedLookupError(hostname) {
+    return Object.assign(new Error(`No vetted address pinned for ${hostname}`), {
+        code: 'ENOTFOUND',
+        hostname
+    });
+}
+
+// Fails closed. An unpinned hostname means the connector is resolving something
+// assertSafeOutboundUrl never approved, which is exactly the case this exists
+// to stop — falling back to a real lookup here would reopen the race.
+function pinnedLookup(hostname, options, callback) {
+    const entry = dnsPins.get(hostname);
+    if (!entry || entry.expiresAt <= Date.now()) {
+        return callback(pinnedLookupError(hostname));
+    }
+
+    const wanted = options?.family;
+    const matches = (wanted === 4 || wanted === 6)
+        ? entry.addresses.filter((a) => a.family === wanted)
+        : entry.addresses;
+    if (!matches.length) return callback(pinnedLookupError(hostname));
+
+    // Node asks for every address when happy-eyeballs is on, one otherwise.
+    if (options?.all) return callback(null, matches.map(({ address, family }) => ({ address, family })));
+    return callback(null, matches[0].address, matches[0].family);
+}
+
+// One agent for the process. Pooling is safe because every pinned address has
+// already passed the private-address check, so a reused connection is no less
+// vetted than a fresh one. Null when ALLOW_PRIVATE_NETWORKS is set: the check
+// is off, so there is nothing to pin against.
+const PINNED_DISPATCHER = ALLOW_PRIVATE_NETWORKS
+    ? null
+    : new UndiciAgent({ connect: { lookup: pinnedLookup } });
+
+// A dispatcher is only usable by a fetch() from the same undici major — the
+// handler interface changed between v7 and v8, and a mismatch fails every
+// outbound request outright rather than quietly going unpinned. The dependency
+// therefore tracks the undici that Node bundles; this says so at boot instead
+// of leaving someone to decode "invalid onRequestStart method".
+function warnOnUndiciMismatch(log = console) {
+    if (!PINNED_DISPATCHER) return true;
+    const bundled = String(process.versions.undici || '').split('.')[0];
+    const dependency = String(require('undici/package.json').version).split('.')[0];
+    if (!bundled || bundled === dependency) return true;
+    log.warn(
+        `Node bundles undici ${process.versions.undici} but this app depends on undici ${dependency}.x. ` +
+        'Outbound requests will fail until the dependency is aligned with the runtime.'
+    );
+    return false;
+}
+
 async function assertSafeOutboundUrl(inputUrl) {
     const url = new URL(inputUrl);
     if (!['http:', 'https:'].includes(url.protocol)) {
@@ -555,6 +673,9 @@ async function assertSafeOutboundUrl(inputUrl) {
             throw new Error(`Blocked private outbound address for ${hostname}`);
         }
     }
+    // A literal address needs no pin: the connector recognises it and never
+    // calls lookup, so there is no second resolution to disagree with.
+    if (!directIp) pinResolvedAddresses(hostname, addresses);
     return url;
 }
 
@@ -567,7 +688,14 @@ async function assertSafeOutboundUrl(inputUrl) {
 async function safeFetch(inputUrl, options = {}, { maxRedirects = 3, onFinalUrl } = {}) {
     let url = await assertSafeOutboundUrl(inputUrl);
     for (let redirects = 0; redirects <= maxRedirects; redirects++) {
-        const res = await fetch(url, { ...options, redirect: 'manual' });
+        // The dispatcher is what makes the check above binding: assertSafeOutboundUrl
+        // pins the addresses it approved, and this connects to those and nothing
+        // else. Every redirect hop re-checks and re-pins before its own fetch.
+        const res = await fetch(url, {
+            ...options,
+            redirect: 'manual',
+            ...(PINNED_DISPATCHER ? { dispatcher: PINNED_DISPATCHER } : {})
+        });
         if (![301, 302, 303, 307, 308].includes(res.status)) {
             onFinalUrl?.(url.toString());
             return res;
@@ -1327,18 +1455,24 @@ app.get('/configure', (req, res) => {
     setPrivateHeaders(res);
     const existing = decodeConfig(req.query.config) || {};
     res.send(renderConfigPage({
-        serverUrl: req.query.serverUrl || existing.serverUrl || '',
-        username: req.query.username || existing.username || '',
-        password: req.query.password || existing.password || '',
+        serverUrl: asString(req.query.serverUrl) || existing.serverUrl || '',
+        username: asString(req.query.username) || existing.username || '',
+        password: asString(req.query.password) || existing.password || '',
         baseUrl: getBaseUrl(req)
     }));
 });
 
 app.post('/configure', async (req, res) => {
     setPrivateHeaders(res);
-    const rawServerUrl = (req.body.serverUrl || '').trim().replace(/\/+$/, '');
-    const username = req.body.username || '';
-    const password = req.body.password || '';
+    // req.body is undefined when nothing parsed the body (no Content-Type, or a
+    // JSON one), and extended urlencoded turns `serverUrl[]=a&serverUrl[]=b` or
+    // `serverUrl[a]=1` into an array or an object. Either way the fields are not
+    // guaranteed to be strings, and this runs before the try below, so calling
+    // .trim() on one was an unauthenticated 500.
+    const body = req.body || {};
+    const rawServerUrl = asString(body.serverUrl).trim().replace(/\/+$/, '');
+    const username = asString(body.username);
+    const password = asString(body.password);
 
     const limit = rateLimitConfigure(req);
     if (!limit.allowed) {
@@ -1913,7 +2047,7 @@ async function relayUpstream(req, res, { upstreamUrl, label, ext, rewriteFor }) 
             if (!res.headersSent) res.status(502).end('bad playlist');
             return;
         }
-        const rewritten = rewriteHlsPlaylist(text, finalUrl, mapper);
+        const rewritten = await rewriteHlsPlaylist(text, finalUrl, mapper);
         res.status(upstream.status);
         // Deliberately not forwarding content-length: the rewritten body is a
         // different size. Nor accept-ranges — a playlist is not seekable.
@@ -1971,6 +2105,33 @@ async function relayUpstream(req, res, { upstreamUrl, label, ext, rewriteFor }) 
 // It also keeps the account credentials on the server: the upstream path
 // embeds username and password, and this is what stops that URL reaching the
 // player. Live channels use it for the same reason (see the stream route).
+// Signing a target hands out a capability, and the URIs come from the provider,
+// not from us — a hostile or compromised panel can put any absolute URL in its
+// playlist. Signing one the server would refuse to fetch is the wrong default,
+// so the same check runs here: a private or unresolvable target is left in the
+// playlist verbatim (it will simply fail in the player) rather than signed.
+// This is defence in depth over the fetch-time check, not a replacement for it.
+function makeHlsProxyMapper(base, configToken) {
+    // Playlists name hundreds of segments on one host; vetting is per origin and
+    // memoised for the pass, so that costs one DNS lookup rather than hundreds.
+    const vetted = new Map();
+    return async (absolute) => {
+        let origin;
+        try {
+            origin = new URL(absolute).origin;
+        } catch {
+            return null;
+        }
+        if (!vetted.has(origin)) {
+            vetted.set(origin, assertSafeOutboundUrl(absolute).then(() => true, () => false));
+        }
+        if (!await vetted.get(origin)) return null;
+
+        const { u, s } = encodeHlsTarget(absolute);
+        return `${base}/${configToken}/proxy/hls?u=${u}&s=${s}`;
+    };
+}
+
 app.all('/:config/proxy/:kind/:file', async (req, res) => {
     if (req.method !== 'GET' && req.method !== 'HEAD') {
         return res.status(405).end('method not allowed');
@@ -2000,10 +2161,7 @@ app.all('/:config/proxy/:kind/:file', async (req, res) => {
         ext,
         rewriteFor: (finalUrl, contentType) => {
             if (!looksLikePlaylist(ext, contentType)) return null;
-            return (absolute) => {
-                const { u, s } = encodeHlsTarget(absolute);
-                return `${base}/${req.params.config}/proxy/hls?u=${u}&s=${s}`;
-            };
+            return makeHlsProxyMapper(base, req.params.config);
         }
     });
 });
@@ -2031,10 +2189,7 @@ app.all('/:config/proxy/hls', async (req, res) => {
         ext: null,
         rewriteFor: (finalUrl, contentType) => {
             if (!looksLikePlaylist(null, contentType)) return null;
-            return (absolute) => {
-                const { u, s } = encodeHlsTarget(absolute);
-                return `${base}/${req.params.config}/proxy/hls?u=${u}&s=${s}`;
-            };
+            return makeHlsProxyMapper(base, req.params.config);
         }
     });
 });
@@ -2229,6 +2384,57 @@ app.get('/health', (req, res) => {
         .json({ status: draining ? 'shutting_down' : 'ok', uptime: process.uptime() });
 });
 
+// A path begins with the config token, which is a bearer credential: it
+// decrypts to the account's password. Logging one would put working install
+// URLs in the log file, so the first segment is dropped when it is long enough
+// to be a token rather than a route name.
+function redactConfigInPath(path) {
+    return String(path).replace(/^\/[^/]{24,}/, '/<config>');
+}
+
+// Unknown paths, so Express's default HTML 404 (which names the method and the
+// path) never reaches a client.
+app.use((req, res) => {
+    res.status(404).type('text/plain').end('not found');
+});
+
+// Terminal error handler. Express's default one writes the stack into the
+// response whenever NODE_ENV is not exactly 'production' — absolute filesystem
+// paths, this file's line numbers and the dependency tree, to anyone who can
+// reach the port. Two routes into it were reachable unauthenticated: a
+// non-string field on POST /configure, and a malformed percent-escape anywhere
+// in a path, which throws a URIError out of the router *before* any handler
+// runs. Nothing a handler does can catch the second one — only this can.
+//
+// Registered last because Express matches middleware in order, and an error
+// handler only sees throws from what was registered before it. The four
+// parameters are what identify it as one, so `next` stays whether or not every
+// path uses it.
+app.use((err, req, res, next) => {
+    // A URIError from decodeParam means the client sent a bad path, not that
+    // the server broke; anything carrying its own status (body-parser and
+    // friends) is trusted to have set a sensible one — but only inside the
+    // error range, since res.status() will send whatever it is given.
+    const claimed = Number(err?.status || err?.statusCode);
+    const status = err instanceof URIError
+        ? 400
+        : (claimed >= 400 && claimed <= 599 ? claimed : 500);
+
+    const where = `${req.method} ${redactConfigInPath(req.originalUrl || req.url)} -> ${status}`;
+    // A 4xx is the client's mistake and arrives as often as someone cares to
+    // send one; a stack per malformed path would be a log flood with no
+    // information in it. A 5xx is ours, and the stack is the whole point.
+    if (status >= 500) console.error(`[error] ${where}:`, err);
+    else console.warn(`[error] ${where}: ${err?.message}`);
+
+    // Once the body has started there is no status left to set, and the
+    // response is already half-written; hand back to Express, which closes the
+    // connection rather than appending a stack to a partial body.
+    if (res.headersSent) return next(err);
+
+    res.status(status).type('text/plain').end(status < 500 ? 'bad request' : 'internal error');
+});
+
 // Only bind the port and install process-wide handlers when run directly, so
 // `require('./index.js')` from a test can exercise the internals below without
 // starting a server or hijacking the test runner's exception handling.
@@ -2236,6 +2442,7 @@ if (require.main === module) {
     // Before binding a port: a production deploy with a weak or absent secret
     // should fail loudly at startup, not quietly issue forgeable install URLs.
     enforceConfigSecretPolicy();
+    warnOnUndiciMismatch();
 
     // Only when actually serving: importing this module for tests should not
     // leave a timer running.
@@ -2318,6 +2525,15 @@ module.exports = {
     readJsonCapped,
     MAX_UPSTREAM_BYTES,
     assertSafeOutboundUrl,
+    makeHlsProxyMapper,
+    asString,
+    redactConfigInPath,
+    pinnedLookup,
+    pinResolvedAddresses,
+    dnsPins,
+    PINNED_DISPATCHER,
+    DNS_PIN_TTL_MS,
+    warnOnUndiciMismatch,
     parseExtra,
     parseYear,
     toIsoDate,
