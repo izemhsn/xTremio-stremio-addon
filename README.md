@@ -41,6 +41,8 @@ Catalog sections (Live TV, XT-Movies, XT-Series) then appear in Stremio's sideba
 | `CACHE_MAX_STREAM_ACCOUNTS` | `4` | How many accounts' full stream lists to hold. These are the largest cached objects (10-50 MB per account per kind), so this is the setting that actually caps memory. Raise it if you serve more than a few concurrent accounts and have the RAM. |
 | `CACHE_MAX_ACCOUNTS` | `100` | How many accounts' category lists to hold. Entries are small. |
 | `CACHE_MAX_SERIES_INFO` | `500` | How many per-series detail entries to hold across all accounts. |
+| `CACHE_MAX_VOD_INFO` | `500` | How many per-movie detail entries to hold across all accounts. Opening a movie needs this payload twice — once for meta, once for the stream — and it is reused when the movie is opened again. |
+| `CACHE_MAX_CATEGORY_LISTS` | `100` | How many per-category stream lists to hold across all accounts. This is the cold-cache path for a genre page; caching it is what makes paginating a genre free rather than one upstream fetch per page. |
 | `CACHE_SWEEP_INTERVAL_MS` | `300000` | How often expired cache entries are reclaimed. Minimum 30 s. |
 | `SERIES_INFO_NEGATIVE_TTL_MS` | `300000` | How long a series whose details could not be loaded is remembered as broken, so repeated requests skip the 3 retries. Lower it if your provider recovers quickly. |
 | `PUBLIC_URL` | *(derived from request headers)* | Pins the externally visible base URL used in install links. Recommended behind a reverse proxy — without it the addon derives the base URL from `X-Forwarded-Host`/`Host`, which a client can supply. |

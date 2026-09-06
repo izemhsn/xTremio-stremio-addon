@@ -866,6 +866,15 @@ const CACHE_MAX_STREAM_ACCOUNTS = Math.max(1, Number(process.env.CACHE_MAX_STREA
 // bound for a single user just browsing.
 const CACHE_MAX_SERIES_INFO = Math.max(1, Number(process.env.CACHE_MAX_SERIES_INFO) || 500);
 
+// Same dimension for movies. A vod_info payload is a single item's metadata —
+// kilobytes, not megabytes — so this bound is about entry count, not size.
+const CACHE_MAX_VOD_INFO = Math.max(1, Number(process.env.CACHE_MAX_VOD_INFO) || 500);
+
+// Per-category stream lists: one entry per category per account. Each is a
+// slice of the full list, so a few hundred KB at most, but the count grows with
+// every genre a user opens.
+const CACHE_MAX_CATEGORY_LISTS = Math.max(1, Number(process.env.CACHE_MAX_CATEGORY_LISTS) || 100);
+
 // getCategories intentionally serves expired categories when a refresh fails
 // (stale beats empty — see CACHE_FAILURE_TTL), so age-sweeping catCache on the
 // normal TTL would destroy that fallback. This hard age only reclaims accounts
@@ -972,6 +981,41 @@ function createStreamListCache() {
     };
 }
 
+// Cache-aside read with single-flight over a BoundedMap of `{ data, ts }`.
+// The full-list caches above and the series-info cache below each predate this
+// and carry behaviour of their own — per-entry TTLs, negative caching, a stale
+// fallback — so they keep their bespoke forms. This is the plain case, and both
+// caches added for the per-item and per-category paths are exactly it.
+function createKeyedCache({ maxEntries, ttl = CACHE_TTL }) {
+    const map = new BoundedMap({ maxEntries, maxAgeMs: ttl });
+    const singleFlight = createSingleFlight();
+    // Returns the entry, not the value: a legitimately null payload must still
+    // read as a hit rather than sending every caller back upstream.
+    const liveEntry = (key) => {
+        const entry = map.get(key);
+        return entry && entry.ts > Date.now() - ttl ? entry : null;
+    };
+    return {
+        map,
+        get(key) {
+            const entry = liveEntry(key);
+            return entry ? entry.data : null;
+        },
+        load(key, fetcher) {
+            const hit = liveEntry(key);
+            if (hit) return Promise.resolve(hit.data);
+            return singleFlight(key, async () => {
+                // Re-check: a concurrent flight may have populated it already.
+                const warm = liveEntry(key);
+                if (warm) return warm.data;
+                const data = await fetcher();
+                map.set(key, { data, ts: Date.now() });
+                return data;
+            });
+        }
+    };
+}
+
 const liveStreamsCache = createStreamListCache();
 const vodStreamsCache = createStreamListCache();
 const seriesStreamsCache = createStreamListCache();
@@ -1007,6 +1051,24 @@ const PAGE_SIZE = 100;
 async function getStreams(cfg, action, params = {}) {
     const data = await xtremioGet(cfg, action, params);
     return Array.isArray(data) ? data : [];
+}
+
+// The per-category fetch is what `selectCatalogGenre` falls back to when the
+// full list is cold — which is precisely when Stremio's parallel catalog
+// requests arrive, and it was neither cached nor single-flighted. Paginating a
+// genre re-pulled the whole category from upstream on every page, and four
+// sequential loads of one genre cost four upstream calls.
+const categoryStreamsCache = createKeyedCache({ maxEntries: CACHE_MAX_CATEGORY_LISTS });
+
+function categoryStreamsCacheKey(cfg, action, categoryId) {
+    return `${accountCacheKey(cfg)}\n${action}\n${categoryId}`;
+}
+
+function getCategoryStreams(cfg, action, categoryId) {
+    return categoryStreamsCache.load(
+        categoryStreamsCacheKey(cfg, action, categoryId),
+        () => getStreams(cfg, action, { category_id: categoryId })
+    );
 }
 
 function parseYear(s) {
@@ -1051,6 +1113,8 @@ const CACHE_SWEEP_INTERVAL_MS = Math.max(30 * 1000, Number(process.env.CACHE_SWE
 function sweepCaches(now = Date.now()) {
     return catCache.sweep(now)
         + seriesInfoCache.sweep(now)
+        + vodInfoCache.map.sweep(now)
+        + categoryStreamsCache.map.sweep(now)
         + liveStreamsCache.map.sweep(now)
         + vodStreamsCache.map.sweep(now)
         + seriesStreamsCache.map.sweep(now);
@@ -1154,6 +1218,23 @@ async function fetchSeriesInfo(cfg, seriesId) {
 
     if (lastInfo !== null) return lastInfo;
     throw failure;
+}
+
+// Movies get the same treatment as series, minus the retries and the negative
+// cache — `get_vod_info` is not flaky the way `get_series_info` is. Opening one
+// movie called it twice, once from the meta route and once from the stream
+// route, and re-opening the same movie paid both again: nothing cached it.
+const vodInfoCache = createKeyedCache({ maxEntries: CACHE_MAX_VOD_INFO });
+
+function vodInfoCacheKey(cfg, vodId) {
+    return `${accountCacheKey(cfg)}\n${vodId}`;
+}
+
+function getVodInfo(cfg, vodId) {
+    return vodInfoCache.load(
+        vodInfoCacheKey(cfg, vodId),
+        () => xtremioGet(cfg, 'get_vod_info', { vod_id: vodId })
+    );
 }
 
 function schemeOf(url) {
@@ -1647,7 +1728,7 @@ async function selectCatalogGenre(cfg, kind, genre) {
     const fullList = kind.listCache.get(cfg);
     return fullList
         ? fullList.filter(s => String(s.category_id) === catIdStr)
-        : await getStreams(cfg, kind.categoryAction, { category_id: catIdStr });
+        : await getCategoryStreams(cfg, kind.categoryAction, catIdStr);
 }
 
 app.get(['/:config/catalog/:type/:id.json', '/:config/catalog/:type/:id/:extra.json'], async (req, res) => {
@@ -1725,7 +1806,7 @@ app.get('/:config/meta/:type/:id.json', async (req, res) => {
         if (id.startsWith('xtremio_movie_')) {
             const streamId = getPrefixedNumericId(id, 'xtremio_movie_');
             if (!streamId) return res.status(400).json({ meta: null });
-            const info = await xtremioGet(cfg, 'get_vod_info', { vod_id: streamId });
+            const info = await getVodInfo(cfg, streamId);
             const movie = info?.info ?? info ?? {};
             const cast = splitList(movie.cast);
             const backdrop = pickBackdrop(movie.backdrop_path);
@@ -1881,7 +1962,7 @@ app.get('/:config/stream/:type/:id.json', async (req, res) => {
         if (id.startsWith('xtremio_movie_')) {
             const streamId = getPrefixedNumericId(id, 'xtremio_movie_');
             if (!streamId) return res.status(400).json({ streams: [] });
-            const info = await xtremioGet(cfg, 'get_vod_info', { vod_id: streamId });
+            const info = await getVodInfo(cfg, streamId);
             const ext = normalizeContainerExt(info?.movie_data?.container_extension);
             const proxyUrl = `${getBaseUrl(req)}/${req.params.config}/proxy/movie/${streamId}.${ext}`;
             return res.json({
@@ -1968,6 +2049,43 @@ async function readTextCapped(body, maxBytes) {
 //
 // `rewriteFor` is called with the response's final URL and content type; it
 // returns a mapper for playlist URIs, or null to stream the body untouched.
+// RFC 9110 §14.3: Accept-Ranges carries a range-*unit* — `bytes` or `none` —
+// not a range. A real provider answers a ranged movie request with
+// `accept-ranges: 0-3328437858`, which this proxy relayed verbatim; a strict
+// player that cannot parse the unit may conclude ranges are unsupported and
+// disable seeking, or fall back to pulling a 3.3 GB file linearly.
+//
+// The opposite mistake lived here too: whenever upstream omitted the header the
+// proxy asserted `bytes`, and an origin that *ignores* Range answers 200 with
+// the whole body. Measured against the real provider, a player asking for 2 KB
+// of an HLS segment was told ranges work and handed 3,675,400 bytes — and in
+// that exchange upstream's own `accept-ranges: bytes` was the lie, so trusting
+// a well-formed value is not enough either.
+//
+// So the header is decided by what the exchange actually demonstrated, in that
+// order of confidence, rather than by what either side claims.
+const RANGE_UNIT = /^(?:bytes|none)$/i;
+
+function normalizeAcceptRanges({ status, upstreamValue, sentRange, sentIfRange }) {
+    // A 206 is proof: the origin honoured a byte range in this very exchange.
+    if (status === 206) return 'bytes';
+
+    // We asked for a range and did not get a partial body, so the origin
+    // ignored it. An If-Range that failed to match legitimately produces a
+    // whole 200 and proves nothing, so that case falls through instead.
+    if (sentRange && !sentIfRange) return null;
+
+    // No evidence from this exchange: trust a well-formed unit from upstream.
+    const unit = String(upstreamValue || '').trim();
+    if (RANGE_UNIT.test(unit)) return unit.toLowerCase();
+
+    // Nothing usable either way. Stay optimistic, as before: plenty of Xtream
+    // CDNs serve ranges without advertising them, and nothing here contradicts
+    // that. Never relay a malformed value — omitting beats lying, and this
+    // returns a valid unit or nothing at all.
+    return 'bytes';
+}
+
 async function relayUpstream(req, res, { upstreamUrl, label, ext, rewriteFor }) {
     const headers = { 'User-Agent': PROXY_USER_AGENT };
     // A Range on a playlist would yield a partial body that cannot be parsed or
@@ -1978,6 +2096,9 @@ async function relayUpstream(req, res, { upstreamUrl, label, ext, rewriteFor }) 
         if (req.headers.range) headers['Range'] = req.headers.range;
         if (req.headers['if-range']) headers['If-Range'] = req.headers['if-range'];
     }
+    // What we asked for is half the evidence normalizeAcceptRanges needs below.
+    const sentRange = Boolean(headers['Range']);
+    const sentIfRange = Boolean(headers['If-Range']);
 
     const controller = new AbortController();
     const abort = () => {
@@ -2059,11 +2180,13 @@ async function relayUpstream(req, res, { upstreamUrl, label, ext, rewriteFor }) 
     res.status(upstream.status);
 
     // Forward headers relevant for seekable playback.
+    // accept-ranges is deliberately absent: it is the one header here that is a
+    // claim about the origin rather than a fact about this body, so it is
+    // derived below instead of relayed.
     const forward = [
         'content-type',
         'content-length',
         'content-range',
-        'accept-ranges',
         'last-modified',
         'etag'
     ];
@@ -2071,9 +2194,14 @@ async function relayUpstream(req, res, { upstreamUrl, label, ext, rewriteFor }) 
         const v = upstream.headers.get(h);
         if (v) res.setHeader(h, v);
     }
-    if (!upstream.headers.get('accept-ranges')) {
-        res.setHeader('Accept-Ranges', 'bytes');
-    }
+
+    const acceptRanges = normalizeAcceptRanges({
+        status: upstream.status,
+        upstreamValue: upstream.headers.get('accept-ranges'),
+        sentRange,
+        sentIfRange
+    });
+    if (acceptRanges) res.setHeader('Accept-Ranges', acceptRanges);
     res.setHeader('Cache-Control', 'no-store');
 
     if (req.method === 'HEAD' || !upstream.body) {
@@ -2514,6 +2642,7 @@ module.exports = {
     selectCatalogGenre,
     normalizeContainerExt,
     isNotWebReady,
+    normalizeAcceptRanges,
     signTokenBody,
     rewriteHlsPlaylist,
     looksLikePlaylist,
@@ -2545,13 +2674,18 @@ module.exports = {
     getAllSeriesStreams,
     getAllLiveStreams,
     getSeriesInfo,
+    getVodInfo,
+    getCategoryStreams,
     createSingleFlight,
+    createKeyedCache,
     accountCacheKey,
     catCache,
     vodStreamsCache,
     seriesStreamsCache,
     liveStreamsCache,
     seriesInfoCache,
+    vodInfoCache,
+    categoryStreamsCache,
     CACHE_TTL,
     CACHE_FAILURE_TTL,
     PAGE_SIZE,
@@ -2561,6 +2695,8 @@ module.exports = {
     CACHE_MAX_ACCOUNTS,
     CACHE_MAX_STREAM_ACCOUNTS,
     CACHE_MAX_SERIES_INFO,
+    CACHE_MAX_VOD_INFO,
+    CACHE_MAX_CATEGORY_LISTS,
     CACHE_STALE_MAX_AGE_MS,
     readSeriesInfoEntry,
     setNegativeSeriesInfo,
