@@ -242,25 +242,26 @@ test('looksLikePlaylist keys off the extension or the content type', () => {
 // --- signed sub-resource targets -------------------------------------------
 
 test('a signed target round-trips', () => {
-    const { u, s } = encodeHlsTarget('http://cdn.test/a/seg1.ts?tok=9');
-    assert.strictEqual(decodeHlsTarget(u, s), 'http://cdn.test/a/seg1.ts?tok=9');
+    const { u, s, e } = encodeHlsTarget('http://cdn.test/a/seg1.ts?tok=9', CFG);
+    assert.strictEqual(decodeHlsTarget(u, s, e, CFG), 'http://cdn.test/a/seg1.ts?tok=9');
 });
 
 test('an unsigned or forged target is rejected', () => {
     // Without this the /proxy/hls route would fetch any URL a caller named,
     // making the instance an open proxy to anyone holding an install token.
-    const { u } = encodeHlsTarget('http://cdn.test/seg.ts');
+    const { u, s, e } = encodeHlsTarget('http://cdn.test/seg.ts', CFG);
     const evil = Buffer.from('http://attacker.test/', 'utf8').toString('base64url');
 
-    assert.strictEqual(decodeHlsTarget(u, 'not-a-signature'), null);
-    assert.strictEqual(decodeHlsTarget(evil, signHlsTarget(u)), null, 'signature for a different payload');
-    assert.strictEqual(decodeHlsTarget(u, undefined), null);
-    assert.strictEqual(decodeHlsTarget(undefined, undefined), null);
+    assert.strictEqual(decodeHlsTarget(u, 'not-a-signature', e, CFG), null);
+    assert.strictEqual(decodeHlsTarget(evil, s, e, CFG), null, 'signature for a different payload');
+    assert.strictEqual(decodeHlsTarget(u, undefined, e, CFG), null);
+    assert.strictEqual(decodeHlsTarget(undefined, undefined, e, CFG), null);
 });
 
 test('non-http targets are rejected even when correctly signed', () => {
     const payload = Buffer.from('file:///etc/passwd', 'utf8').toString('base64url');
-    assert.strictEqual(decodeHlsTarget(payload, signHlsTarget(payload)), null);
+    const expiry = String(Date.now() + 60000);
+    assert.strictEqual(decodeHlsTarget(payload, signHlsTarget(payload, CFG, expiry), expiry, CFG), null);
 });
 
 test('HLS signatures are domain-separated from config-token MACs', () => {
@@ -348,8 +349,8 @@ test('a partial playlist is refused rather than relayed unrewritten', async () =
     // The sub-resource route must forward Range for EXT-X-BYTERANGE segments,
     // so a ranged request for a nested *playlist* would return 206 and bypass
     // the rewrite. Relaying that fragment would leak the credentials it names.
-    const { u, s } = encodeHlsTarget(`${providerBase}/hls/${USERNAME}/${PASSWORD}/variant.m3u8`);
-    const res = await realFetch(`${base}/${CFG}/proxy/hls?u=${u}&s=${s}`, {
+    const { u, s, e } = encodeHlsTarget(`${providerBase}/hls/${USERNAME}/${PASSWORD}/variant.m3u8`, CFG);
+    const res = await realFetch(`${base}/${CFG}/proxy/hls?u=${u}&s=${s}&e=${e}`, {
         headers: { Range: 'bytes=0-11' }
     });
     assert.strictEqual(res.status, 502);
@@ -415,8 +416,8 @@ test('the passthrough route refuses an unsigned target and makes no request', as
 });
 
 test('the passthrough route still requires a valid config token', async () => {
-    const { u, s } = encodeHlsTarget(`${providerBase}/hls/x/y/seg1.ts`);
-    const res = await realFetch(`${base}/not-a-token/proxy/hls?u=${u}&s=${s}`);
+    const { u, s, e } = encodeHlsTarget(`${providerBase}/hls/x/y/seg1.ts`, CFG);
+    const res = await realFetch(`${base}/not-a-token/proxy/hls?u=${u}&s=${s}&e=${e}`);
     assert.strictEqual(res.status, 401);
     assert.deepStrictEqual(providerHits, []);
 });

@@ -438,21 +438,51 @@ const PROXY_HEADER_TIMEOUT_MS = Math.max(1000, Number(process.env.PROXY_HEADER_T
 // before any outbound request. The `hls:` prefix domain-separates these from
 // config-token MACs, which use the same key: without it a value valid in one
 // position could be replayed in the other.
-function signHlsTarget(payload) {
-    return crypto.createHmac('sha256', CONFIG_MAC_KEY).update(`hls:${payload}`).digest('base64url');
+// A signature covers the config token and an expiry as well as the URL, so the
+// capability it grants is neither transferable nor permanent. It was previously
+// a pure function of the URL and the global MAC key, which meant one minted
+// while rewriting user A's playlist verified under *any* user's token, forever
+// — and the target it names is an Xtream segment URL with A's credentials in
+// the path. Obtaining one already requires A's token, so this is durability
+// rather than escalation: a link captured from a log or a shared screen stayed
+// valid indefinitely, and survived the user reconfiguring.
+//
+// None of the three fields can contain a `:` — the config token is base64url
+// with `.` separators, the expiry is digits, the payload is base64url — so
+// concatenating them is unambiguous and no field can be shifted into another.
+const HLS_SIGNATURE_TTL_MS = Math.max(60 * 1000, Number(process.env.HLS_SIGNATURE_TTL_MS) || 60 * 60 * 1000);
+
+function signHlsTarget(payload, configToken = '', expiresAt = 0) {
+    return crypto.createHmac('sha256', CONFIG_MAC_KEY)
+        .update(`hls:${configToken}:${expiresAt}:${payload}`)
+        .digest('base64url');
 }
 
-function encodeHlsTarget(absoluteUrl) {
+function encodeHlsTarget(absoluteUrl, configToken = '', now = Date.now()) {
     const payload = Buffer.from(absoluteUrl, 'utf8').toString('base64url');
-    return { u: payload, s: signHlsTarget(payload) };
+    const expiresAt = now + HLS_SIGNATURE_TTL_MS;
+    return { u: payload, s: signHlsTarget(payload, configToken, expiresAt), e: String(expiresAt) };
 }
 
-// Returns the URL only when the signature verifies, so a caller cannot point
-// this server at a host of their choosing even holding a valid config token.
-function decodeHlsTarget(payload, signature) {
+// Returns the URL only when the signature verifies for this config token and
+// the expiry has not lapsed, so a caller cannot point this server at a host of
+// their choosing even holding a valid config token of their own.
+function decodeHlsTarget(payload, signature, expiry, configToken = '', now = Date.now()) {
     if (typeof payload !== 'string' || typeof signature !== 'string') return null;
     if (payload.length > 4096) return null;
-    if (!timingSafeEqualString(signHlsTarget(payload), signature)) return null;
+
+    // Parsed strictly: `Number('12e9')` and `Number(' 12 ')` both succeed, and
+    // an expiry that round-trips differently to the string that was signed
+    // would verify against a value it does not equal.
+    const expiresAt = typeof expiry === 'string' && /^\d{1,15}$/.test(expiry) ? Number(expiry) : NaN;
+    if (!Number.isSafeInteger(expiresAt)) return null;
+
+    // Signature first, then the clock: both are cheap, but checking the MAC
+    // before anything derived from caller-supplied input keeps the order of
+    // operations obvious.
+    if (!timingSafeEqualString(signHlsTarget(payload, configToken, expiry), signature)) return null;
+    if (expiresAt <= now) return null;
+
     try {
         const url = new URL(Buffer.from(payload, 'base64url').toString('utf8'));
         if (!['http:', 'https:'].includes(url.protocol)) return null;
@@ -2333,8 +2363,8 @@ function makeHlsProxyMapper(base, configToken) {
         }
         if (!await vetted.get(origin)) return null;
 
-        const { u, s } = encodeHlsTarget(absolute);
-        return `${base}/${configToken}/proxy/hls?u=${u}&s=${s}`;
+        const { u, s, e } = encodeHlsTarget(absolute, configToken);
+        return `${base}/${configToken}/proxy/hls?u=${u}&s=${s}&e=${e}`;
     };
 }
 
@@ -2383,7 +2413,9 @@ app.all('/:config/proxy/hls', async (req, res) => {
     const cfg = decodeConfig(req.params.config);
     if (!cfg) return res.status(401).end('unauthorized');
 
-    const upstreamUrl = decodeHlsTarget(req.query.u, req.query.s);
+    // Bound to this config token: a signature minted for another account's
+    // playlist does not verify here, even though the MAC key is global.
+    const upstreamUrl = decodeHlsTarget(req.query.u, req.query.s, req.query.e, req.params.config);
     if (!upstreamUrl) return res.status(400).end('bad target');
 
     const base = getBaseUrl(req);
@@ -2727,6 +2759,7 @@ module.exports = {
     encodeHlsTarget,
     decodeHlsTarget,
     signHlsTarget,
+    HLS_SIGNATURE_TTL_MS,
     MAX_PLAYLIST_BYTES,
     isPrivateIp,
     readJsonCapped,

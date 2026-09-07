@@ -69,7 +69,7 @@ test('a public target is still signed and still round-trips', async () => {
     assert.ok(proxied?.startsWith('https://addon.test/CFG/proxy/hls?'), `unexpected: ${proxied}`);
     const { searchParams } = new URL(proxied);
     assert.equal(
-        decodeHlsTarget(searchParams.get('u'), searchParams.get('s')),
+        decodeHlsTarget(searchParams.get('u'), searchParams.get('s'), searchParams.get('e'), 'CFG'),
         `http://${PUBLIC_IP}/a/seg1.ts`
     );
 });
