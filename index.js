@@ -193,111 +193,65 @@ async function getManifest(baseUrl = `http://localhost:${PORT}`, cfg = null) {
     const catalogs = [];
 
     if (cfg) {
+        // getCategories cannot reject — refreshCategories resolves through
+        // Promise.allSettled and always returns an entry, serving stale or empty
+        // lists on failure — so this catch is belt and braces rather than the
+        // degraded path. It used to push a second, hand-maintained copy of the
+        // catalog list that could never be reached. The real degraded case is an
+        // *empty* category list, which genreExtra handles below.
+        let cats = { live: [], movies: [], series: [] };
         try {
-            const cats = await getCategories(cfg);
-            const movieGenres = [...new Set(cats.movies.map(c => c.category_name).filter(Boolean))];
-            const seriesGenres = [...new Set(cats.series.map(c => c.category_name).filter(Boolean))];
-            const liveGenres = [...new Set(cats.live.map(c => c.category_name).filter(Boolean))];
-
-            catalogs.push(
-                {
-                    type: 'Live TV',
-                    id: 'xtremio_live',
-                    name: 'Live TV',
-                    extra: [
-                        { name: 'genre', options: liveGenres, isRequired: true },
-                        { name: 'skip' },
-                        { name: 'search' }
-                    ]
-                },
-                {
-                    type: 'XT-Movies',
-                    id: 'xtremio_movies_popular',
-                    name: 'Popular',
-                    extra: [
-                        { name: 'genre', options: movieGenres, isRequired: true },
-                        { name: 'skip' },
-                        { name: 'search' }
-                    ]
-                },
-                {
-                    type: 'XT-Movies',
-                    id: 'xtremio_movies_new',
-                    name: 'New',
-                    extra: [
-                        { name: 'genre', options: movieGenres, isRequired: true },
-                        { name: 'skip' },
-                        { name: 'search' }
-                    ]
-                },
-                {
-                    type: 'XT-Movies',
-                    id: 'xtremio_movies_featured',
-                    name: 'Featured',
-                    extra: [
-                        { name: 'genre', options: movieGenres, isRequired: true },
-                        { name: 'skip' },
-                        { name: 'search' }
-                    ]
-                },
-                {
-                    type: 'XT-Series',
-                    id: 'xtremio_series_popular',
-                    name: 'Popular',
-                    extra: [
-                        { name: 'genre', options: seriesGenres, isRequired: true },
-                        { name: 'skip' },
-                        { name: 'search' }
-                    ]
-                },
-                {
-                    type: 'XT-Series',
-                    id: 'xtremio_series_new',
-                    name: 'New',
-                    extra: [
-                        { name: 'genre', options: seriesGenres, isRequired: true },
-                        { name: 'skip' },
-                        { name: 'search' }
-                    ]
-                },
-                {
-                    type: 'XT-Series',
-                    id: 'xtremio_series_featured',
-                    name: 'Featured',
-                    extra: [
-                        { name: 'genre', options: seriesGenres, isRequired: true },
-                        { name: 'skip' },
-                        { name: 'search' }
-                    ]
-                },
-                {
-                    type: 'XT-Movies',
-                    id: 'xtremio_search_movies',
-                    name: 'Search Movies',
-                    extra: [{ name: 'search', isRequired: true }],
-                    searchProperties: ['name']
-                },
-                {
-                    type: 'XT-Series',
-                    id: 'xtremio_search_series',
-                    name: 'Search Series',
-                    extra: [{ name: 'search', isRequired: true }],
-                    searchProperties: ['name']
-                }
-            );
+            cats = await getCategories(cfg);
         } catch (e) {
-            catalogs.push(
-                { type: 'Live TV', id: 'xtremio_live', name: 'Live TV' },
-                { type: 'XT-Movies', id: 'xtremio_movies_popular', name: 'Popular' },
-                { type: 'XT-Movies', id: 'xtremio_movies_new', name: 'New' },
-                { type: 'XT-Movies', id: 'xtremio_movies_featured', name: 'Featured' },
-                { type: 'XT-Series', id: 'xtremio_series_popular', name: 'Popular' },
-                { type: 'XT-Series', id: 'xtremio_series_new', name: 'New' },
-                { type: 'XT-Series', id: 'xtremio_series_featured', name: 'Featured' },
-                { type: 'XT-Movies', id: 'xtremio_search_movies', name: 'Search Movies', extra: [{ name: 'search', isRequired: true }], searchProperties: ['name'] },
-                { type: 'XT-Series', id: 'xtremio_search_series', name: 'Search Series', extra: [{ name: 'search', isRequired: true }], searchProperties: ['name'] }
-            );
+            console.error('[manifest] categories unavailable:', e.message);
         }
+
+        const genresOf = (key) =>
+            [...new Set((cats[key] || []).map(c => c.category_name).filter(Boolean))];
+
+        // A genre is only offered when there is something to pick. Stremio reads
+        // `isRequired: true` as "the client must supply one of these options",
+        // so a required genre with an empty list is a catalog nobody can open —
+        // strictly worse than the plain catalog it was meant to degrade into.
+        const genreExtra = (genres) => (genres.length
+            ? [{ name: 'genre', options: genres, isRequired: true }, { name: 'skip' }, { name: 'search' }]
+            : [{ name: 'skip' }, { name: 'search' }]);
+
+        // One row per catalog, so the rule cannot apply to some and miss others
+        // — which is how the empty-options bug survived in the first place:
+        // seven copies of the same `extra` literal.
+        const genreCatalogs = [
+            ['Live TV', 'xtremio_live', 'Live TV', 'live'],
+            ['XT-Movies', 'xtremio_movies_popular', 'Popular', 'movies'],
+            ['XT-Movies', 'xtremio_movies_new', 'New', 'movies'],
+            ['XT-Movies', 'xtremio_movies_featured', 'Featured', 'movies'],
+            ['XT-Series', 'xtremio_series_popular', 'Popular', 'series'],
+            ['XT-Series', 'xtremio_series_new', 'New', 'series'],
+            ['XT-Series', 'xtremio_series_featured', 'Featured', 'series']
+        ];
+
+        catalogs.push(
+            ...genreCatalogs.map(([type, id, name, key]) => ({
+                type,
+                id,
+                name,
+                extra: genreExtra(genresOf(key))
+            })),
+            {
+                type: 'XT-Movies',
+                id: 'xtremio_search_movies',
+                name: 'Search Movies',
+                extra: [{ name: 'search', isRequired: true }],
+                searchProperties: ['name']
+            },
+            {
+                type: 'XT-Series',
+                id: 'xtremio_search_series',
+                name: 'Search Series',
+                extra: [{ name: 'search', isRequired: true }],
+                searchProperties: ['name']
+            }
+        );
     }
 
     return {
@@ -422,6 +376,12 @@ const PROXY_USER_AGENT = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/
 // How long to wait for upstream response headers in the proxy. Applies to the
 // headers only — never to the body, which is a legitimate long-lived stream.
 const PROXY_HEADER_TIMEOUT_MS = Math.max(1000, Number(process.env.PROXY_HEADER_TIMEOUT_MS) || 20000);
+
+// Separate, longer deadline for the one path that buffers a whole body before
+// answering: the playlist rewrite. The streaming path must stay unbounded — a
+// paused movie is a legitimately idle connection — so this is not a general
+// body timeout.
+const PLAYLIST_BODY_TIMEOUT_MS = Math.max(1000, Number(process.env.PLAYLIST_BODY_TIMEOUT_MS) || 30000);
 
 // --- HLS playlist proxying -------------------------------------------------
 //
@@ -914,10 +874,18 @@ function accountCacheKey(cfg) {
 // when it is read makes the *first* key the least recently used one — which is
 // the one to drop when the cache is full.
 class BoundedMap extends Map {
-    constructor({ maxEntries, maxAgeMs = null }) {
+    // `maxBytes` weighs entries by their `bytes` field as well as counting them,
+    // because entry count is a poor proxy for memory when one entry is a parsed
+    // 25 MB catalog and another is a few KB of categories. `onEvict` reports
+    // what was dropped and why, which is how the stream caches notice they are
+    // thrashing rather than caching.
+    constructor({ maxEntries, maxAgeMs = null, maxBytes = null, onEvict = null }) {
         super();
         this.maxEntries = maxEntries;
         this.maxAgeMs = maxAgeMs;
+        this.maxBytes = maxBytes;
+        this.onEvict = onEvict;
+        this.totalBytes = 0;
     }
 
     get(key) {
@@ -935,15 +903,44 @@ class BoundedMap extends Map {
     }
 
     set(key, value) {
+        const replaced = super.get(key);
+        if (replaced) this.totalBytes -= weightOf(replaced);
         super.delete(key);
         super.set(key, value);
-        while (this.size > this.maxEntries) {
+        this.totalBytes += weightOf(value);
+
+        // Never evict what was just written, even when a single entry is larger
+        // than the whole budget: refusing to cache it at all would mean
+        // refetching it on every request, which is worse than being over.
+        while (this.size > 1 && (this.size > this.maxEntries || this.overBudget())) {
             // Map keys iterate oldest-first; the first is the LRU victim.
             const oldest = this.keys().next();
-            if (oldest.done) break;
-            super.delete(oldest.value);
+            if (oldest.done || oldest.value === key) break;
+            this.evict(oldest.value, this.size > this.maxEntries ? 'entry count' : 'byte budget');
         }
         return this;
+    }
+
+    overBudget() {
+        return this.maxBytes !== null && this.totalBytes > this.maxBytes;
+    }
+
+    evict(key, reason) {
+        const entry = super.get(key);
+        super.delete(key);
+        this.totalBytes -= weightOf(entry);
+        if (this.onEvict) this.onEvict(key, entry, reason);
+        return entry;
+    }
+
+    delete(key) {
+        if (super.has(key)) this.totalBytes -= weightOf(super.get(key));
+        return super.delete(key);
+    }
+
+    clear() {
+        this.totalBytes = 0;
+        return super.clear();
     }
 
     // Drops entries past maxAgeMs. Caches whose expired entries are still
@@ -954,11 +951,45 @@ class BoundedMap extends Map {
         for (const [key, entry] of this) {
             if (entry && typeof entry.ts === 'number' && entry.ts <= now - this.maxAgeMs) {
                 super.delete(key);
+                this.totalBytes -= weightOf(entry);
                 dropped++;
             }
         }
         return dropped;
     }
+}
+
+function weightOf(entry) {
+    return typeof entry?.bytes === 'number' ? entry.bytes : 0;
+}
+
+// Sampled rather than measured: JSON.stringify over a 25 MB list allocates a
+// second 25 MB string to learn what twenty items already say, and doubling peak
+// memory to police memory would be self-defeating. Stream lists are thousands
+// of near-identical records, so a sample is accurate to within a few percent —
+// and a budget only needs a proxy, not a byte count.
+function estimateBytes(value) {
+    if (!Array.isArray(value)) {
+        try {
+            return JSON.stringify(value)?.length ?? 0;
+        } catch {
+            return 0;
+        }
+    }
+    if (!value.length) return 0;
+
+    const step = Math.max(1, Math.floor(value.length / 20));
+    let sampled = 0;
+    let counted = 0;
+    for (let i = 0; i < value.length; i += step) {
+        try {
+            sampled += JSON.stringify(value[i])?.length ?? 0;
+        } catch {
+            // A circular or unserializable item tells us nothing; skip it.
+        }
+        counted++;
+    }
+    return counted ? Math.round((sampled / counted) * value.length) : 0;
 }
 
 // Category lists are small (a few KB per account), so the bound here is about
@@ -969,6 +1000,14 @@ const CACHE_MAX_ACCOUNTS = Math.max(1, Number(process.env.CACHE_MAX_ACCOUNTS) ||
 // one that actually caps memory. Evicting costs one upstream refetch; keeping
 // too many costs the process.
 const CACHE_MAX_STREAM_ACCOUNTS = Math.max(1, Number(process.env.CACHE_MAX_STREAM_ACCOUNTS) || 4);
+
+// Counting entries is not the same as bounding memory: four accounts' worth of
+// entries could be four megabytes or four hundred, and only the second one
+// matters. This is a serialized-JSON budget *per kind*, so the ceiling across
+// live, movies and series is three times it. Resident cost is a multiple of
+// that again — a parsed graph of many small objects typically runs 3-10× its
+// serialized size — which is the number to scale down on a small container.
+const CACHE_MAX_STREAM_BYTES = Math.max(1, Number(process.env.CACHE_MAX_STREAM_MB) || 64) * 1024 * 1024;
 
 // One entry per series *per account* — the only dimension that grows without
 // bound for a single user just browsing.
@@ -1059,7 +1098,21 @@ function createStreamListCache() {
     // are by far the largest entries, so reclaiming them matters most.
     const map = new BoundedMap({
         maxEntries: CACHE_MAX_STREAM_ACCOUNTS,
-        maxAgeMs: CACHE_TTL
+        maxAgeMs: CACHE_TTL,
+        maxBytes: CACHE_MAX_STREAM_BYTES,
+        // Evicting an entry that has not expired means the bounds are too tight
+        // for the load: that account's next request refetches 10-50 MB, and
+        // nothing else would say so. An expired entry leaving is routine and
+        // silent.
+        onEvict(key, entry, reason) {
+            if (entry && entry.ts > Date.now() - CACHE_TTL) {
+                console.warn(
+                    `[cache] evicted a live stream list on ${reason} ` +
+                    `(${Math.round((entry.bytes || 0) / 1024 / 1024)} MB); ` +
+                    'raise CACHE_MAX_STREAM_ACCOUNTS or CACHE_MAX_STREAM_MB if this repeats'
+                );
+            }
+        }
     });
     const singleFlight = createSingleFlight();
     return {
@@ -1070,7 +1123,7 @@ function createStreamListCache() {
             return null;
         },
         set(cfg, items) {
-            map.set(accountCacheKey(cfg), { data: items, ts: Date.now() });
+            map.set(accountCacheKey(cfg), { data: items, ts: Date.now(), bytes: estimateBytes(items) });
         },
         // Cache-aside read: serves a warm entry, otherwise runs `fetcher` once
         // no matter how many callers arrive while it is in flight.
@@ -1814,6 +1867,15 @@ function toCatalogMetas(items, kind) {
 async function selectCatalogGenre(cfg, kind, genre) {
     const cats = await getCategories(cfg);
     const categories = cats[kind.categoryKey] || [];
+
+    // No categories at all — the degraded case the manifest reflects by dropping
+    // the genre extra. Without this the shelf is empty either way, because there
+    // is no category for the genre to resolve to; the full list is the honest
+    // answer, and it is the same list search already uses.
+    if (!categories.length) {
+        console.warn(`[catalog] no ${kind.categoryKey} categories; serving the full list`);
+        return kind.loadAll(cfg);
+    }
     // Stremio marks genre required, but a bare catalog request still falls back
     // to the first category rather than showing an empty shelf.
     const selectedGenre = genre || (categories[0] && categories[0].category_name);
@@ -2269,12 +2331,28 @@ async function relayUpstream(req, res, { upstreamUrl, label, ext, rewriteFor }) 
 
     if (mapper && req.method !== 'HEAD') {
         let text;
+        // The header timer is gone by now — correct for the streaming path,
+        // where a long body is the point, but this branch buffers the whole
+        // thing before answering. An upstream that sends headers and then
+        // trickles one byte a minute would otherwise hold the request, its
+        // socket and up to MAX_PLAYLIST_BYTES of buffer indefinitely;
+        // REQUEST_TIMEOUT_MS does not help, since that bounds receiving the
+        // *request*. A playlist is kilobytes, so this deadline is generous.
+        let bodyTimedOut = false;
+        const bodyTimer = setTimeout(() => { bodyTimedOut = true; abort(); }, PLAYLIST_BODY_TIMEOUT_MS);
         try {
             text = await readTextCapped(upstream.body, MAX_PLAYLIST_BYTES);
         } catch (e) {
+            if (bodyTimedOut) {
+                console.warn(`[proxy] playlist body timed out after ${PLAYLIST_BODY_TIMEOUT_MS}ms for ${label}`);
+                if (!res.headersSent) res.status(504).end('upstream timeout');
+                return;
+            }
             if (!isAbortErr(e)) console.warn(`[proxy] playlist read failed for ${label}: ${e.message}`);
             if (!res.headersSent) res.status(502).end('bad playlist');
             return;
+        } finally {
+            clearTimeout(bodyTimer);
         }
         const rewritten = await rewriteHlsPlaylist(text, finalUrl, mapper);
         res.status(upstream.status);
@@ -2753,6 +2831,9 @@ module.exports = {
     normalizeContainerExt,
     isNotWebReady,
     normalizeAcceptRanges,
+    estimateBytes,
+    CACHE_MAX_STREAM_BYTES,
+    PLAYLIST_BODY_TIMEOUT_MS,
     signTokenBody,
     rewriteHlsPlaylist,
     looksLikePlaylist,
