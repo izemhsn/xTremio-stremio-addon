@@ -125,8 +125,11 @@ function getBaseUrl(req) {
     return `${safeProto}://${safeHost}`;
 }
 
+// null and undefined become '', but every other value is stringified as itself:
+// `String(str || '')` silently turned 0 and false into an empty string, which
+// is a trap for the next caller that interpolates a number.
 function escapeHtml(str) {
-    return String(str || '').replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;').replace(/'/g, '&#039;');
+    return String(str ?? '').replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;').replace(/'/g, '&#039;');
 }
 
 function validateConfig(cfg) {
@@ -242,6 +245,11 @@ async function getManifest(baseUrl = `http://localhost:${PORT}`, cfg = null) {
                 id: 'xtremio_search_movies',
                 name: 'Search Movies',
                 extra: [{ name: 'search', isRequired: true }],
+                // Not a field the Stremio SDK defines, so no client reads it.
+                // Kept because it is accurate documentation of what the search
+                // route actually does — filterByName matches on `name` only —
+                // and because an unknown key is inert where a mistyped known
+                // one (see `config` above) is not.
                 searchProperties: ['name']
             },
             {
@@ -249,6 +257,11 @@ async function getManifest(baseUrl = `http://localhost:${PORT}`, cfg = null) {
                 id: 'xtremio_search_series',
                 name: 'Search Series',
                 extra: [{ name: 'search', isRequired: true }],
+                // Not a field the Stremio SDK defines, so no client reads it.
+                // Kept because it is accurate documentation of what the search
+                // route actually does — filterByName matches on `name` only —
+                // and because an unknown key is inert where a mistyped known
+                // one (see `config` above) is not.
                 searchProperties: ['name']
             }
         );
@@ -263,11 +276,16 @@ async function getManifest(baseUrl = `http://localhost:${PORT}`, cfg = null) {
         types: ['Live TV', 'XT-Movies', 'XT-Series', 'series'],
         catalogs,
         idPrefixes: ['xtremio_live_', 'xtremio_movie_', 'xtremio_series_', 'xtremio_episode_'],
+        // No `config` field. The Stremio spec defines it as an array of field
+        // descriptors, and this addon used to emit `{ url }` — an object where a
+        // client following the spec expects a list. Clients ignore it today, but
+        // one that starts honouring it would be handed the wrong type, and it
+        // buys nothing: `behaviorHints.configurable` is what routes the user to
+        // /configure, and that already works.
         behaviorHints: {
             configurable: true,
             configurationRequired: !cfg
-        },
-        config: { url: `${baseUrl}/configure` }
+        }
     };
 }
 
@@ -747,6 +765,19 @@ async function assertSafeOutboundUrl(inputUrl) {
     return url;
 }
 
+// A response whose body is never read still owns a connection: undici keeps it
+// out of the pool until the body is consumed or cancelled, so dropping one on
+// the floor holds a socket until GC gets round to it. Every path that abandons
+// a response goes through here. A body with a reader already attached is
+// locked and cannot be cancelled — those paths abort the request instead, which
+// tears the connection down rather than trying to return it to the pool.
+function discardBody(res) {
+    try {
+        const body = res?.body;
+        if (body && !body.locked) body.cancel().catch(() => {});
+    } catch {}
+}
+
 // `onFinalUrl` reports the URL that actually produced the returned response,
 // after any redirects. HLS playlists carry relative URIs that must be resolved
 // against *that* URL, not the one we asked for — a provider's /live/... request
@@ -774,6 +805,16 @@ async function safeFetch(inputUrl, options = {}, { maxRedirects = 3, onFinalUrl 
             onFinalUrl?.(url.toString());
             return res;
         }
+        // The redirect's own body is never read. Every proxy request traverses at
+        // least one 302, so this is the hot path for leaked connections.
+        // The redirect's own body is never read. The audit expected undici to
+        // hold that connection until GC; measured, it does not — the abandoned
+        // socket closed in under 10 ms with and without this call, because a
+        // half-read response cannot be returned to the pool anyway. Kept as
+        // explicit hygiene rather than as a fix for a leak that reproduces: it
+        // states the intent at the point of abandonment instead of depending on
+        // that undici behaviour continuing to hold.
+        discardBody(res);
         if (redirects === maxRedirects) throw new Error('Too many redirects');
 
         url = await assertSafeOutboundUrl(new URL(location, url).toString());
@@ -897,7 +938,11 @@ class BoundedMap extends Map {
         return entry;
     }
 
-    // Read without disturbing LRU order, for callers that are only inspecting.
+    // Read without disturbing LRU order. Nothing in the request path uses this —
+    // it exists so tests can assert what a cache holds without the assertion
+    // itself promoting the entry and changing what is evicted next. Kept
+    // deliberately rather than deleted: the alternative is tests that cannot
+    // observe eviction order without perturbing it.
     peek(key) {
         return super.get(key);
     }
@@ -1238,13 +1283,20 @@ function parseYear(s) {
     return m ? parseInt(m[0]) : undefined;
 }
 
+// "Usable" has to mean the same thing here as it does at the point of use, or
+// the two disagree and the disagreement is cached. A payload carrying only
+// `info.cover` (or a plot, or a genre) counted as usable, was cached
+// *positively* for the full 30 minutes, and then failed the meta route's own
+// `hasContent` check — which requires a name or episodes — so the series
+// rendered as `meta: null` for half an hour with no retry. Accepting less than
+// the caller needs is worse than a retry: it turns a flaky call into a
+// sticky one.
 function isUsableSeriesInfo(info) {
     if (!info || typeof info !== 'object') return false;
-    const hasInfo = info.info && typeof info.info === 'object'
-        && (info.info.name || info.info.plot || info.info.genre || info.info.cover);
+    const hasName = info.info && typeof info.info === 'object' && info.info.name;
     const eps = info.episodes;
     const hasEpisodes = eps && typeof eps === 'object' && Object.keys(eps).length > 0;
-    return Boolean(hasInfo || hasEpisodes);
+    return Boolean(hasName || hasEpisodes);
 }
 
 const SERIES_INFO_MAX_ATTEMPTS = 3;
@@ -1473,7 +1525,15 @@ async function validateXtremioCredentials(serverUrl, username, password) {
     return { valid: false, error: 'Cannot connect to server' };
 }
 
-function renderConfigPage({ serverUrl = '', username = '', password = '', status = null, baseUrl = `http://localhost:${PORT}` }) {
+// `nonce` comes from setPrivateHeaders and is the only thing that lets this
+// page's one script run under its CSP. Rendering without one (a caller that
+// forgot, or a test) still produces a working page — only the click-to-copy
+// convenience goes quiet, since the link is selectable text either way.
+function renderConfigPage({ serverUrl = '', username = '', password = '', status = null, baseUrl = `http://localhost:${PORT}`, nonce = '' }) {
+    // Base64 contains nothing escapeHtml touches, so this is identical to the
+    // value in the header — it just keeps the rule that every interpolation on
+    // this page goes through escapeHtml, with no exception to remember.
+    const safeNonce = escapeHtml(nonce);
     const safeServerUrl = escapeHtml(serverUrl);
     const safeUsername = escapeHtml(username);
     const safePassword = escapeHtml(password);
@@ -1510,11 +1570,50 @@ function renderConfigPage({ serverUrl = '', username = '', password = '', status
                         <svg fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M4 16v1a3 3 0 003 3h10a3 3 0 003-3v-1m-4-4l-4 4m0 0l-4-4m4 4V4"/></svg>
                         Install in Stremio
                     </a>
-                    <div style="margin-top: 16px;">
-                        <p style="font-size: 13px; color: #555; margin-bottom: 8px; font-weight: 600; text-align: left;">Or copy this link to install:</p>
-                        <input type="text" value="${httpUrl}" readonly onclick="this.select(); document.execCommand('copy'); const p = this.previousElementSibling; const orig = p.innerText; p.innerText = '✓ Copied to clipboard!'; p.style.color = '#2e7d32'; setTimeout(() => { p.innerText = orig; p.style.color = '#555'; }, 2000);" style="width: 100%; padding: 12px; border: 2px solid #e0e0e0; border-radius: 10px; font-size: 14px; color: #333; background: #f9f9f9; cursor: pointer; text-align: center; transition: border-color 0.2s;" title="Click to copy install link" onmouseover="this.style.borderColor='#7c4dff'" onmouseout="this.style.borderColor='#e0e0e0'" />
+                    <div class="copy-block">
+                        <p id="copy-label" class="copy-label" data-idle="Or copy this link to install:">Or copy this link to install:</p>
+                        <input type="text" id="copy-input" class="copy-input" value="${httpUrl}" readonly title="Click to copy install link" />
                     </div>
-                </div>`;
+                </div>
+                <script nonce="${safeNonce}">
+                (function () {
+                    var input = document.getElementById('copy-input');
+                    var label = document.getElementById('copy-label');
+                    if (!input || !label) return;
+                    var timer = null;
+
+                    function report(copied) {
+                        label.textContent = copied ? '✓ Copied to clipboard!' : 'Press Ctrl+C to copy';
+                        label.style.color = copied ? '#2e7d32' : '#555';
+                        clearTimeout(timer);
+                        timer = setTimeout(function () {
+                            label.textContent = label.dataset.idle;
+                            label.style.color = '#555';
+                        }, 2000);
+                    }
+
+                    function copyViaSelection() {
+                        // execCommand is deprecated but stays as the fallback rather
+                        // than the other way round: navigator.clipboard exists only on
+                        // secure origins, and this addon is most often reached over
+                        // plain http on a LAN, where it is undefined.
+                        try { return document.execCommand('copy'); } catch (e) { return false; }
+                    }
+
+                    input.addEventListener('click', function () {
+                        input.select();
+                        if (navigator.clipboard && navigator.clipboard.writeText) {
+                            navigator.clipboard.writeText(input.value).then(function () {
+                                report(true);
+                            }, function () {
+                                report(copyViaSelection());
+                            });
+                        } else {
+                            report(copyViaSelection());
+                        }
+                    });
+                })();
+                </script>`;
         } else {
             statusHtml = `
                 <div class="status-section">
@@ -1578,6 +1677,10 @@ function renderConfigPage({ serverUrl = '', username = '', password = '', status
             .status-warning { background: #fff8e1; color: #8a5a00; }
             .status-warning .status-text { line-height: 1.5; }
             .install-link { margin-top: 4px; }
+            .copy-block { margin-top: 16px; }
+            .copy-label { font-size: 13px; color: #555; margin-bottom: 8px; font-weight: 600; text-align: left; }
+            .copy-input { width: 100%; padding: 12px; border: 2px solid #e0e0e0; border-radius: 10px; font-size: 14px; color: #333; background: #f9f9f9; cursor: pointer; text-align: center; transition: border-color 0.2s; }
+            .copy-input:hover { border-color: #7c4dff; }
             .disclaimer {
                 background: #fff8e1;
                 border: 1px solid #ffe082;
@@ -1640,9 +1743,42 @@ function renderConfigPage({ serverUrl = '', username = '', password = '', status
 
 // The configure page echoes back the password and embeds the install token.
 // Keep it out of shared caches, browser history, and outbound Referer headers.
+//
+// The framing and CSP headers are the backstop behind the escapeHtml discipline
+// in renderConfigPage, not a replacement for it. Framing is the one with a live
+// attack behind it: this is the only page with a submit button that sends
+// plaintext credentials, so a framed copy of it is a clickjacking target, and
+// both frame-ancestors and X-Frame-Options are sent because the latter is all
+// an older client understands.
+//
+// The policy can be nearly `default-src 'none'` because the page loads nothing
+// external — no fonts, no stylesheets, no scripts, and its icons are inline
+// <svg> rather than images.
+// Scripts run only under a per-response nonce, which is what forced the copy
+// handler out of an onclick attribute and into a real script block: an inline
+// handler would need script-src 'unsafe-inline', which would give back exactly
+// the injected-script execution the policy exists to deny. style-src keeps
+// 'unsafe-inline' because the page's <style> block and its remaining style="…"
+// attributes both need it, and a style nonce does not cover attributes.
+// Returns the nonce, which the caller must pass to renderConfigPage.
 function setPrivateHeaders(res) {
     res.setHeader('Cache-Control', 'no-store');
     res.setHeader('Referrer-Policy', 'no-referrer');
+
+    const nonce = crypto.randomBytes(16).toString('base64');
+    res.setHeader('Content-Security-Policy', [
+        "default-src 'none'",
+        `script-src 'nonce-${nonce}'`,
+        "style-src 'unsafe-inline'",
+        // form-action does not fall back to default-src, so the page's own POST
+        // has to be allowed explicitly or the form silently stops submitting.
+        "form-action 'self'",
+        "base-uri 'none'",
+        "frame-ancestors 'none'"
+    ].join('; '));
+    res.setHeader('X-Frame-Options', 'DENY');
+    res.setHeader('X-Content-Type-Options', 'nosniff');
+    return nonce;
 }
 
 // POST /configure makes an outbound request to a host the caller chooses, with
@@ -1693,19 +1829,26 @@ function rateLimitConfigure(req) {
     return { allowed: true, retryAfter: 0 };
 }
 
+// Prefill comes from an encrypted `config` token and nothing else. The route
+// used to accept serverUrl, username and password as loose query parameters
+// too. They were escaped, so it was never XSS — but it invited a URL with a
+// plaintext password into browser history, referrer chains, proxy logs and
+// anything that shoulder-surfs an address bar. The token is the one form of
+// this URL that is safe to hand around, so it is the only one accepted.
 app.get('/configure', (req, res) => {
-    setPrivateHeaders(res);
+    const nonce = setPrivateHeaders(res);
     const existing = decodeConfig(req.query.config) || {};
     res.send(renderConfigPage({
-        serverUrl: asString(req.query.serverUrl) || existing.serverUrl || '',
-        username: asString(req.query.username) || existing.username || '',
-        password: asString(req.query.password) || existing.password || '',
-        baseUrl: getBaseUrl(req)
+        serverUrl: existing.serverUrl || '',
+        username: existing.username || '',
+        password: existing.password || '',
+        baseUrl: getBaseUrl(req),
+        nonce
     }));
 });
 
 app.post('/configure', async (req, res) => {
-    setPrivateHeaders(res);
+    const nonce = setPrivateHeaders(res);
     // req.body is undefined when nothing parsed the body (no Content-Type, or a
     // JSON one), and extended urlencoded turns `serverUrl[]=a&serverUrl[]=b` or
     // `serverUrl[a]=1` into an array or an object. Either way the fields are not
@@ -1725,7 +1868,8 @@ app.post('/configure', async (req, res) => {
             username,
             password,
             status: { valid: false, error: `Too many attempts. Try again in ${limit.retryAfter} second${limit.retryAfter === 1 ? '' : 's'}.` },
-            baseUrl: getBaseUrl(req)
+            baseUrl: getBaseUrl(req),
+            nonce
         }));
     }
 
@@ -1740,7 +1884,8 @@ app.post('/configure', async (req, res) => {
             username,
             password,
             status: validation,
-            baseUrl: getBaseUrl(req)
+            baseUrl: getBaseUrl(req),
+            nonce
         }));
     } catch (e) {
         res.send(renderConfigPage({
@@ -1748,7 +1893,8 @@ app.post('/configure', async (req, res) => {
             username,
             password,
             status: { valid: false, error: 'Something went wrong. Please try again.' },
-            baseUrl: getBaseUrl(req)
+            baseUrl: getBaseUrl(req),
+            nonce
         }));
     }
 });
@@ -1808,13 +1954,24 @@ const CATALOG_KINDS = {
 // with item id prefixes: `xtremio_series_new` is a catalog id that starts with
 // the item prefix `xtremio_series_`, which is why item ids are matched by
 // `typeMatchesId` and never by this.
+// The three variants the manifest actually declares. Anything else has to be
+// rejected rather than resolved: an unknown suffix used to yield a real kind
+// with `variant: 'bogus'`, which gives a null comparator, so the catalog was
+// served *unsorted* instead of 404ing. A silently wrong order is harder to
+// notice than a missing shelf.
+const CATALOG_VARIANTS = new Set(['new', 'popular', 'featured']);
+
 function parseCatalogId(id) {
     const str = String(id || '');
     if (str === 'xtremio_live') return { kind: 'live', variant: null, search: false };
     if (str === 'xtremio_search_movies') return { kind: 'movies', variant: null, search: true };
     if (str === 'xtremio_search_series') return { kind: 'series', variant: null, search: true };
-    if (str.startsWith('xtremio_movies_')) return { kind: 'movies', variant: str.slice('xtremio_movies_'.length), search: false };
-    if (str.startsWith('xtremio_series_')) return { kind: 'series', variant: str.slice('xtremio_series_'.length), search: false };
+    for (const kind of ['movies', 'series']) {
+        const prefix = `xtremio_${kind}_`;
+        if (!str.startsWith(prefix)) continue;
+        const variant = str.slice(prefix.length);
+        return CATALOG_VARIANTS.has(variant) ? { kind, variant, search: false } : null;
+    }
     return null;
 }
 
@@ -2036,7 +2193,10 @@ app.get('/:config/meta/:type/:id.json', async (req, res) => {
                         title: ep.title || `Episode ${ep.episode_num}`,
                         season: parseInt(seasonNum),
                         episode: parseInt(ep.episode_num) || 1,
-                        released: toIsoDate(ep.info?.releasedate) || '1970-01-01T00:00:00.000Z',
+                        // Omitted rather than epoch-defaulted: Stremio renders a
+                        // date it is given, so the old fallback printed "1970"
+                        // next to every episode whose provider sent no date.
+                        released: toIsoDate(ep.info?.releasedate) || undefined,
                         overview: ep.info?.plot || undefined,
                         thumbnail: ep.info?.movie_image || undefined
                     });
@@ -2290,11 +2450,28 @@ async function relayUpstream(req, res, { upstreamUrl, label, ext, rewriteFor }) 
     let headersTimedOut = false;
     const headerTimer = setTimeout(() => { headersTimedOut = true; abort(); }, PROXY_HEADER_TIMEOUT_MS);
     try {
+        // A HEAD from the player used to become a GET upstream whose body was
+        // then dropped unread, spending a buffer window of the provider's
+        // bandwidth — bounded by undici's backpressure, but wasted, and a movie
+        // here is routinely 3 GB. Pass the method through instead.
         upstream = await safeFetch(upstreamUrl, {
-            method: 'GET',
+            method: req.method === 'HEAD' ? 'HEAD' : 'GET',
             headers,
             signal: controller.signal
         }, { onFinalUrl: (u) => { finalUrl = u; } });
+
+        // Not every Xtream CDN implements HEAD. Falling back keeps a player's
+        // probe working rather than trading wasted bytes for a broken one; the
+        // response is discarded and re-requested, which is what used to happen
+        // on every HEAD anyway.
+        if (req.method === 'HEAD' && (upstream.status === 405 || upstream.status === 501)) {
+            discardBody(upstream);
+            upstream = await safeFetch(upstreamUrl, {
+                method: 'GET',
+                headers,
+                signal: controller.signal
+            }, { onFinalUrl: (u) => { finalUrl = u; } });
+        }
     } catch (e) {
         if (headersTimedOut) {
             console.warn(`[proxy] upstream headers timed out after ${PROXY_HEADER_TIMEOUT_MS}ms for ${label}`);
@@ -2325,6 +2502,7 @@ async function relayUpstream(req, res, { upstreamUrl, label, ext, rewriteFor }) 
     // range-request playlists, so refusing costs nothing real.
     if (!mapper && upstream.status === 206 && looksLikePlaylist(ext, contentType)) {
         console.warn(`[proxy] refusing to relay a partial playlist for ${label}`);
+        discardBody(upstream);
         if (!res.headersSent) res.status(502).end('partial playlist');
         return;
     }
@@ -2349,6 +2527,9 @@ async function relayUpstream(req, res, { upstreamUrl, label, ext, rewriteFor }) 
                 return;
             }
             if (!isAbortErr(e)) console.warn(`[proxy] playlist read failed for ${label}: ${e.message}`);
+            // readTextCapped holds a reader, so the body is locked and cannot be
+            // cancelled — abort the request instead of leaving the socket half-read.
+            abort();
             if (!res.headersSent) res.status(502).end('bad playlist');
             return;
         } finally {
@@ -2376,7 +2557,15 @@ async function relayUpstream(req, res, { upstreamUrl, label, ext, rewriteFor }) 
         'last-modified',
         'etag'
     ];
+    // undici decompresses transparently, so on a content-encoded response the
+    // body handed to us is longer than the content-length that came with it.
+    // Forwarding that number makes the client stop short or hang waiting for
+    // bytes that already arrived. Unlikely for media, plausible for a playlist
+    // or an error page, and the length is optional — Express falls back to
+    // chunked encoding without it.
+    const encoded = Boolean(upstream.headers.get('content-encoding'));
     for (const h of forward) {
+        if (encoded && h === 'content-length') continue;
         const v = upstream.headers.get(h);
         if (v) res.setHeader(h, v);
     }
@@ -2391,6 +2580,8 @@ async function relayUpstream(req, res, { upstreamUrl, label, ext, rewriteFor }) 
     res.setHeader('Cache-Control', 'no-store');
 
     if (req.method === 'HEAD' || !upstream.body) {
+        // A HEAD that fell back to GET above still has a body nobody will read.
+        discardBody(upstream);
         return res.end();
     }
 
@@ -2793,8 +2984,18 @@ if (require.main === module) {
         console.error('Uncaught exception, exiting:', err);
         process.exit(1);
     });
+    // Same treatment as an uncaught throw, and for the same reason: a rejection
+    // nobody handled leaves the process in exactly the undefined state the
+    // handler above exists to escape, while /health cheerfully keeps answering
+    // 200. Logging and continuing also diverged from Node's own default, which
+    // has been to exit since v15. Express 5 forwards async route errors to the
+    // terminal error handler, so anything reaching here is a genuine bug rather
+    // than routine traffic — including a client disconnect, which the proxy
+    // handles locally and which is covered by a test that kills a socket
+    // mid-stream and asserts the process survives.
     process.on('unhandledRejection', (err) => {
-        console.error('Unhandled rejection:', err);
+        console.error('Unhandled rejection, exiting:', err);
+        process.exit(1);
     });
 }
 
@@ -2846,6 +3047,7 @@ module.exports = {
     readJsonCapped,
     MAX_UPSTREAM_BYTES,
     assertSafeOutboundUrl,
+    discardBody,
     makeHlsProxyMapper,
     asString,
     redactConfigInPath,
