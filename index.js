@@ -2453,19 +2453,34 @@ async function relayUpstream(req, res, { upstreamUrl, label, ext, rewriteFor }) 
         // A HEAD from the player used to become a GET upstream whose body was
         // then dropped unread, spending a buffer window of the provider's
         // bandwidth — bounded by undici's backpressure, but wasted, and a movie
-        // here is routinely 3 GB. Pass the method through instead.
-        upstream = await safeFetch(upstreamUrl, {
-            method: req.method === 'HEAD' ? 'HEAD' : 'GET',
-            headers,
-            signal: controller.signal
-        }, { onFinalUrl: (u) => { finalUrl = u; } });
+        // here is routinely 3 GB. So the method is passed through.
+        //
+        // But HEAD cannot be trusted to work, and the failure is not tidy.
+        // Measured against a real Xtream account: the panel answers HEAD with
+        // **502 and no redirect at all**, and the CDN behind its 302 drops the
+        // connection outright, so `fetch` *throws* rather than returning a
+        // status. An earlier version of this fell back only on 405/501 and
+        // turned every real HEAD into a 502 — the regression this shape exists
+        // to prevent. Anything short of a usable response therefore falls back
+        // to the GET that has always worked: one wasted round trip on providers
+        // that reject HEAD, against a whole body saved on those that honour it.
+        if (req.method === 'HEAD') {
+            try {
+                const head = await safeFetch(upstreamUrl, {
+                    method: 'HEAD',
+                    headers,
+                    signal: controller.signal
+                }, { onFinalUrl: (u) => { finalUrl = u; } });
+                if (head.status < 400) upstream = head;
+                else discardBody(head);
+            } catch (e) {
+                // A timeout or a client disconnect is not a statement about HEAD
+                // support, and retrying would paper over it.
+                if (headersTimedOut || isAbortErr(e)) throw e;
+            }
+        }
 
-        // Not every Xtream CDN implements HEAD. Falling back keeps a player's
-        // probe working rather than trading wasted bytes for a broken one; the
-        // response is discarded and re-requested, which is what used to happen
-        // on every HEAD anyway.
-        if (req.method === 'HEAD' && (upstream.status === 405 || upstream.status === 501)) {
-            discardBody(upstream);
+        if (!upstream) {
             upstream = await safeFetch(upstreamUrl, {
                 method: 'GET',
                 headers,

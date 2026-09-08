@@ -72,6 +72,28 @@ function providerHandler(req, res) {
         return res.end(req.method === 'HEAD' ? undefined : body);
     }
 
+    // What the real Xtream panel does: 502 to a HEAD, with no redirect. The
+    // first version of the M-1 fix fell back only on 405/501 and turned every
+    // real HEAD into a 502.
+    if (id === '6') {
+        if (req.method === 'HEAD') {
+            res.writeHead(502, { 'Content-Type': 'text/html', 'Content-Length': '154' });
+            return res.end();
+        }
+        res.writeHead(200, { 'Content-Type': 'video/mp4', 'Content-Length': '4' });
+        return res.end('abcd');
+    }
+
+    // What the CDN behind that panel's 302 does: drops the connection, so fetch
+    // throws rather than returning a status at all.
+    if (id === '7') {
+        if (req.method === 'HEAD') {
+            return req.socket.destroy();
+        }
+        res.writeHead(200, { 'Content-Type': 'video/mp4', 'Content-Length': '4' });
+        return res.end('abcd');
+    }
+
     if (id === '4') {
         res.writeHead(302, {
             Location: req.url.replace('/4.', '/5.'),
@@ -132,6 +154,26 @@ test('a provider that refuses HEAD falls back to GET rather than failing', async
 
     const methods = providerHits.map(h => h.method);
     assert.deepEqual(methods, ['HEAD', 'GET'], 'HEAD first, then the fallback');
+});
+
+test('a 502 to a HEAD falls back too — the shape the real provider sends', async () => {
+    // Measured, not imagined: the live Xtream panel answers HEAD with 502 and no
+    // redirect. A fallback scoped to 405/501 let that reach the player, which is
+    // exactly what happened on the first attempt at this fix.
+    const res = await realFetch(`${base}/${CFG}/proxy/movie/6.mp4`, { method: 'HEAD' });
+    assert.equal(res.status, 200, 'a 502 from a HEAD must not reach the player');
+    assert.equal(res.headers.get('content-length'), '4');
+    assert.deepEqual(providerHits.map(h => h.method), ['HEAD', 'GET']);
+});
+
+test('a HEAD that kills the connection falls back too', async () => {
+    // The other half of the same live measurement: the CDN behind the panel's
+    // 302 drops the socket on a HEAD, so fetch throws instead of returning a
+    // status. A status-only check never sees this one.
+    const res = await realFetch(`${base}/${CFG}/proxy/movie/7.mp4`, { method: 'HEAD' });
+    assert.equal(res.status, 200, 'a thrown HEAD must not reach the player');
+    assert.equal(res.headers.get('content-length'), '4');
+    assert.deepEqual(providerHits.map(h => h.method), ['HEAD', 'GET']);
 });
 
 // --- L-3: content-length vs a decompressed body ------------------------------
