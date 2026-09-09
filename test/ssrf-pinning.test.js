@@ -44,10 +44,23 @@ const INDEX = require.resolve('../index.js');
 // A literal address, so nothing here depends on DNS or on being online.
 const PUBLIC_IP = '93.184.216.34';
 
+// These tests are about the private-address rule, so the origins under test are
+// admitted by the M-3 allowlist and the only thing left to refuse them is the
+// address check itself. Signing an off-origin target has its own file.
+const ALLOWED = new Set([
+    'https://addon.test',
+    `http://${PUBLIC_IP}`,
+    'http://169.254.169.254',
+    'http://127.0.0.1:1234',
+    'http://[::1]:8080',
+    'http://10.0.0.5',
+    'http://192.168.1.1'
+]);
+
 // --- signing-time validation -----------------------------------------------
 
 test('a private or link-local target is never signed', async () => {
-    const map = makeHlsProxyMapper('https://addon.test', 'CFG');
+    const map = makeHlsProxyMapper('https://addon.test', 'CFG', ALLOWED);
 
     // The two from the confirmed exploit: the cloud metadata endpoint reached
     // through an EXT-X-KEY, and a loopback admin port reached through a segment.
@@ -63,7 +76,7 @@ test('a private or link-local target is never signed', async () => {
 });
 
 test('a public target is still signed and still round-trips', async () => {
-    const map = makeHlsProxyMapper('https://addon.test', 'CFG');
+    const map = makeHlsProxyMapper('https://addon.test', 'CFG', ALLOWED);
     const proxied = await map(`http://${PUBLIC_IP}/a/seg1.ts`);
 
     assert.ok(proxied?.startsWith('https://addon.test/CFG/proxy/hls?'), `unexpected: ${proxied}`);
@@ -90,7 +103,7 @@ test('a refused target is left in the playlist verbatim, not dropped', async () 
     const out = await rewriteHlsPlaylist(
         playlist,
         `http://${PUBLIC_IP}/a/play.m3u8`,
-        makeHlsProxyMapper('https://addon.test', 'CFG')
+        makeHlsProxyMapper('https://addon.test', 'CFG', ALLOWED)
     );
 
     assert.ok(out.includes('URI="http://169.254.169.254/latest/meta-data/"'), 'key line should be untouched');

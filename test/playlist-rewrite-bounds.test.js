@@ -46,6 +46,15 @@ const {
 const realFetch = global.fetch;
 const CFG = encodeConfig({ serverUrl: 'http://provider.test', username: 'u', password: 'p' });
 
+// These tests are about the *bounds* on the rewrite, not about which origins are
+// allowed, so every host they use is admitted explicitly. M-3's origin rule has
+// its own file.
+const ALLOWED = new Set([
+    'http://provider.test',
+    'http://cdn.example.com',
+    ...Array.from({ length: 600 }, (_, i) => `http://h${i}.example.com`)
+]);
+
 function playlistOver(hosts) {
     const lines = ['#EXTM3U', '#EXT-X-TARGETDURATION:8'];
     for (const h of hosts) lines.push('#EXTINF:8,', `http://${h}/seg.ts`);
@@ -72,7 +81,7 @@ test('a playlist naming many origins resolves only up to the cap', async () => {
     const out = await rewriteHlsPlaylist(
         playlistOver(hosts),
         'http://h0.example.com/live.m3u8',
-        makeHlsProxyMapper('http://addon.test', CFG)
+        makeHlsProxyMapper('http://addon.test', CFG, ALLOWED)
     );
 
     const signed = out.split('\n').filter(l => l.includes('/proxy/hls?u=')).length;
@@ -99,7 +108,7 @@ test('a real playlist, all on one host, is unaffected by the cap', async () => {
     ].join('\n');
 
     const out = await rewriteHlsPlaylist(body, 'http://cdn.example.com/live.m3u8',
-        makeHlsProxyMapper('http://addon.test', CFG));
+        makeHlsProxyMapper('http://addon.test', CFG, ALLOWED));
 
     // Two segments plus the EXT-X-KEY URI: key and map URIs are sub-resources
     // exactly like segment lines, and leak the same credentials if left alone.
@@ -116,12 +125,12 @@ test('origin vetting is shared across rewrites, not repeated per playlist', asyn
     const body = playlistOver(['cdn.example.com', 'cdn.example.com']);
 
     await rewriteHlsPlaylist(body, 'http://cdn.example.com/live.m3u8',
-        makeHlsProxyMapper('http://addon.test', CFG));
+        makeHlsProxyMapper('http://addon.test', CFG, ALLOWED));
     assert.equal(lookups.length, 1);
 
     for (let i = 0; i < 5; i++) {
         await rewriteHlsPlaylist(body, 'http://cdn.example.com/live.m3u8',
-            makeHlsProxyMapper('http://addon.test', CFG));
+            makeHlsProxyMapper('http://addon.test', CFG, ALLOWED));
     }
     assert.equal(lookups.length, 1, 'later passes re-resolved a host already vetted');
 });
@@ -133,7 +142,7 @@ test('concurrent rewrites of the same origin share one resolution', async () => 
     const body = playlistOver(['cdn.example.com']);
     await Promise.all(Array.from({ length: 6 }, () =>
         rewriteHlsPlaylist(body, 'http://cdn.example.com/live.m3u8',
-            makeHlsProxyMapper('http://addon.test', CFG))
+            makeHlsProxyMapper('http://addon.test', CFG, ALLOWED))
     ));
     assert.equal(lookups.length, 1);
 });
@@ -158,7 +167,7 @@ test('without a deadline the rewrite behaves exactly as before', async () => {
     const out = await rewriteHlsPlaylist(
         playlistOver(['cdn.example.com']),
         'http://cdn.example.com/live.m3u8',
-        makeHlsProxyMapper('http://addon.test', CFG)
+        makeHlsProxyMapper('http://addon.test', CFG, ALLOWED)
     );
     assert.ok(out.includes('/proxy/hls?u='));
 });

@@ -2800,7 +2800,49 @@ async function relayUpstream(req, res, { upstreamUrl, label, ext, rewriteFor }) 
 // so the same check runs here: a private or unresolvable target is left in the
 // playlist verbatim (it will simply fail in the player) rather than signed.
 // This is defence in depth over the fetch-time check, not a replacement for it.
-function makeHlsProxyMapper(base, configToken) {
+// Escape hatch for a provider that genuinely fans segments out beyond the panel
+// and the playlist's own origin. Hostnames rather than origins, so a provider
+// serving the playlist over http and its segments over https needs one entry, not
+// two. Empty by default — the two derived origins cover every real provider seen
+// so far, and every entry here is a host this server will fetch from on request.
+const HLS_TARGET_ALLOWED_HOSTS = new Set(
+    String(process.env.HLS_TARGET_ALLOWED_HOSTS || '')
+        .split(',')
+        .map(h => h.trim().toLowerCase())
+        .filter(Boolean)
+);
+
+// The origins a playlist is allowed to name. The account's own panel is not
+// enough on its own: real providers 302 the playlist to a CDN on a different
+// host — one live account here serves its segments from a bare IP that is not the
+// panel hostname at all — so the origin the playlist was *finally* fetched from
+// has to be in the set too, alongside the one it was requested from.
+// normalizeUrl throws on an empty serverUrl, and a config that decoded is not a
+// guarantee of a usable one. A panel with no origin simply contributes nothing to
+// the allowed set rather than taking the request down.
+function panelOrigin(cfg) {
+    try {
+        return normalizeUrl(cfg.serverUrl);
+    } catch {
+        return null;
+    }
+}
+
+function hlsTargetOrigins(...candidates) {
+    const origins = new Set();
+    for (const candidate of candidates) {
+        if (!candidate) continue;
+        try {
+            origins.add(new URL(candidate).origin);
+        } catch { /* not a usable origin; simply contributes nothing */ }
+    }
+    return origins;
+}
+
+// `allowedOrigins` is required and there is deliberately no permissive default:
+// a caller that forgets it signs nothing, which fails closed and shows up
+// immediately, rather than quietly restoring the open relay this closes.
+function makeHlsProxyMapper(base, configToken, allowedOrigins) {
     // Playlists name hundreds of segments on one host, so vetting is per origin —
     // one DNS resolution rather than hundreds, and now shared across passes via
     // hlsOriginVetCache rather than only within one.
@@ -2811,11 +2853,31 @@ function makeHlsProxyMapper(base, configToken) {
     // no further lookups are made.
     const seen = new Set();
     let warned = false;
+    let refusedOrigin = false;
     return async (absolute) => {
-        let origin;
+        let url;
         try {
-            origin = new URL(absolute).origin;
+            url = new URL(absolute);
         } catch {
+            return null;
+        }
+        const origin = url.origin;
+
+        // Checked before the cap and before any DNS work, so a playlist naming
+        // hosts this account has no business fetching costs nothing at all.
+        // assertSafeOutboundUrl below only refuses *private* targets, which left
+        // every public URL a panel cared to name signable — and therefore
+        // fetchable and relayable from the operator's address.
+        if (!(allowedOrigins && allowedOrigins.has(origin))
+            && !HLS_TARGET_ALLOWED_HOSTS.has(url.hostname.toLowerCase())) {
+            if (!refusedOrigin) {
+                refusedOrigin = true;
+                console.warn(
+                    `[proxy] playlist names ${origin}, which is neither the account's panel nor the ` +
+                    'origin the playlist came from; leaving it unsigned ' +
+                    '(add it to HLS_TARGET_ALLOWED_HOSTS if the provider legitimately uses it)'
+                );
+            }
             return null;
         }
 
@@ -2869,7 +2931,11 @@ app.all('/:config/proxy/:kind/:file', async (req, res) => {
         ext,
         rewriteFor: (finalUrl, contentType) => {
             if (!looksLikePlaylist(ext, contentType)) return null;
-            return makeHlsProxyMapper(base, req.params.config);
+            return makeHlsProxyMapper(
+                base,
+                req.params.config,
+                hlsTargetOrigins(serverUrl, upstreamUrl, finalUrl)
+            );
         }
     });
 });
@@ -2899,7 +2965,14 @@ app.all('/:config/proxy/hls', async (req, res) => {
         ext: null,
         rewriteFor: (finalUrl, contentType) => {
             if (!looksLikePlaylist(null, contentType)) return null;
-            return makeHlsProxyMapper(base, req.params.config);
+            // A nested playlist keeps the same rule. `upstreamUrl` is included as
+            // well as `finalUrl` because a variant playlist that redirects may
+            // still name its segments back on the host it was fetched from.
+            return makeHlsProxyMapper(
+                base,
+                req.params.config,
+                hlsTargetOrigins(panelOrigin(cfg), upstreamUrl, finalUrl)
+            );
         }
     });
 });
@@ -3254,6 +3327,8 @@ module.exports = {
     assertSafeOutboundUrl,
     discardBody,
     makeHlsProxyMapper,
+    hlsTargetOrigins,
+    HLS_TARGET_ALLOWED_HOSTS,
     hlsOriginVetCache,
     HLS_ORIGIN_VET_TTL_MS,
     asString,
