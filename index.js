@@ -401,6 +401,22 @@ const PROXY_HEADER_TIMEOUT_MS = Math.max(1000, Number(process.env.PROXY_HEADER_T
 // body timeout.
 const PLAYLIST_BODY_TIMEOUT_MS = Math.max(1000, Number(process.env.PLAYLIST_BODY_TIMEOUT_MS) || 30000);
 
+// Reading the body is not the end of the work. The rewrite that follows resolves
+// DNS once per distinct origin named in the playlist, and it used to run with no
+// deadline at all: PLAYLIST_BODY_TIMEOUT_MS had been cleared and
+// PROXY_HEADER_TIMEOUT_MS long before that. At MAX_PLAYLIST_BYTES a playlist can
+// name on the order of 60,000 distinct hostnames, which held one request, its
+// socket and the buffered body for tens of minutes while emitting a resolver
+// query per host. Two bounds close it: a ceiling on how many distinct origins are
+// worth vetting at all, and a deadline over the phase as a whole.
+//
+// The cap is the load-bearing one — it bounds the *number* of lookups. The
+// deadline bounds the total and is the backstop for a slow resolver; it is
+// checked between lookups, so a single hung resolution can still overrun it by
+// that lookup's own timeout.
+const MAX_PLAYLIST_ORIGINS = Math.max(1, Number(process.env.MAX_PLAYLIST_ORIGINS) || 32);
+const PLAYLIST_REWRITE_TIMEOUT_MS = Math.max(1000, Number(process.env.PLAYLIST_REWRITE_TIMEOUT_MS) || 15000);
+
 // --- HLS playlist proxying -------------------------------------------------
 //
 // Live channels are served as either a continuous MPEG-TS body (.ts), which
@@ -496,8 +512,18 @@ const HLS_URI_ATTR = /URI="([^"]*)"/gi;
 // would silently corrupt the playlist.
 // `toProxyUrl` may be async — the mapper used in production resolves DNS to
 // check the target before signing it — so this is async throughout.
-async function rewriteHlsPlaylist(text, baseUrl, toProxyUrl) {
+async function rewriteHlsPlaylist(text, baseUrl, toProxyUrl, { deadline = null } = {}) {
     const mapUri = async (raw) => {
+        // Checked here rather than around the whole pass because this is the only
+        // point that awaits: a timer cannot interrupt an await chain, so the loop
+        // has to look. Throwing rather than emitting a partly-rewritten playlist
+        // is deliberate — the un-rewritten lines are the provider's own URLs, and
+        // those carry the account credentials this rewrite exists to hide.
+        if (deadline !== null && Date.now() > deadline) {
+            const err = new Error('playlist rewrite deadline exceeded');
+            err.code = 'PLAYLIST_REWRITE_TIMEOUT';
+            throw err;
+        }
         const uri = String(raw).trim();
         if (!uri) return null;
         let absolute;
@@ -1248,6 +1274,34 @@ const liveStreamsCache = createStreamListCache();
 const vodStreamsCache = createStreamListCache();
 const seriesStreamsCache = createStreamListCache();
 
+// Signing-time vetting of the origins named in an HLS playlist. This was memoised
+// per rewrite pass, which helped within one playlist and not at all across them —
+// and a live playlist is re-fetched every few seconds, so the same CDN host was
+// re-resolved for the life of the channel. Only OS-level DNS caching hid it.
+//
+// The TTL is the DNS pin's on purpose: a decision about a hostname must not
+// outlive the window in which that hostname's addresses are treated as fixed.
+// Caching this is safe because it is *not* the check that guards the fetch —
+// safeFetch re-runs assertSafeOutboundUrl, and re-pins, on every segment request.
+// This one only decides whether a URI is worth signing.
+const HLS_ORIGIN_VET_TTL_MS = DNS_PIN_TTL_MS;
+const HLS_ORIGIN_VET_MAX = 512;
+const hlsOriginVetCache = new BoundedMap({
+    maxEntries: HLS_ORIGIN_VET_MAX,
+    maxAgeMs: HLS_ORIGIN_VET_TTL_MS
+});
+
+// Returns a promise for whether this origin may be signed. The promise itself is
+// cached, so concurrent rewrites naming the same host share one resolution
+// instead of racing. It never rejects.
+function vetHlsOrigin(absolute, origin) {
+    const cached = hlsOriginVetCache.get(origin);
+    if (cached && cached.ts > Date.now() - HLS_ORIGIN_VET_TTL_MS) return cached.ok;
+    const ok = assertSafeOutboundUrl(absolute).then(() => true, () => false);
+    hlsOriginVetCache.set(origin, { ok, ts: Date.now() });
+    return ok;
+}
+
 function getAllVodStreams(cfg) {
     return vodStreamsCache.load(cfg, () => getStreams(cfg, 'get_vod_streams'));
 }
@@ -1411,7 +1465,8 @@ function sweepCaches(now = Date.now()) {
         + categoryStreamsCache.map.sweep(now)
         + liveStreamsCache.map.sweep(now)
         + vodStreamsCache.map.sweep(now)
-        + seriesStreamsCache.map.sweep(now);
+        + seriesStreamsCache.map.sweep(now)
+        + hlsOriginVetCache.sweep(now);
 }
 
 function startCacheSweeper() {
@@ -2647,7 +2702,24 @@ async function relayUpstream(req, res, { upstreamUrl, label, ext, rewriteFor }) 
         } finally {
             clearTimeout(bodyTimer);
         }
-        const rewritten = await rewriteHlsPlaylist(text, finalUrl, mapper);
+        // The two timers above are both cleared by now, so this phase carries its
+        // own deadline. See PLAYLIST_REWRITE_TIMEOUT_MS.
+        let rewritten;
+        try {
+            rewritten = await rewriteHlsPlaylist(text, finalUrl, mapper, {
+                deadline: Date.now() + PLAYLIST_REWRITE_TIMEOUT_MS
+            });
+        } catch (e) {
+            const timedOut = e.code === 'PLAYLIST_REWRITE_TIMEOUT';
+            console.warn(
+                `[proxy] playlist rewrite ${timedOut ? `timed out after ${PLAYLIST_REWRITE_TIMEOUT_MS}ms` : 'failed'} ` +
+                `for ${label}${timedOut ? '' : `: ${e.message}`}`
+            );
+            if (!res.headersSent) {
+                res.status(timedOut ? 504 : 502).end(timedOut ? 'upstream timeout' : 'bad playlist');
+            }
+            return;
+        }
         res.status(upstream.status);
         // Deliberately not forwarding content-length: the rewritten body is a
         // different size. Nor accept-ranges — a playlist is not seekable.
@@ -2729,9 +2801,16 @@ async function relayUpstream(req, res, { upstreamUrl, label, ext, rewriteFor }) 
 // playlist verbatim (it will simply fail in the player) rather than signed.
 // This is defence in depth over the fetch-time check, not a replacement for it.
 function makeHlsProxyMapper(base, configToken) {
-    // Playlists name hundreds of segments on one host; vetting is per origin and
-    // memoised for the pass, so that costs one DNS lookup rather than hundreds.
-    const vetted = new Map();
+    // Playlists name hundreds of segments on one host, so vetting is per origin —
+    // one DNS resolution rather than hundreds, and now shared across passes via
+    // hlsOriginVetCache rather than only within one.
+    //
+    // Distinct origins are capped per playlist because each new one costs a
+    // resolution and a real playlist names one or two. Past the cap a URI is left
+    // unsigned, which is the same answer an unresolvable target already gets, and
+    // no further lookups are made.
+    const seen = new Set();
+    let warned = false;
     return async (absolute) => {
         let origin;
         try {
@@ -2739,10 +2818,22 @@ function makeHlsProxyMapper(base, configToken) {
         } catch {
             return null;
         }
-        if (!vetted.has(origin)) {
-            vetted.set(origin, assertSafeOutboundUrl(absolute).then(() => true, () => false));
+
+        if (!seen.has(origin)) {
+            if (seen.size >= MAX_PLAYLIST_ORIGINS) {
+                if (!warned) {
+                    warned = true;
+                    console.warn(
+                        `[proxy] playlist names more than ${MAX_PLAYLIST_ORIGINS} distinct origins; ` +
+                        'leaving the rest unsigned (raise MAX_PLAYLIST_ORIGINS if a provider legitimately fans out)'
+                    );
+                }
+                return null;
+            }
+            seen.add(origin);
         }
-        if (!await vetted.get(origin)) return null;
+
+        if (!await vetHlsOrigin(absolute, origin)) return null;
 
         const { u, s, e } = encodeHlsTarget(absolute, configToken);
         return `${base}/${configToken}/proxy/hls?u=${u}&s=${s}&e=${e}`;
@@ -3147,6 +3238,8 @@ module.exports = {
     estimateBytes,
     CACHE_MAX_STREAM_BYTES,
     PLAYLIST_BODY_TIMEOUT_MS,
+    PLAYLIST_REWRITE_TIMEOUT_MS,
+    MAX_PLAYLIST_ORIGINS,
     signTokenBody,
     rewriteHlsPlaylist,
     looksLikePlaylist,
@@ -3161,6 +3254,8 @@ module.exports = {
     assertSafeOutboundUrl,
     discardBody,
     makeHlsProxyMapper,
+    hlsOriginVetCache,
+    HLS_ORIGIN_VET_TTL_MS,
     asString,
     redactConfigInPath,
     pinnedLookup,
