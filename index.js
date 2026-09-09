@@ -2066,7 +2066,9 @@ function catalogTypesFor(id) {
 // produce — and the same catalog has two sources (the warm full list or a
 // per-category fetch), so the page you got depended on cache state. That was the
 // audit's L3.
-function catalogComparator(kind, variant) {
+// `now` is a parameter only so the featured shuffle can be tested across days
+// without moving the system clock. Production always takes the default.
+function catalogComparator(kind, variant, now = Date.now()) {
     const idOf = s => parseInt(s[kind.idField]) || 0;
     const byId = (a, b) => idOf(a) - idOf(b);
 
@@ -2077,9 +2079,23 @@ function catalogComparator(kind, variant) {
         return (a, b) => ((parseFloat(b.rating) || 0) - (parseFloat(a.rating) || 0)) || byId(a, b);
     }
     if (variant === 'featured') {
-        // Seeded on the day so the shuffle holds still while the user paginates.
-        const daySeed = Math.floor(Date.now() / 86400000);
-        const hash = s => ((idOf(s) * 2654435761 + daySeed) & 0x7fffffff);
+        // Seeded on the day so the shuffle holds still while the user paginates
+        // and changes when the day does. The seed has to enter the hash *before*
+        // the multiply. It used to be added after (`id * C + daySeed`), and
+        // adding a constant is order-preserving except for the single item that
+        // wraps 2^31 — with tens of thousands of items spread over that range the
+        // mean gap is tens of thousands, so the rotation took tens of thousands of
+        // days to cross one item boundary. "Featured" was a fixed permutation:
+        // measured identical at day+1, +30, +365 and +3650.
+        const daySeed = Math.floor(now / 86400000);
+        // Spread the day across the whole word first, so consecutive days are not
+        // near-identical keys.
+        const dayKey = Math.imul(daySeed, 0x9e3779b1);
+        // XOR is a permutation of the id space and 2654435761 is odd, so this
+        // stays a bijection modulo 2^31 exactly as the previous hash was: two
+        // distinct ids still cannot collide, which is what the injectivity test
+        // below relies on.
+        const hash = s => (Math.imul(idOf(s) ^ dayKey, 2654435761) & 0x7fffffff);
         return (a, b) => (hash(a) - hash(b)) || byId(a, b);
     }
     return null;

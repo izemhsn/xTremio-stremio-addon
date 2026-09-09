@@ -33,6 +33,8 @@ const {
 
 const realFetch = global.fetch;
 
+const DAY_MS = 86400000;
+
 const CFG_ARGS = { serverUrl: 'http://provider.test:8080', username: 'alice', password: 'secret' };
 const CFG = encodeConfig(CFG_ARGS);
 
@@ -190,17 +192,65 @@ test('the featured shuffle is injective, so it is already a total order', () => 
     // provide — that featured is already total over a realistic id range. It is
     // deliberately not a test of the multiplier: collisions need ids about 2^27
     // apart even for an even multiplier, so no tractable range would show that.
+    // Checked across a spread of days, not just today: the hash mixes the day
+    // seed in, so a property that held only for the current date would be a test
+    // that starts failing on some future morning.
+    const t0 = Date.UTC(2026, 0, 1);
     for (const kindName of ['movies', 'series']) {
         const kind = CATALOG_KINDS[kindName];
-        const cmp = catalogComparator(kind, 'featured');
-        const seen = new Set();
-        for (let id = 1; id <= 5000; id++) {
-            const item = { [kind.idField]: id };
-            // Position in a total order is unique iff nothing compares equal to it.
-            const key = String(cmp(item, { [kind.idField]: 0 }));
-            assert.ok(!seen.has(key), `${kindName}: id ${id} collides with an earlier id`);
-            seen.add(key);
+        for (const day of [0, 1, 2, 37, 365, 3650]) {
+            const cmp = catalogComparator(kind, 'featured', t0 + day * DAY_MS);
+            const seen = new Set();
+            for (let id = 1; id <= 5000; id++) {
+                const item = { [kind.idField]: id };
+                // Position in a total order is unique iff nothing compares equal to it.
+                const key = String(cmp(item, { [kind.idField]: 0 }));
+                assert.ok(!seen.has(key), `${kindName} day+${day}: id ${id} collides with an earlier id`);
+                seen.add(key);
+            }
         }
+    }
+});
+
+test('the featured shuffle actually varies from day to day', () => {
+    // The seed used to be *added* after the multiply. Adding a constant is
+    // order-preserving except for the one item that wraps 2^31, so "featured"
+    // was a fixed permutation — measured byte-identical at day+1, +30, +365 and
+    // +3650 against a real account. Nothing in the suite pinned variation, which
+    // is exactly why it survived. This is that missing half.
+    const t0 = Date.UTC(2026, 0, 1);
+    const kind = CATALOG_KINDS.movies;
+    const items = Array.from({ length: 2000 }, (_, i) => ({ [kind.idField]: i + 1 }));
+    const orderAt = t => [...items]
+        .sort(catalogComparator(kind, 'featured', t))
+        .map(s => s[kind.idField]);
+
+    const base = orderAt(t0);
+    for (const day of [1, 7, 30, 365, 3650]) {
+        const later = orderAt(t0 + day * DAY_MS);
+        const held = later.filter((x, i) => x === base[i]).length;
+        // A genuine reshuffle leaves only a handful of positions by coincidence;
+        // the old hash left every single one.
+        assert.ok(
+            held < items.length / 100,
+            `day+${day} kept ${held}/${items.length} positions — the shuffle is not varying`
+        );
+    }
+});
+
+test('the featured shuffle holds still within a day', () => {
+    // The other half of the intent, and the reason it is seeded by day at all:
+    // paginating a shelf must not reshuffle underneath the user.
+    const kind = CATALOG_KINDS.series;
+    const items = Array.from({ length: 500 }, (_, i) => ({ [kind.idField]: i + 1 }));
+    const orderAt = t => [...items]
+        .sort(catalogComparator(kind, 'featured', t))
+        .map(s => s[kind.idField]);
+
+    const dayStart = Date.UTC(2026, 5, 15);
+    const first = orderAt(dayStart);
+    for (const offset of [1, 1000, 3600000, DAY_MS - 1]) {
+        assert.deepEqual(orderAt(dayStart + offset), first, `order changed ${offset}ms into the same day`);
     }
 });
 
