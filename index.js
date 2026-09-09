@@ -2009,6 +2009,30 @@ app.post('/configure', async (req, res) => {
         }));
     }
 
+    // An empty serverUrl made normalizeUrl throw, which the catch below reported
+    // as the generic "Something went wrong" — true, but silent about which field
+    // is at fault. The browser's `required` attributes normally prevent this, so
+    // it is only reachable by a direct POST, but the field still deserves an
+    // answer it can act on.
+    const missing = [
+        !rawServerUrl && 'server URL',
+        !username && 'username',
+        !password && 'password'
+    ].filter(Boolean);
+    if (missing.length) {
+        const named = missing.length === 1
+            ? missing[0]
+            : `${missing.slice(0, -1).join(', ')} and ${missing[missing.length - 1]}`;
+        return res.send(renderConfigPage({
+            serverUrl: rawServerUrl,
+            username,
+            password,
+            status: { valid: false, error: `Please enter your ${named}.` },
+            baseUrl: getBaseUrl(req),
+            nonce
+        }));
+    }
+
     try {
         const validation = await validateXtremioCredentials(rawServerUrl, username, password);
         const finalServerUrl = validation.valid
@@ -2216,13 +2240,18 @@ app.get(['/:config/catalog/:type/:id.json', '/:config/catalog/:type/:id/:extra.j
 
     const { id, type } = req.params;
 
-    const route = parseCatalogId(id);
-    if (route && !CATALOG_KINDS[route.kind].catalogTypes.includes(type)) {
+    // Asked of catalogTypesFor rather than re-derived here. The route used to
+    // inline the equivalent lookup, which left the function with no production
+    // caller at all and its six assertions testing something that never ran —
+    // exactly the shape that lets a check and its test drift apart.
+    const types = catalogTypesFor(id);
+    if (!types) return res.json({ metas: [] });
+    if (!types.includes(type)) {
         console.warn(`[catalog] type/id mismatch: type=${type} id=${id}`);
         return res.json({ metas: [] });
     }
-    if (!route) return res.json({ metas: [] });
 
+    const route = parseCatalogId(id);
     const kind = CATALOG_KINDS[route.kind];
 
     try {
@@ -2340,11 +2369,20 @@ app.get('/:config/meta/:type/:id.json', async (req, res) => {
                         skippedEpisodes++;
                         continue;
                     }
+                    // `|| 1` turned a legitimate episode 0 into episode 1, and
+                    // providers do number specials, pilots and recaps 0 — so the
+                    // episode was relabelled and collided with the real episode 1
+                    // of the same season. Only a value that will not parse falls
+                    // back now.
+                    const parsedEpisode = parseInt(ep.episode_num);
+                    const episodeNum = Number.isInteger(parsedEpisode) ? parsedEpisode : 1;
                     videos.push({
                         id: `xtremio_episode_${seriesId}:${seasonNum}:${ep.id}`,
-                        title: ep.title || `Episode ${ep.episode_num}`,
+                        // Built from the resolved number, so a missing episode_num
+                        // reads "Episode 1" rather than "Episode undefined".
+                        title: ep.title || `Episode ${episodeNum}`,
                         season: parseInt(seasonNum),
-                        episode: parseInt(ep.episode_num) || 1,
+                        episode: episodeNum,
                         // Omitted rather than epoch-defaulted: Stremio renders a
                         // date it is given, so the old fallback printed "1970"
                         // next to every episode whose provider sent no date.

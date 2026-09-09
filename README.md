@@ -25,6 +25,13 @@ Server listens on `http://localhost:3000` by default.
 
 Catalog sections (Live TV, XT-Movies, XT-Series) then appear in Stremio's sidebar.
 
+The server URL must be a bare host, optionally with a port and scheme —
+`http://line.example.com:8080`, or just `line.example.com:8080`. **A path prefix is
+not supported**: every upstream URL is built from the origin, so a panel reachable
+only at `http://host/panel` is looked up at `http://host/player_api.php` and fails
+validation with the deliberately vague "Cannot reach that server". If your provider
+gave you a URL with a path in it, the panel host is usually the same URL without it.
+
 ## Environment variables
 
 | Variable | Default | Purpose |

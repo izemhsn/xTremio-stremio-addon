@@ -218,3 +218,56 @@ test('season 0 is kept — it is numeric and providers use it for specials', asy
     assert.deepEqual(meta.videos.map(v => v.id), ['xtremio_episode_103:0:7']);
     assert.equal(meta.videos[0].season, 0);
 });
+
+test('episode 0 is kept too, for the same reason season 0 is', async () => {
+    // `parseInt(ep.episode_num) || 1` relabelled a legitimate episode 0 as
+    // episode 1, where it collided with the season's real episode 1 — two
+    // entries claiming the same slot, one of them wrong.
+    stubUpstream({
+        info: { name: 'Show' },
+        episodes: { 1: [
+            { id: '7', episode_num: 0, title: 'Pilot' },
+            { id: '8', episode_num: 1, title: 'First' }
+        ] }
+    });
+    const res = await get('/meta/series/xtremio_series_104.json');
+    const { meta } = await res.json();
+
+    assert.deepEqual(meta.videos.map(v => v.episode), [0, 1]);
+    assert.deepEqual(meta.videos.map(v => v.title), ['Pilot', 'First']);
+});
+
+test('an unparseable episode number still falls back, and says so readably', async () => {
+    // The fallback is what the `|| 1` was there for; only the 0 case was wrong.
+    stubUpstream({
+        info: { name: 'Show' },
+        episodes: { 1: [
+            { id: '9' },
+            { id: '10', episode_num: 'not a number' }
+        ] }
+    });
+    const res = await get('/meta/series/xtremio_series_105.json');
+    const { meta } = await res.json();
+
+    assert.deepEqual(meta.videos.map(v => v.episode), [1, 1]);
+    // And the generated title reads from the resolved number rather than the raw
+    // field, which used to render "Episode undefined".
+    assert.deepEqual(meta.videos.map(v => v.title), ['Episode 1', 'Episode 1']);
+});
+
+test('the catalog route dispatches through catalogTypesFor, not a copy of it', () => {
+    // The route used to inline the equivalent lookup, so the tested function had
+    // no production caller and the assertions above proved nothing about what
+    // actually runs. Asserting on the source is crude, but it is the only thing
+    // that catches the two drifting apart again — the behaviour is identical
+    // either way, which is precisely why the duplication survived unnoticed.
+    const src = require('fs').readFileSync(require.resolve('../index.js'), 'utf8');
+    const route = src.slice(src.indexOf("app.get(['/:config/catalog/"));
+    const body = route.slice(0, route.indexOf('\n});'));
+
+    assert.ok(body.includes('catalogTypesFor(id)'), 'the catalog route must call catalogTypesFor');
+    assert.ok(
+        !body.includes('.catalogTypes.includes('),
+        'the catalog route still re-derives the type list instead of asking catalogTypesFor'
+    );
+});
