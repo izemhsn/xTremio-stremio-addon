@@ -15,6 +15,7 @@ const {
     normalizeContainerExt,
     isNotWebReady,
     parseExtra,
+    rawExtraSegment,
     parseYear,
     toIsoDate,
     splitList,
@@ -113,16 +114,91 @@ test('isNotWebReady is false only for https + mp4', () => {
     assert.strictEqual(isNotWebReady('https://x/y.mp4', 'MP4'), false);
 });
 
-test('parseExtra does not decode a second time', () => {
-    // Express has already percent-decoded the route param. A literal '%' in a
-    // search term used to throw URIError here and surface as an HTTP 500.
+test('parseExtra decodes the raw segment exactly once', () => {
+    assert.deepStrictEqual(parseExtra('skip=100&genre=News'), { skip: '100', genre: 'News' });
+    assert.deepStrictEqual(parseExtra('genre=News%20%26%20Sports'), { genre: 'News & Sports' });
+    assert.deepStrictEqual(
+        parseExtra('skip=100&genre=Kids%20%26%20Family'),
+        { skip: '100', genre: 'Kids & Family' }
+    );
+    // A literal '%' in a search term used to throw URIError and surface as an
+    // HTTP 500, so a part that will not decode is kept verbatim instead.
     assert.deepStrictEqual(parseExtra('search=100%'), { search: '100%' });
     assert.deepStrictEqual(parseExtra('skip=%zz'), { skip: '%zz' });
-    assert.deepStrictEqual(parseExtra('skip=100&genre=News'), { skip: '100', genre: 'News' });
     // A value containing '=' keeps everything after the first separator.
     assert.deepStrictEqual(parseExtra('search=a=b'), { search: 'a=b' });
     assert.deepStrictEqual(parseExtra(''), {});
     assert.deepStrictEqual(parseExtra(undefined), {});
+});
+
+test("parseExtra keeps a '&' that belongs to a value, encoded or not", () => {
+    // The bug this closes: the manifest advertises these genres verbatim from
+    // category_name, and splitting on every '&' made both shelves unopenable.
+    assert.deepStrictEqual(
+        parseExtra('genre=%7CSLO%7C%20SLOVAKIA%20%26%20Czechia'),
+        { genre: '|SLO| SLOVAKIA & Czechia' }
+    );
+    // Same value with the '&' sent raw rather than escaped. Pairs split only
+    // before a declared key, so this survives too.
+    assert.deepStrictEqual(parseExtra('genre=Kids & Family'), { genre: 'Kids & Family' });
+    assert.deepStrictEqual(
+        parseExtra('skip=100&genre=Kids & Family'),
+        { skip: '100', genre: 'Kids & Family' }
+    );
+    assert.deepStrictEqual(
+        parseExtra('genre=GLORY PPV & VIDEOLAND EVENT & BOXING &'),
+        { genre: 'GLORY PPV & VIDEOLAND EVENT & BOXING &' }
+    );
+});
+
+test("parseExtra leaves '+' alone", () => {
+    // '+' is an ordinary character in a path segment, not a space. Parsing the
+    // segment as a form body (URLSearchParams) would decode it to a space and
+    // break every "CANAL+ SPORT" style category name — 17 of them on the account
+    // this was tested against, against the 2 that the '&' handling repairs.
+    assert.deepStrictEqual(parseExtra('genre=CANAL+%20SPORT'), { genre: 'CANAL+ SPORT' });
+    assert.deepStrictEqual(
+        parseExtra('genre=%7CFR%7C%20CANAL%2B%20SPORT'),
+        { genre: '|FR| CANAL+ SPORT' }
+    );
+    assert.deepStrictEqual(parseExtra('search=rock+roll'), { search: 'rock+roll' });
+});
+
+test('parseExtra accepts a pair whose separators are escaped too', () => {
+    // How much of the segment is escaped is the client's choice. Stremio itself
+    // escapes only the value and leaves `genre=` literal, but a client that
+    // escapes the whole pair must still parse, so '=' and '&' are matched in
+    // both forms.
+    assert.deepStrictEqual(parseExtra('search%3Dmatrix'), { search: 'matrix' });
+    assert.deepStrictEqual(parseExtra('SEARCH%3Dmatrix'), { search: 'matrix' });
+    assert.deepStrictEqual(
+        parseExtra('skip%3D100%26genre%3DNews'),
+        { skip: '100', genre: 'News' }
+    );
+});
+
+test('rawExtraSegment reads the segment before Express decodes it', () => {
+    const req = (originalUrl, extra) => ({ originalUrl, params: { extra } });
+
+    assert.strictEqual(
+        rawExtraSegment(req('/tok/catalog/Live%20TV/xtremio_live/genre=A%20%26%20B.json', 'genre=A & B')),
+        'genre=A%20%26%20B'
+    );
+    // The route pattern without an :extra has nothing to parse.
+    assert.strictEqual(
+        rawExtraSegment(req('/tok/catalog/Live%20TV/xtremio_live.json', undefined)),
+        undefined
+    );
+    // A query string is not part of the segment.
+    assert.strictEqual(
+        rawExtraSegment(req('/tok/catalog/XT-Movies/xtremio_movies_new/skip=100.json?x=1', 'skip=100')),
+        'skip=100'
+    );
+    // An encoded '/' stays inside the segment rather than splitting it.
+    assert.strictEqual(
+        rawExtraSegment(req('/tok/catalog/Live%20TV/xtremio_live/genre=24%2F7.json', 'genre=24/7')),
+        'genre=24%2F7'
+    );
 });
 
 test('parseYear pulls the first 4-digit run, or undefined', () => {

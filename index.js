@@ -1164,24 +1164,46 @@ function createStreamListCache() {
         map,
         get(cfg) {
             const cached = map.get(accountCacheKey(cfg));
-            if (cached && cached.ts > Date.now() - CACHE_TTL) return cached.data;
+            // Per-entry ttl: a stale entry being served through an outage carries
+            // a short one, so it is retried in a minute rather than in half an hour.
+            if (cached && cached.ts > Date.now() - (cached.ttl || CACHE_TTL)) return cached.data;
             return null;
         },
         set(cfg, items) {
-            map.set(accountCacheKey(cfg), { data: items, ts: Date.now(), bytes: estimateBytes(items) });
+            map.set(accountCacheKey(cfg), {
+                data: items, ts: Date.now(), ttl: CACHE_TTL, bytes: estimateBytes(items)
+            });
         },
         // Cache-aside read: serves a warm entry, otherwise runs `fetcher` once
         // no matter how many callers arrive while it is in flight.
         load(cfg, fetcher) {
             const cached = this.get(cfg);
             if (cached) return Promise.resolve(cached);
-            return singleFlight(accountCacheKey(cfg), async () => {
+            const key = accountCacheKey(cfg);
+            return singleFlight(key, async () => {
                 // Re-check: a concurrent flight may have populated it already.
                 const warm = this.get(cfg);
                 if (warm) return warm;
-                const items = await fetcher();
-                this.set(cfg, items);
-                return items;
+                try {
+                    const items = await fetcher();
+                    this.set(cfg, items);
+                    return items;
+                } catch (e) {
+                    // A list we already have beats no list at all — the caller's
+                    // only other answer is an empty shelf. `ts` is deliberately
+                    // *not* re-stamped: the entry keeps its true age, so the
+                    // ordinary age sweep still reclaims it and stale data is
+                    // served for minutes rather than indefinitely. Only the ttl
+                    // moves, which is what schedules the retry.
+                    const stale = map.get(key);
+                    if (!stale || !Array.isArray(stale.data) || !stale.data.length) throw e;
+                    stale.ttl = (Date.now() - stale.ts) + CACHE_FAILURE_TTL;
+                    console.warn(
+                        `[cache] upstream list failed (${e.message}); serving ${stale.data.length} ` +
+                        `stale items, retrying in ${CACHE_FAILURE_TTL / 1000}s`
+                    );
+                    return stale.data;
+                }
             });
         }
     };
@@ -1238,25 +1260,84 @@ function getAllLiveStreams(cfg) {
     return liveStreamsCache.load(cfg, () => getStreams(cfg, 'get_live_streams'));
 }
 
-// Express has already percent-decoded the :extra route param, so pairs are
-// split as-is. Decoding a second time corrupts values containing a literal '%'
-// and throws URIError on ones like "100%" (a legitimate search term).
+// The keys this addon declares in its manifest `extra` blocks. Nothing else is
+// a pair separator's right-hand side, which is what makes the split below safe.
+const EXTRA_KEYS = ['skip', 'genre', 'search'];
+
+// A pair boundary is a separator followed by one of those keys and its '='. A
+// '&' anywhere else belongs to a value and is kept: category names like
+// "SLOVAKIA & Czechia" and "Kids & Family" are common, and splitting on every
+// '&' cut them in half, so the manifest advertised a genre whose shelf could
+// never open. Anchoring on a declared key is what makes that decidable — the
+// previous code could not tell a separator from a value byte, because Express
+// percent-decodes a route param before any handler sees it, turning %26 into the
+// very character the parser split on.
+//
+// Both the separator and the '=' are matched raw or escaped, because how much of
+// the segment is escaped is the client's choice: some send `genre=A%20%26%20B`,
+// others escape the whole pair as `genre%3DA%2520%2526%2520B`.
+const EXTRA_KEY_ALT = EXTRA_KEYS.join('|');
+const EXTRA_PAIR_SPLIT = new RegExp(`(?:&|%26)(?=(?:${EXTRA_KEY_ALT})(?:=|%3D))`, 'i');
+const EXTRA_KEY_HEAD = new RegExp(`^(${EXTRA_KEY_ALT})(?:=|%3D)`, 'i');
+
+// decodeURIComponent throws on a malformed escape, and "100%" is a legitimate
+// search term, so a part that will not decode is kept verbatim. Decoding here is
+// only correct because the input is the *raw* segment (see rawExtraSegment); on
+// an already-decoded param this would be a second decode and would corrupt it.
+function decodeExtraPart(part) {
+    try {
+        return decodeURIComponent(part);
+    } catch {
+        return part;
+    }
+}
+
 function parseExtra(extra) {
     const params = {};
-    if (extra) {
-        extra.split('&').forEach(p => {
-            const [k, ...rest] = p.split('=');
-            params[k] = rest.join('=');
-        });
+    if (!extra) return params;
+
+    for (const pair of extra.split(EXTRA_PAIR_SPLIT)) {
+        const head = EXTRA_KEY_HEAD.exec(pair);
+        if (head) {
+            params[head[1].toLowerCase()] = decodeExtraPart(pair.slice(head[0].length));
+            continue;
+        }
+        // Not a key this addon declares. Kept rather than dropped, on the first
+        // literal '=', so an extra added to the manifest without being added to
+        // EXTRA_KEYS still arrives instead of vanishing silently.
+        const i = pair.indexOf('=');
+        const [k, v] = i === -1 ? [pair, ''] : [pair.slice(0, i), pair.slice(i + 1)];
+        params[decodeExtraPart(k)] = decodeExtraPart(v);
     }
     return params;
 }
 
+// The still-encoded :extra segment, or undefined when the request matched the
+// route pattern that has no extra. `originalUrl` is the one place the escapes
+// survive; `req.params.extra` has already lost them.
+function rawExtraSegment(req) {
+    if (req.params.extra === undefined) return undefined;
+    const path = req.originalUrl.split('?')[0];
+    return path.slice(path.lastIndexOf('/') + 1).replace(/\.json$/i, '');
+}
+
 const PAGE_SIZE = 100;
 
+// A payload that is not an array is a provider failure, not an empty catalog:
+// an overloaded Xtream panel answers `get_vod_streams` with an error object or a
+// bare `{}`. Coercing that to [] made it indistinguishable from a genuinely
+// empty account, and the empty list was then cached *positively* for the full 30
+// minutes — every movie shelf and every movie search blank until it expired, off
+// one blip, with no retry. Throwing keeps it out of the cache, because rejections
+// are not cached, so the next request tries again. Same lesson as
+// `isUsableSeriesInfo`: accepting less than the caller needs turns a flaky call
+// into a sticky one.
 async function getStreams(cfg, action, params = {}) {
     const data = await xtremioGet(cfg, action, params);
-    return Array.isArray(data) ? data : [];
+    if (!Array.isArray(data)) {
+        throw new Error(`${action} returned ${data === null ? 'null' : typeof data}, not a list`);
+    }
+    return data;
 }
 
 // The per-category fetch is what `selectCatalogGenre` falls back to when the
@@ -2074,7 +2155,7 @@ app.get(['/:config/catalog/:type/:id.json', '/:config/catalog/:type/:id/:extra.j
     const kind = CATALOG_KINDS[route.kind];
 
     try {
-        const extra = parseExtra(req.params.extra);
+        const extra = parseExtra(rawExtraSegment(req));
         const skip = Math.max(0, parseInt(extra.skip) || 0);
 
         let items;
@@ -3073,6 +3154,7 @@ module.exports = {
     DNS_PIN_TTL_MS,
     warnOnUndiciMismatch,
     parseExtra,
+    rawExtraSegment,
     parseYear,
     toIsoDate,
     splitList,
