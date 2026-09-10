@@ -1657,6 +1657,28 @@ function describeDowngrade(requested, finalUrl, source) {
     return { from: 'https', to: 'http', source };
 }
 
+// The URL a provider names for itself in `server_info`, or null when those fields
+// do not make one. They are provider-controlled and used to be concatenated
+// unchecked: a `url` that already carried its port gave `http://host:8080:8080`,
+// which does not parse, and one with a trailing slash gave `http://host/:8080`,
+// which parses but has lost its port. Both reported "Connected!" and minted an
+// install link whose every catalog was empty. Only a bare http(s) origin is
+// accepted; the caller keeps the URL that just worked otherwise.
+function serverInfoOrigin(si) {
+    if (!si || !si.url) return null;
+    const proto = si.server_protocol || 'http';
+    const port = (proto === 'https' ? si.https_port : si.port) || si.port;
+    let parsed;
+    try {
+        parsed = new URL(port ? `${proto}://${si.url}:${port}` : `${proto}://${si.url}`);
+    } catch {
+        return null;
+    }
+    if (parsed.protocol !== 'http:' && parsed.protocol !== 'https:') return null;
+    if (parsed.pathname !== '/' || parsed.search || parsed.hash || parsed.username || parsed.password) return null;
+    return parsed.origin;
+}
+
 async function validateXtremioCredentials(serverUrl, username, password) {
     const base = normalizeUrl(serverUrl);
     const urls = [base, base.replace(/^https?/, m => m === 'https' ? 'http' : 'https')];
@@ -1680,15 +1702,12 @@ async function validateXtremioCredentials(serverUrl, username, password) {
                 return { valid: false, error: 'Account has expired' };
             }
 
-            let resolvedUrl;
             const si = json.server_info;
-            if (si && si.url) {
-                const proto = si.server_protocol || 'http';
-                const port = (proto === 'https' ? si.https_port : si.port) || si.port;
-                resolvedUrl = port ? `${proto}://${si.url}:${port}` : `${proto}://${si.url}`;
+            const named = serverInfoOrigin(si);
+            if (si && si.url && !named) {
+                console.warn('[configure] provider server_info does not form a usable URL; keeping the one that connected');
             }
-
-            const finalUrl = resolvedUrl || url;
+            const finalUrl = named || url;
             // Attribute the downgrade to whichever step actually caused it: the
             // http retry, or the provider overriding a scheme that just worked.
             const downgrade = describeDowngrade(base, url, 'fallback')
@@ -3202,11 +3221,22 @@ app.all('/:config/proxy/:kind/:file', async (req, res) => {
     const [, streamId, ext] = match;
     if (!isNumericId(streamId)) return res.status(400).end('bad stream id');
 
-    const serverUrl = normalizeUrl(cfg.serverUrl);
-    const upstreamUrl = new URL(
-        `/${kind}/${encodeURIComponent(cfg.username)}/${encodeURIComponent(cfg.password)}/${streamId}.${ext}`,
-        serverUrl
-    ).toString();
+    // A token minted before server_info was validated can hold a server URL that
+    // does not parse. Node puts the rejected input on the TypeError, and here that
+    // input is this path — username and password included — so the failure is
+    // answered on the spot rather than thrown to the terminal handler's log.
+    let serverUrl;
+    let upstreamUrl;
+    try {
+        serverUrl = normalizeUrl(cfg.serverUrl);
+        upstreamUrl = new URL(
+            `/${kind}/${encodeURIComponent(cfg.username)}/${encodeURIComponent(cfg.password)}/${streamId}.${ext}`,
+            serverUrl
+        ).toString();
+    } catch {
+        console.warn('[proxy] the configured server URL does not parse; the account needs reconfiguring');
+        return res.status(502).end('bad upstream');
+    }
 
     const base = getBaseUrl(req);
     await relayUpstream(req, res, {
@@ -3478,7 +3508,7 @@ app.use((req, res) => {
 // handler only sees throws from what was registered before it. The four
 // parameters are what identify it as one, so `next` stays whether or not every
 // path uses it.
-app.use((err, req, res, next) => {
+function terminalErrorHandler(err, req, res, next) {
     // A URIError from decodeParam means the client sent a bad path, not that
     // the server broke; anything carrying its own status (body-parser and
     // friends) is trusted to have set a sensible one — but only inside the
@@ -3492,7 +3522,13 @@ app.use((err, req, res, next) => {
     // A 4xx is the client's mistake and arrives as often as someone cares to
     // send one; a stack per malformed path would be a log flood with no
     // information in it. A 5xx is ours, and the stack is the whole point.
-    if (status >= 500) console.error(`[error] ${where}:`, err);
+    //
+    // The stack, not the error object: printing an object prints its own
+    // properties too, and some carry request data. A failed `new URL()` holds its
+    // rejected input, which on the proxy route was a path with the account's
+    // username and password in it. redactConfigInPath covers the request path;
+    // nothing could cover properties it never sees.
+    if (status >= 500) console.error(`[error] ${where}:`, err?.stack || String(err));
     else console.warn(`[error] ${where}: ${err?.message}`);
 
     // Once the body has started there is no status left to set, and the
@@ -3501,7 +3537,9 @@ app.use((err, req, res, next) => {
     if (res.headersSent) return next(err);
 
     res.status(status).type('text/plain').end(status < 500 ? 'bad request' : 'internal error');
-});
+}
+
+app.use(terminalErrorHandler);
 
 // Only bind the port and install process-wide handlers when run directly, so
 // `require('./index.js')` from a test can exercise the internals below without
@@ -3577,6 +3615,8 @@ module.exports = {
     getBaseUrl,
     escapeHtml,
     normalizeUrl,
+    serverInfoOrigin,
+    terminalErrorHandler,
     buildUrl,
     buildXtremioApiUrl,
     isNumericId,
