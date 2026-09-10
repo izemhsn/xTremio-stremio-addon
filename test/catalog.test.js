@@ -108,7 +108,7 @@ async function getCatalog(type, id, extra) {
         ? `${base}/${CFG}/catalog/${encodeURIComponent(type)}/${id}/${encodeURIComponent(extra)}.json`
         : `${base}/${CFG}/catalog/${encodeURIComponent(type)}/${id}.json`;
     const res = await realFetch(path);
-    return { status: res.status, body: await res.json() };
+    return { status: res.status, headers: res.headers, body: await res.json() };
 }
 
 // --- the table ------------------------------------------------------------
@@ -386,8 +386,64 @@ test('caching hints are attached to every catalog response', async () => {
         ['XT-Movies', 'xtremio_movies_new', null],
         ['XT-Series', 'xtremio_search_series', 'search=tango']
     ]) {
-        const { body } = await getCatalog(type, id, extra);
+        const { body, headers } = await getCatalog(type, id, extra);
         assert.equal(body.cacheMaxAge, 300, `${id} lost its cacheMaxAge`);
         assert.equal(body.staleRevalidate, 600, `${id} lost its staleRevalidate`);
+
+        // The body fields describe a Cache-Control header that this server has to
+        // send itself. stremio-addon-sdk derives one from them; a hand-rolled
+        // server that emits only the fields gives the client nothing to act on.
+        const cc = headers.get('cache-control');
+        assert.ok(cc, `${id} sent no Cache-Control`);
+        assert.match(cc, /max-age=300/, `${id}: header disagrees with cacheMaxAge`);
+        assert.match(cc, /stale-while-revalidate=600/, `${id}: header disagrees with staleRevalidate`);
+        // Account-specific content behind a bearer token in the path.
+        assert.match(cc, /private/, `${id} must not be marked public`);
     }
+});
+
+test('a degraded response is never cacheable', async () => {
+    // Every early return in these routes is an empty shelf or a null meta caused
+    // by a failure. Heuristic caching of one would pin a transient fault, which
+    // is the same mistake as caching an empty upstream list.
+    stubProvider();
+    clearCaches();
+
+    const cases = [
+        ['XT-Movies', 'xtremio_series_new', null],        // type/id mismatch
+        ['XT-Movies', 'no_such_catalog', null],           // unknown id
+        ['XT-Movies', 'xtremio_search_movies', 'skip=0']  // search with no term
+    ];
+    for (const [type, id, extra] of cases) {
+        const { headers, body } = await getCatalog(type, id, extra);
+        assert.deepEqual(body.metas, [], `${id} should have degraded to an empty shelf`);
+        assert.equal(headers.get('cache-control'), 'no-store', `${id} left a degraded answer cacheable`);
+    }
+});
+
+test('search results are ordered, so pagination survives a refetch', async () => {
+    // A search catalog has no variant, so it used to get no comparator at all and
+    // was served in whatever order upstream produced. That is stable only while
+    // one cached list survives: across a TTL refetch, an upstream reordering
+    // moves the page boundaries and the reader sees an item twice or not at all.
+    stubProvider();
+    clearCaches();
+    const first = await getCatalog('XT-Series', 'xtremio_search_series', 'search=a');
+
+    // Same account, list refetched and handed back in the opposite order — which
+    // is exactly what a provider is free to do across the 30-minute TTL.
+    clearCaches();
+    const reversedProvider = global.fetch;
+    global.fetch = async (url) => {
+        const res = await reversedProvider(url);
+        const json = await res.json();
+        return { ok: true, status: 200, headers: { get: () => null }, json: async () => Array.isArray(json) ? [...json].reverse() : json };
+    };
+    const second = await getCatalog('XT-Series', 'xtremio_search_series', 'search=a');
+
+    assert.deepEqual(
+        second.body.metas.map(m => m.id),
+        first.body.metas.map(m => m.id),
+        'the same search returned a different order after a refetch'
+    );
 });

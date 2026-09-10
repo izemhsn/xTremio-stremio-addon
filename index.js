@@ -1377,6 +1377,26 @@ function rawExtraSegment(req) {
 
 const PAGE_SIZE = 100;
 
+// `cacheMaxAge` and `staleRevalidate` are body fields, and in
+// stremio-addon-sdk's serveHTTP they are what the SDK *converts into* a
+// Cache-Control header. This addon is hand-rolled, so it emitted the fields and
+// no header at all: nothing downstream had anything to act on, and the 86400 on
+// movie meta was inert. This sets the header the fields were always describing,
+// and keeps the fields — they are harmless, documentary, and read directly by
+// some clients.
+//
+// `private` rather than `public` because every one of these responses is
+// account-specific and the path carries a bearer token. A shared cache keys on
+// the whole URL, so `public` would not leak between accounts, but it would put
+// credentialed content in intermediaries the operator does not control — and the
+// caching that actually matters here is the client's.
+function withCacheHints(res, cacheMaxAge, staleRevalidate) {
+    const directives = ['private', `max-age=${cacheMaxAge}`];
+    if (staleRevalidate) directives.push(`stale-while-revalidate=${staleRevalidate}`);
+    res.setHeader('Cache-Control', directives.join(', '));
+    return staleRevalidate === undefined ? { cacheMaxAge } : { cacheMaxAge, staleRevalidate };
+}
+
 // A payload that is not an array is a provider failure, not an empty catalog:
 // an overloaded Xtream panel answers `get_vod_streams` with an error object or a
 // bare `{}`. Coercing that to [] made it indistinguishable from a genuinely
@@ -2235,6 +2255,11 @@ async function selectCatalogGenre(cfg, kind, genre) {
 }
 
 app.get(['/:config/catalog/:type/:id.json', '/:config/catalog/:type/:id/:extra.json'], async (req, res) => {
+    // Degraded answers are the default: every early return below is an empty
+    // shelf or a null meta produced by a failure, and a client or intermediary
+    // applying heuristic caching to one would pin a transient fault for as long
+    // as it liked. withCacheHints overwrites this on the paths that succeeded.
+    res.setHeader('Cache-Control', 'no-store');
     const cfg = decodeConfig(req.params.config);
     if (!cfg) return res.json({ metas: [] });
 
@@ -2268,12 +2293,22 @@ app.get(['/:config/catalog/:type/:id.json', '/:config/catalog/:type/:id/:extra.j
             items = await selectCatalogGenre(cfg, kind, extra.genre);
             if (!items) return res.json({ metas: [] });
             items = filterByName(items, extra.search);
-            const comparator = catalogComparator(kind, route.variant);
-            if (comparator) items = [...items].sort(comparator);
         }
 
+        // Both branches sort, and they did not used to. A search catalog has no
+        // variant, so it got no comparator and was served in whatever order the
+        // provider happened to return — which is stable only for as long as one
+        // cached list survives. Across a TTL refetch an upstream reordering moves
+        // the page boundaries, and the reader sees an item twice or not at all.
+        // `new` is the variant chosen for search because it is a total order (it
+        // ends in the item id, like every comparator here) and "most recently
+        // added first" is the most useful ranking available behind a substring
+        // match, which carries no relevance signal of its own.
+        const comparator = catalogComparator(kind, route.search ? 'new' : route.variant);
+        if (comparator) items = [...items].sort(comparator);
+
         const metas = toCatalogMetas(items.slice(skip, skip + PAGE_SIZE), kind);
-        return res.json({ metas, cacheMaxAge: 300, staleRevalidate: 600 });
+        return res.json({ metas, ...withCacheHints(res, 300, 600) });
     } catch (e) {
         console.error('[catalog] Error:', e.message);
         res.json({ metas: [] });
@@ -2281,6 +2316,11 @@ app.get(['/:config/catalog/:type/:id.json', '/:config/catalog/:type/:id/:extra.j
 });
 
 app.get('/:config/meta/:type/:id.json', async (req, res) => {
+    // Degraded answers are the default: every early return below is an empty
+    // shelf or a null meta produced by a failure, and a client or intermediary
+    // applying heuristic caching to one would pin a transient fault for as long
+    // as it liked. withCacheHints overwrites this on the paths that succeeded.
+    res.setHeader('Cache-Control', 'no-store');
     const cfg = decodeConfig(req.params.config);
     if (!cfg) return res.json({ meta: null });
     const { id, type } = req.params;
@@ -2308,7 +2348,7 @@ app.get('/:config/meta/:type/:id.json', async (req, res) => {
                 genres: s.category_name ? [s.category_name] : [],
                 description: s.name || undefined
             };
-            return res.json({ meta, cacheMaxAge: 300 });
+            return res.json({ meta, ...withCacheHints(res, 300) });
         }
 
         if (id.startsWith('xtremio_movie_')) {
@@ -2337,7 +2377,7 @@ app.get('/:config/meta/:type/:id.json', async (req, res) => {
                 country: movie.country || undefined,
                 trailer: movie.youtube_trailer || undefined
             };
-            return res.json({ meta, cacheMaxAge: 86400 });
+            return res.json({ meta, ...withCacheHints(res, 86400) });
         }
 
         if (id.startsWith('xtremio_series_')) {
@@ -2422,7 +2462,7 @@ app.get('/:config/meta/:type/:id.json', async (req, res) => {
                 year: parseYear(series.releaseDate),
                 videos
             };
-            return res.json({ meta, cacheMaxAge: 3600 });
+            return res.json({ meta, ...withCacheHints(res, 3600) });
         }
 
         res.json({ meta: null });
@@ -2433,6 +2473,11 @@ app.get('/:config/meta/:type/:id.json', async (req, res) => {
 });
 
 app.get('/:config/stream/:type/:id.json', async (req, res) => {
+    // Degraded answers are the default: every early return below is an empty
+    // shelf or a null meta produced by a failure, and a client or intermediary
+    // applying heuristic caching to one would pin a transient fault for as long
+    // as it liked. withCacheHints overwrites this on the paths that succeeded.
+    res.setHeader('Cache-Control', 'no-store');
     const cfg = decodeConfig(req.params.config);
     if (!cfg) return res.json({ streams: [] });
     const { id, type } = req.params;
@@ -2475,7 +2520,7 @@ app.get('/:config/stream/:type/:id.json', async (req, res) => {
                         }
                     };
                 }),
-                cacheMaxAge: 3600
+                ...withCacheHints(res, 3600)
             });
         }
 
@@ -3337,6 +3382,7 @@ module.exports = {
     parseEpisodeId,
     typeMatchesId,
     catalogTypesFor,
+    withCacheHints,
     parseCatalogId,
     CATALOG_KINDS,
     catalogComparator,
