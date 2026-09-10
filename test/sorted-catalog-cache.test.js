@@ -10,35 +10,45 @@
 // as good as the moment it stops being used, and the rule here is identity — the
 // entry is reused only while the array it was derived from is still the array
 // the list cache hands back.
+//
+// Audit M-5 and L-11 then corrected the memo's lifetime and its key. Views live
+// in a WeakMap keyed by the list they were sorted from, so they cannot keep an
+// evicted list alive, and under one list they are keyed by what
+// selectCatalogSource selected rather than by the genre string a client sent.
 process.env.CONFIG_SECRET = 'test-secret-for-unit-tests';
 process.env.ALLOW_PRIVATE_NETWORKS = 'true';
 
 const test = require('node:test');
 const assert = require('node:assert');
+const v8 = require('node:v8');
+const vm = require('node:vm');
 
 const {
     app,
     encodeConfig,
+    accountCacheKey,
     CATALOG_KINDS,
     parseCatalogId,
     catalogComparator,
     sortedCatalogItems,
-    sortedCatalogCache,
-    sweepCaches,
+    sortedCatalogViews,
     catCache,
     categoryStreamsCache,
     vodStreamsCache,
     seriesStreamsCache,
-    liveStreamsCache,
-    CACHE_TTL,
-    CACHE_MAX_SORTED_CATALOGS
+    liveStreamsCache
 } = require('../index.js');
+
+// A view's lifetime is the whole of M-5, and only a collection can show it. The
+// flag is set at runtime so `npm test` needs no node options; a context created
+// after it is set gets the `gc` global.
+v8.setFlagsFromString('--expose-gc');
+const gc = vm.runInNewContext('gc');
 
 const realFetch = global.fetch;
 const DAY_MS = 86400000;
 
 const CFG_ARGS = { serverUrl: 'http://provider.test:8080', username: 'alice', password: 'secret' };
-const OTHER_ARGS = { ...CFG_ARGS, password: 'different' };
 const CFG = encodeConfig(CFG_ARGS);
 
 const MOVIE_KIND = CATALOG_KINDS.movies;
@@ -57,11 +67,27 @@ function movies(n) {
 }
 
 function sortedOf(route, items, opts = {}) {
-    const { cfg = CFG_ARGS, genre = null, source = items, now } = opts;
-    return sortedCatalogItems(cfg, MOVIE_KIND, route, genre, { items, source }, now);
+    const { source = items, selection = 'all', now } = opts;
+    return sortedCatalogItems(MOVIE_KIND, route, { items, source, selection }, now);
 }
 
-test.beforeEach(() => sortedCatalogCache.clear());
+// The keys of the views held for one source list, in insertion order.
+function viewKeys(source) {
+    const entry = sortedCatalogViews.get(source);
+    return entry ? [...entry.views.keys()] : [];
+}
+
+// True once `ref`'s target has been collected. A WeakRef holds its target until
+// the end of the job that created or dereferenced it, so each collection has to
+// run on a later turn.
+async function collected(ref) {
+    for (let i = 0; i < 10; i++) {
+        await new Promise(resolve => setImmediate(resolve));
+        gc();
+        if (ref.deref() === undefined) return true;
+    }
+    return false;
+}
 
 // --- memoisation ----------------------------------------------------------
 
@@ -75,7 +101,7 @@ test('the same shelf, asked twice, is sorted once', () => {
     // Identity, not deepEqual: a second sort would produce an equal array, so
     // only reference equality distinguishes a memo hit from a repeat of the work.
     assert.strictEqual(second, first, 'the second request re-sorted the list');
-    assert.equal(sortedCatalogCache.size, 1);
+    assert.deepStrictEqual(viewKeys(items), ['new\nall']);
 });
 
 test('the memoised order is the order the sort produces', () => {
@@ -113,10 +139,13 @@ test('a refetched list invalidates the sorted view in the same instant', () => {
 
     assert.notStrictEqual(second, first);
     assert.equal(second[0].stream_id, 999, 'the newest item from the refetched list should lead');
-    assert.equal(sortedCatalogCache.size, 1, 'the stale entry should be replaced, not accumulated');
+    assert.deepStrictEqual(viewKeys(refetched), ['new\nall']);
 });
 
 test('an equal-but-different array is not treated as the same source', () => {
+    // This is also what separates two accounts: every list cache is keyed by
+    // account, so two accounts' lists are two arrays even when their contents
+    // agree.
     const route = parseCatalogId('xtremio_movies_new');
     const items = movies(10);
     const clone = movies(10);
@@ -129,32 +158,40 @@ test('an equal-but-different array is not treated as the same source', () => {
 
 // --- key separation -------------------------------------------------------
 
-test('every coordinate of the key separates two shelves', () => {
+test('variant and selection separate views over one source; search does not', () => {
     const items = movies(30);
     const now = Date.UTC(2026, 0, 1, 12);
     const newRoute = parseCatalogId('xtremio_movies_new');
-    const featured = parseCatalogId('xtremio_movies_featured');
+    const popular = parseCatalogId('xtremio_movies_popular');
     const search = parseCatalogId('xtremio_search_movies');
 
     const base = sortedOf(newRoute, items, { now });
-    const byVariant = sortedOf(featured, items, { now });
-    const byGenre = sortedOf(newRoute, items, { genre: 'Action', now });
-    const byAccount = sortedOf(newRoute, items, { cfg: OTHER_ARGS, now });
-    const byDay = sortedOf(featured, items, { now: now + DAY_MS });
+    const byVariant = sortedOf(popular, items, { now });
+    const bySelection = sortedOf(newRoute, items.filter(s => s.rating === 1), {
+        source: items, selection: 'category:20', now
+    });
+    assert.notStrictEqual(byVariant, base, 'the variant did not separate the views');
+    assert.notStrictEqual(bySelection, base, 'the selection did not separate the views');
+    assert.equal(bySelection.length, 6, 'a category view was served the whole list');
 
-    // A search shelf and a genre-less browse shelf share account, kind, variant
-    // and an empty genre — but a genre-less browse shelf falls back to the first
-    // category while search spans everything, so they are different arrays under
-    // otherwise identical coordinates and must not share an entry.
-    const bySearch = sortedOf(search, items, { now });
+    // Search over the full list is sorted `new`, which is exactly the view the
+    // no-categories shelf already holds — one sort, not two.
+    assert.strictEqual(sortedOf(search, items, { now }), base);
 
-    for (const [label, other] of [
-        ['variant', byVariant], ['genre', byGenre], ['account', byAccount], ['search', bySearch]
-    ]) {
-        assert.notStrictEqual(other, base, `${label} did not separate the entries`);
-    }
-    assert.notStrictEqual(byDay, byVariant, 'the day did not separate the featured entries');
-    assert.equal(sortedCatalogCache.size, 6);
+    assert.deepStrictEqual(viewKeys(items), ['new\nall', 'popular\nall', 'new\ncategory:20']);
+});
+
+test("a new day drops the previous day's views", () => {
+    const items = movies(30);
+    const t0 = Date.UTC(2026, 0, 1, 12);
+    sortedOf(parseCatalogId('xtremio_movies_featured'), items, { now: t0 });
+    sortedOf(parseCatalogId('xtremio_movies_new'), items, { now: t0 });
+    assert.equal(viewKeys(items).length, 2);
+
+    // A list can stay cached across midnight; yesterday's featured order must not
+    // stay with it.
+    sortedOf(parseCatalogId('xtremio_movies_featured'), items, { now: t0 + DAY_MS });
+    assert.deepStrictEqual(viewKeys(items), ['featured\nall']);
 });
 
 test("the featured shuffle still changes with the day, through the cache", () => {
@@ -185,27 +222,25 @@ test('an unsorted shelf is passed through and caches nothing', () => {
     // would spend memory to remember the identity function.
     const route = parseCatalogId('xtremio_live');
     const items = [{ stream_id: 3 }, { stream_id: 1 }];
-    const out = sortedCatalogItems(CFG_ARGS, CATALOG_KINDS.live, route, null, { items, source: items });
+    const out = sortedCatalogItems(CATALOG_KINDS.live, route, { items, source: items, selection: 'all' });
 
     assert.strictEqual(out, items);
-    assert.equal(sortedCatalogCache.size, 0);
+    assert.equal(sortedCatalogViews.has(items), false);
 });
 
-// --- bounds ---------------------------------------------------------------
+// --- lifetime (M-5) -------------------------------------------------------
 
-test('the cache is bounded and swept like every other cache', () => {
+test('a view does not keep the list it was sorted from alive', async () => {
+    // The memo used to hold `source` in an entry of its own, so a list the stream
+    // cache evicted stayed reachable for as long as its view did.
     const route = parseCatalogId('xtremio_movies_new');
-    const items = movies(5);
-    for (let i = 0; i < CACHE_MAX_SORTED_CATALOGS + 10; i++) {
-        sortedOf(route, items, { genre: `Genre ${i}` });
-    }
-    assert.ok(sortedCatalogCache.size <= CACHE_MAX_SORTED_CATALOGS,
-        `held ${sortedCatalogCache.size} entries against a bound of ${CACHE_MAX_SORTED_CATALOGS}`);
+    let list = movies(1000);
+    const listRef = new WeakRef(list);
+    const viewRef = new WeakRef(sortedOf(route, list));
+    list = null;
 
-    // An entry pins the whole list it was sorted from, so an instance whose users
-    // have gone away must not hold one until something new arrives.
-    sweepCaches(Date.now() + CACHE_TTL + 1);
-    assert.equal(sortedCatalogCache.size, 0, 'sortedCatalogCache is missing from sweepCaches');
+    assert.ok(await collected(listRef), 'the sorted view kept its source list reachable');
+    assert.ok(await collected(viewRef), 'the view outlived the list it was sorted from');
 });
 
 // --- through the route ----------------------------------------------------
@@ -222,12 +257,18 @@ function stubProvider() {
     global.fetch = async (url) => {
         const u = new URL(url);
         const action = u.searchParams.get('action');
+        const categoryId = u.searchParams.get('category_id');
         let data = [];
         if (action === 'get_vod_categories') data = CATS.movies;
         else if (action === 'get_series_categories') data = CATS.series;
         else if (action === 'get_live_categories') data = CATS.live;
-        else if (action === 'get_vod_streams') data = provided;
-        return { ok: true, status: 200, headers: { get: () => null }, json: async () => data };
+        else if (action === 'get_vod_streams') {
+            data = categoryId ? provided.filter(s => String(s.category_id) === categoryId) : provided;
+        }
+        // A fresh array per response, as a parsed body is. Handing back `provided`
+        // itself would let this module hold the cached list, and the eviction
+        // test below could never see it collected.
+        return { ok: true, status: 200, headers: { get: () => null }, json: async () => [...data] };
     };
 }
 
@@ -239,8 +280,13 @@ function clearCaches() {
     vodStreamsCache.map.clear();
     seriesStreamsCache.map.clear();
     liveStreamsCache.map.clear();
-    sortedCatalogCache.clear();
 }
+
+function cachedCategoryList(categoryId) {
+    return categoryStreamsCache.get(`${accountCacheKey(CFG_ARGS)}\n${MOVIE_KIND.categoryAction}\n${categoryId}`);
+}
+
+const idsOf = shelf => shelf.metas.map(m => Number(m.id.replace('xtremio_movie_', '')));
 
 let server;
 let base;
@@ -281,8 +327,9 @@ test('paginating a shelf sorts once and pages consistently', async () => {
     const added = ids.map(id => Number(id.replace('xtremio_movie_', '')));
     assert.deepStrictEqual(added, [...added].sort((a, b) => b - a));
 
-    // One sorted view for the shelf, reused by all three pages.
-    assert.equal(sortedCatalogCache.size, 1);
+    // One sorted view for the shelf, reused by all three pages. The full list is
+    // cold, so the genre-less shelf was served from its first category's list.
+    assert.deepStrictEqual(viewKeys(cachedCategoryList(20)), ['new\ncategory:20']);
 });
 
 test('search is filtered from the sorted list and returns the same items as before', async () => {
@@ -306,14 +353,26 @@ test('search is filtered from the sorted list and returns the same items as befo
 test('a genre shelf and the search shelf do not serve each other', async () => {
     stubProvider();
     clearCaches();
-    provided = movies(250);
+    // Odd ids go to a category the account does not list, so a genre shelf and a
+    // search select visibly different items.
+    provided = movies(250).map(s => (s.stream_id % 2 ? { ...s, category_id: 21 } : s));
+    const isEven = id => id % 2 === 0;
 
-    const genreShelf = await getCatalog('xtremio_movies_new', 'genre=Action');
-    const searchShelf = await getCatalog('xtremio_search_movies', 'search=Movie');
+    // Search first, so the genre shelf is filtered from the same warm full list:
+    // one source, and only the selection tells the two views apart.
+    const warmSearch = await getCatalog('xtremio_search_movies', 'search=Movie');
+    const warmGenre = await getCatalog('xtremio_movies_new', 'genre=Action');
+    assert.ok(!idsOf(warmSearch).every(isEven), 'search should span both categories');
+    assert.ok(idsOf(warmGenre).every(isEven), 'the genre shelf was served the search view');
+    assert.deepStrictEqual(viewKeys(vodStreamsCache.get(CFG_ARGS)), ['new\nall', 'new\ncategory:20']);
 
-    assert.equal(genreShelf.metas.length, 100);
-    assert.equal(searchShelf.metas.length, 100);
-    assert.equal(sortedCatalogCache.size, 2, 'the two shelves shared one entry');
+    // And the other way round, where the genre shelf comes from a per-category
+    // fetch and the two views sit on different sources.
+    clearCaches();
+    const coldGenre = await getCatalog('xtremio_movies_new', 'genre=Action');
+    const coldSearch = await getCatalog('xtremio_search_movies', 'search=Movie');
+    assert.ok(idsOf(coldGenre).every(isEven), 'the genre shelf was served the search view');
+    assert.ok(!idsOf(coldSearch).every(isEven), 'search was served the genre view');
 });
 
 test('a list refetched after its TTL is served, not the memoised old order', async () => {
@@ -327,7 +386,7 @@ test('a list refetched after its TTL is served, not the memoised old order', asy
     // The provider gains a title and the lists behind the shelf expire — both of
     // them, because a genre-less shelf resolves to the first category and is
     // served from the per-category cache when the full list is cold. The sorted
-    // view is deliberately *not* cleared: identity is what has to catch this, and
+    // view is deliberately *not* touched: identity is what has to catch this, and
     // if it does not, the new title is invisible for the life of the memo.
     provided = movies(10).concat({
         stream_id: 999, name: 'Newest', category_id: 20, added: 99999, rating: 5
@@ -338,4 +397,60 @@ test('a list refetched after its TTL is served, not the memoised old order', asy
     const after = await getCatalog('xtremio_movies_new', 'skip=0');
     assert.equal(after.metas.length, 11);
     assert.equal(after.metas[0].id, 'xtremio_movie_999', 'served a sorted view of the old list');
+});
+
+// --- L-11: the key is what was selected, not what was asked for -----------
+
+test('a genre that search ignores does not mint a view per distinct string', async () => {
+    stubProvider();
+    clearCaches();
+    provided = movies(250);
+
+    // What the audit reproduced: 64 searches, each with a different ignored genre,
+    // filled a cache every account shared with sorts of one list.
+    for (let i = 0; i < 20; i++) {
+        const page = await getCatalog('xtremio_search_movies', `search=Movie&genre=ignored-${i}`);
+        assert.equal(page.metas.length, 100);
+    }
+    assert.deepStrictEqual(viewKeys(vodStreamsCache.get(CFG_ARGS)), ['new\nall']);
+});
+
+test('a kind with no categories holds one view whatever genre is sent, shared with search', async () => {
+    const listed = CATS.movies;
+    CATS.movies = [];
+    try {
+        stubProvider();
+        clearCaches();
+        provided = movies(250);
+
+        // The degraded shelf serves the full list for any genre, advertised or not.
+        for (const extra of ['genre=Action', 'genre=anything-at-all', `genre=${'x'.repeat(40)}`]) {
+            const page = await getCatalog('xtremio_movies_new', extra);
+            assert.equal(page.metas.length, 100, `${extra} should serve the full list`);
+        }
+        assert.equal((await getCatalog('xtremio_movies_new')).metas.length, 100);
+        assert.equal((await getCatalog('xtremio_search_movies', 'search=Movie')).metas.length, 100);
+
+        assert.deepStrictEqual(viewKeys(vodStreamsCache.get(CFG_ARGS)), ['new\nall']);
+    } finally {
+        CATS.movies = listed;
+    }
+});
+
+// --- M-5 through the route ------------------------------------------------
+
+test('evicting a stream list releases it, sorted views and all', async () => {
+    stubProvider();
+    clearCaches();
+    provided = movies(2000);
+
+    await getCatalog('xtremio_search_movies', 'search=Movie');
+    await getCatalog('xtremio_movies_popular', 'genre=Action');
+    const listRef = new WeakRef(vodStreamsCache.get(CFG_ARGS));
+    assert.deepStrictEqual(viewKeys(listRef.deref()), ['new\nall', 'popular\ncategory:20']);
+
+    // What the stream cache does to stay within CACHE_MAX_STREAM_MB.
+    vodStreamsCache.map.clear();
+    assert.ok(await collected(listRef),
+        'an evicted list stayed reachable — the stream cache bound no longer bounds memory');
 });

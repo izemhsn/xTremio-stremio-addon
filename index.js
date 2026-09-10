@@ -1101,15 +1101,6 @@ const CACHE_MAX_SERIES_INFO = Math.max(1, Number(process.env.CACHE_MAX_SERIES_IN
 // kilobytes, not megabytes — so this bound is about entry count, not size.
 const CACHE_MAX_VOD_INFO = Math.max(1, Number(process.env.CACHE_MAX_VOD_INFO) || 500);
 
-// Sorted catalog views: one entry per account / kind / variant / genre / day.
-// An entry holds an array of the *same* item objects the list cache already
-// holds, so it costs one machine word per item, not a second copy of the list —
-// but it does keep that list reachable, which is why the count is bounded and
-// the entries are swept on the ordinary TTL rather than left to the LRU alone.
-// 340 live genres is a real number for one account, so this is sized for a user
-// browsing widely, not for one shelf.
-const CACHE_MAX_SORTED_CATALOGS = Math.max(1, Number(process.env.CACHE_MAX_SORTED_CATALOGS) || 64);
-
 // Per-category stream lists: one entry per category per account. Each is a
 // slice of the full list, so a few hundred KB at most, but the count grows with
 // every genre a user opens.
@@ -1308,10 +1299,17 @@ const seriesStreamsCache = createStreamListCache();
 // refetch invalidates the sorted view in the same instant, with no window in
 // which the two could disagree. A TTL of its own could only be wrong in one
 // direction or the other.
-const sortedCatalogCache = new BoundedMap({
-    maxEntries: CACHE_MAX_SORTED_CATALOGS,
-    maxAgeMs: CACHE_TTL
-});
+//
+// That identity is also what the views are keyed by — a WeakMap from the source
+// array — so a view lives exactly as long as the list it was sorted from. This
+// was a BoundedMap of its own, and an entry holding `source` kept a list
+// reachable after the stream cache had evicted it to stay within its budget:
+// with CACHE_MAX_STREAM_ACCOUNTS=1, six accounts opening one shelf each held
+// ~94 MB the stream cache had already let go of. It needs no count, TTL or sweep
+// of its own, because the list caches already bound the lists, and a view adds
+// one machine word per item it holds. Each source maps to `{ day, views }`; see
+// sortedCatalogItems.
+const sortedCatalogViews = new WeakMap();
 
 // Signing-time vetting of the origins named in an HLS playlist. This was memoised
 // per rewrite pass, which helped within one playlist and not at all across them —
@@ -1525,7 +1523,6 @@ function sweepCaches(now = Date.now()) {
         + liveStreamsCache.map.sweep(now)
         + vodStreamsCache.map.sweep(now)
         + seriesStreamsCache.map.sweep(now)
-        + sortedCatalogCache.sweep(now)
         + hlsOriginVetCache.sweep(now);
 }
 
@@ -2271,11 +2268,15 @@ function toCatalogMetas(items, kind) {
 
 // Items for one genre, or null when the genre does not resolve to a category.
 // Resolves a genre to its items *and* to the cached array they were derived
-// from. The second half is what lets the sorted view above be invalidated by
+// from. The second half is what lets the sorted view be invalidated by
 // identity: a genre shelf is usually a fresh `.filter()` of the full list, so
 // the items array is new on every request and says nothing about whether the
 // underlying data changed — but the array it was filtered from is the one the
 // list cache holds, and that is replaced only by a refetch.
+//
+// `selection` names which subset of `source` the items are, as resolved here:
+// 'all', or the category. The sorted view is keyed on it rather than on the
+// genre the request carried, because the no-categories path ignores that genre.
 //
 // `selectCatalogGenre` below is the plain-items form, kept because it is the
 // exported surface and the shape the rest of the file describes.
@@ -2290,7 +2291,7 @@ async function selectCatalogSource(cfg, kind, genre) {
     if (!categories.length) {
         console.warn(`[catalog] no ${kind.categoryKey} categories; serving the full list`);
         const all = await kind.loadAll(cfg);
-        return { items: all, source: all };
+        return { items: all, source: all, selection: 'all' };
     }
     // Stremio marks genre required, but a bare catalog request still falls back
     // to the first category rather than showing an empty shelf.
@@ -2308,19 +2309,22 @@ async function selectCatalogSource(cfg, kind, genre) {
                 if (s.category_id != null && s.category_id !== '') return String(s.category_id) === catIdStr;
                 return genreLower && String(s.category_name || '').toLowerCase() === genreLower;
             }),
-            source: all
+            source: all,
+            // The name takes part in this filter, so it takes part in the selection.
+            selection: `category:${catIdStr}\n${genreLower}`
         };
     }
 
+    const selection = `category:${catIdStr}`;
     // Reuse the warm full list when there is one; otherwise a per-category fetch
     // beats pulling 10-50 MB just to filter it down.
     const fullList = kind.listCache.get(cfg);
     if (fullList) {
-        return { items: fullList.filter(s => String(s.category_id) === catIdStr), source: fullList };
+        return { items: fullList.filter(s => String(s.category_id) === catIdStr), source: fullList, selection };
     }
     // The per-category list is itself cached, so it is its own identity token.
     const catList = await getCategoryStreams(cfg, kind.categoryAction, catIdStr);
-    return { items: catList, source: catList };
+    return { items: catList, source: catList, selection };
 }
 
 async function selectCatalogGenre(cfg, kind, genre) {
@@ -2329,34 +2333,42 @@ async function selectCatalogGenre(cfg, kind, genre) {
 }
 
 // The sorted view of one shelf, memoised against the identity of the list it was
-// derived from (see sortedCatalogCache). Returns `items` untouched when the
+// derived from (see sortedCatalogViews). Returns `items` untouched when the
 // variant has no comparator — the live shelf and any unsorted kind — so nothing
 // is cached for a shelf whose order was never computed in the first place.
 //
-// The search branch keys separately from the plain shelf even though both may
-// carry an empty genre: a genre-less shelf falls back to the *first* category
-// inside selectCatalogSource, while search always spans the full list, so the
-// two are different arrays under otherwise identical coordinates.
-function sortedCatalogItems(cfg, kind, route, genre, { items, source }, now = Date.now()) {
+// Under one source, a view is keyed by the variant and by `selection`, the subset
+// selectCatalogSource resolved — never by the genre string the request carried.
+// Search and a kind with no categories ignore the genre, so keying on it let
+// every distinct string mint a fresh sort of the same list, and while the views
+// shared one LRU across accounts, one token holder could evict everyone else's.
+// Keyed by what was selected, the views a source can have are bounded by its own
+// account's categories, and a search shares its view with the no-categories
+// shelf, which is the same list sorted the same way.
+//
+// Account and kind are not in the key because the source already implies them:
+// every list cache is keyed by account, and each kind has its own.
+function sortedCatalogItems(kind, route, { items, source, selection }, now = Date.now()) {
     const variant = route.search ? 'new' : route.variant;
     const comparator = catalogComparator(kind, variant, now);
     if (!comparator) return items;
 
-    const key = [
-        accountCacheKey(cfg),
-        route.kind,
-        route.search ? `search:${variant}` : variant,
-        genre || '',
-        Math.floor(now / 86400000)
-    ].join('\n');
+    // The featured order is seeded on the day, and a list that stays cached
+    // across midnight must not keep yesterday's views alongside today's.
+    const day = Math.floor(now / 86400000);
+    let entry = sortedCatalogViews.get(source);
+    if (!entry || entry.day !== day) {
+        entry = { day, views: new Map() };
+        sortedCatalogViews.set(source, entry);
+    }
 
-    const hit = sortedCatalogCache.get(key);
-    // Identity, not equality: a refetched list is a different array even when it
-    // holds the same records, and that is exactly when the sort must be redone.
-    if (hit && hit.source === source) return hit.sorted;
+    // `variant` never contains a newline, so the selection cannot shift into it.
+    const key = `${variant}\n${selection}`;
+    const hit = entry.views.get(key);
+    if (hit) return hit;
 
     const sorted = [...items].sort(comparator);
-    sortedCatalogCache.set(key, { source, sorted, ts: now });
+    entry.views.set(key, sorted);
     return sorted;
 }
 
@@ -2395,7 +2407,7 @@ app.get(['/:config/catalog/:type/:id.json', '/:config/catalog/:type/:id/:extra.j
             // in-memory filter. This is what makes search cheap.
             if (!extra.search) return res.json({ metas: [] });
             const all = await kind.loadAll(cfg);
-            selected = { items: all, source: all };
+            selected = { items: all, source: all, selection: 'all' };
         } else {
             selected = await selectCatalogSource(cfg, kind, extra.genre);
             if (!selected) return res.json({ metas: [] });
@@ -2419,7 +2431,7 @@ app.get(['/:config/catalog/:type/:id.json', '/:config/catalog/:type/:id/:extra.j
         // term, which is what makes it memoisable at all. Keying a cache by a
         // caller-supplied search string would be an unbounded key space.
         const items = filterByName(
-            sortedCatalogItems(cfg, kind, route, extra.genre, selected),
+            sortedCatalogItems(kind, route, selected),
             extra.search
         );
 
@@ -3581,8 +3593,7 @@ module.exports = {
     selectCatalogGenre,
     selectCatalogSource,
     sortedCatalogItems,
-    sortedCatalogCache,
-    CACHE_MAX_SORTED_CATALOGS,
+    sortedCatalogViews,
     normalizeContainerExt,
     isNotWebReady,
     normalizeAcceptRanges,
