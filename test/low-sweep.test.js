@@ -337,14 +337,51 @@ test('GET /configure ignores loose credential query parameters', async () => {
     assert.match(html, /name="password" value=""/);
 });
 
-test('GET /configure still prefills from an encrypted config token', async () => {
-    // The one form of this URL that is safe to hand around, and the flow the
-    // install link depends on — dropping the loose params must not break it.
-    const res = await realFetch(`${base}/configure?config=${CFG}`);
-    const html = await res.text();
-    assert.ok(html.includes(providerBase.replace(/&/g, '&amp;')), 'server url prefilled');
+// --- M-4 / L-12: a token never gives its password back -----------------------
+
+// PASSWORD is a single letter, which any HTML page contains; asserting absence
+// needs a value that cannot turn up by accident.
+const DISTINCT_PASSWORD = 'Sup3r-S3cret-Passw0rd';
+
+function assertPrefilledWithoutPassword(html) {
+    assert.ok(html.includes(providerBase), 'server url prefilled');
     assert.match(html, new RegExp(`name="username" value="${USERNAME}"`));
-    assert.match(html, new RegExp(`name="password" value="${PASSWORD}"`));
+    assert.match(html, /name="password" value=""/);
+    assert.ok(!html.includes(DISTINCT_PASSWORD), 'the password must not appear anywhere on the page');
+}
+
+test('GET /configure prefills from a token, but never the password', async () => {
+    // The token is the install URL Stremio stores and syncs. Rendering its
+    // password into the form made this page decrypt it for whoever held one.
+    const token = encodeConfig({ serverUrl: providerBase, username: USERNAME, password: DISTINCT_PASSWORD });
+    const res = await realFetch(`${base}/configure?config=${token}`);
+    assertPrefilledWithoutPassword(await res.text());
+});
+
+test('GET /:config/configure, where Stremio\'s Configure button lands, serves the same page', async () => {
+    const token = encodeConfig({ serverUrl: providerBase, username: USERNAME, password: DISTINCT_PASSWORD });
+    const res = await realFetch(`${base}/${token}/configure`);
+    assert.equal(res.status, 200);
+    assertPrefilledWithoutPassword(await res.clone().text());
+
+    // It is the credential page, so it carries that page's headers — and not the
+    // wildcard the addon resources under the same token prefix get.
+    assert.equal(res.headers.get('cache-control'), 'no-store');
+    assert.match(res.headers.get('content-security-policy') || '', /frame-ancestors 'none'/);
+    assert.equal(res.headers.get('access-control-allow-origin'), null);
+
+    // A form without an action would POST back to /<token>/configure, which has
+    // no handler.
+    assert.match(await res.text(), /<form method="POST" action="\/configure">/);
+});
+
+test('GET /:config/configure with an undecodable token renders the empty form', async () => {
+    const res = await realFetch(`${base}/not-a-real-token/configure`);
+    const html = await res.text();
+    assert.equal(res.status, 200);
+    assert.match(html, /name="serverUrl" value=""/);
+    assert.match(html, /name="username" value=""/);
+    assert.match(html, /name="password" value=""/);
 });
 
 // --- L-8: a rejection is as fatal as a throw ---------------------------------

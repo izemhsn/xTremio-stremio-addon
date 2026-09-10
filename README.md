@@ -107,6 +107,7 @@ instead of a stack trace with filesystem paths.
 | `/` | Landing page with project overview and install CTA |
 | `/health` | Health probe. `200 {"status":"ok"}` normally; `503 {"status":"shutting_down"}` once a shutdown signal has been received, so a load balancer drains this instance before it stops serving. |
 | `/configure` | HTML form to enter Xtream credentials and get an install link (includes disclaimer banner) |
+| `/:config/configure` | The same form, opened by Stremio's **Configure** button on an installed addon. Prefills the server URL and username from the token; the password must be entered again |
 | `/manifest.json` | Unconfigured Stremio manifest |
 | `/:config/manifest.json` | Configured manifest with populated genres |
 | `/:config/catalog/:type/:id/:extra?.json` | Catalog items |
@@ -133,8 +134,10 @@ an error — Stremio surfaces raw errors to the user.
 
 - No server-side database — every request carries the config in its URL.
 - Multiple users can share the same deployed instance without interfering.
-- Tokens are opaque to the holder, but they are **bearer credentials**: anyone with the install
-  URL can stream through your instance using your provider account. Treat it like a password.
+- A token does not give its password back: reconfiguring from one prefills the server URL and
+  username, but asks for the password again. Tokens are still **bearer credentials**: anyone
+  with the install URL can stream through your instance using your provider account. Treat it
+  like a password.
 - Tokens are only decryptable by the instance that issued them. Move to a new host and you must
   carry `CONFIG_SECRET` across, or reissue every install URL.
 

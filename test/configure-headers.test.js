@@ -181,6 +181,6 @@ test('a page rendered without a nonce still renders', () => {
     // renderConfigPage is exported and called from tests; a missing nonce must
     // degrade to a page whose link is still selectable, not throw.
     const html = renderConfigPage({});
-    assert.match(html, /<form method="POST">/);
+    assert.match(html, /<form method="POST" action="\/configure">/);
     assert.doesNotMatch(html, /undefined/);
 });

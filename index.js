@@ -1907,7 +1907,7 @@ function renderConfigPage({ serverUrl = '', username = '', password = '', status
                         <li>Credentials are encrypted into your install URL &mdash; keep it private, do not share it.</li>
                     </ul>
                 </div>
-                <form method="POST">
+                <form method="POST" action="/configure">
                     <div class="input-group">
                         <label>Server URL</label>
                         <div class="input-wrapper">
@@ -1937,7 +1937,7 @@ function renderConfigPage({ serverUrl = '', username = '', password = '', status
     </body></html>`;
 }
 
-// The configure page echoes back the password and embeds the install token.
+// The configure page echoes back a submitted password and embeds the install token.
 // Keep it out of shared caches, browser history, and outbound Referer headers.
 //
 // The framing and CSP headers are the backstop behind the escapeHtml discipline
@@ -2029,19 +2029,32 @@ function rateLimitConfigure(req) {
 // used to accept serverUrl, username and password as loose query parameters
 // too. They were escaped, so it was never XSS — but it invited a URL with a
 // plaintext password into browser history, referrer chains, proxy logs and
-// anything that shoulder-surfs an address bar. The token is the one form of
-// this URL that is safe to hand around, so it is the only one accepted.
-app.get('/configure', (req, res) => {
+// anything that shoulder-surfs an address bar.
+//
+// Even from a token, only the server URL and username are prefilled. The token
+// is the install URL Stremio stores and syncs, and rendering its password into
+// the form made this page decrypt it for whoever held one — handing out a
+// password that works against the provider directly, bypasses this server and
+// survives a CONFIG_SECRET rotation. Reconfiguring costs retyping one field.
+function sendConfigurePage(req, res, token) {
     const nonce = setPrivateHeaders(res);
-    const existing = decodeConfig(req.query.config) || {};
+    const existing = decodeConfig(token) || {};
     res.send(renderConfigPage({
         serverUrl: existing.serverUrl || '',
         username: existing.username || '',
-        password: existing.password || '',
         baseUrl: getBaseUrl(req),
         nonce
     }));
-});
+}
+
+app.get('/configure', (req, res) => sendConfigurePage(req, res, req.query.config));
+
+// Stremio's Configure button on an installed addon swaps manifest.json for
+// `configure` in the transport URL, so it lands here and not on /configure. An
+// undecodable token renders the empty form, as the bare route does. The form
+// names /configure as its action because a bare POST from this path would go to
+// /<token>/configure, which has no handler.
+app.get('/:config/configure', (req, res) => sendConfigurePage(req, res, req.params.config));
 
 app.post('/configure', async (req, res) => {
     const nonce = setPrivateHeaders(res);

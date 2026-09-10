@@ -183,7 +183,7 @@ test('the addon protocol keeps its wildcard, the rest does not', () => {
     }
     // These do not: /configure handles plaintext credentials, and the landing
     // page and health probe are read by people and orchestrators.
-    for (const path of ['/configure', '/', '/health', '/tok/proxy/movie/1.mp4']) {
+    for (const path of ['/configure', '/tok/configure', '/', '/health', '/tok/proxy/movie/1.mp4']) {
         assert.equal(corsApplies(path), false, `${path} must not be wildcarded`);
     }
 });
