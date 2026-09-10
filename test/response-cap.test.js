@@ -101,3 +101,79 @@ test('the default cap is generous enough for a large real provider', () => {
     // comfortably or legitimate providers break.
     assert.ok(MAX_UPSTREAM_BYTES >= 32 * 1024 * 1024, `cap is ${MAX_UPSTREAM_BYTES}`);
 });
+
+// --- transient peak while parsing (audit L-5) -------------------------------
+//
+// `JSON.parse(Buffer.concat(chunks).toString('utf8'))` reads as one step but
+// allocates three full copies of the body, and writing it as one expression
+// keeps every one of them reachable until the last returns: `chunks` is live
+// through both the concat and the stringify, and the concatenated buffer is live
+// through the parse. At MAX_UPSTREAM_BYTES that is a ~256 MB peak for a 64 MB
+// catalog — the spike that OOMs a small container, which no steady-state budget
+// describes.
+
+// Streams a body as several chunks, so the concat has something real to join.
+function chunkedResponse(text, chunkSize) {
+    const buf = Buffer.from(text, 'utf8');
+    let offset = 0;
+    return {
+        ok: true,
+        status: 200,
+        headers: { get: () => null },
+        body: {
+            getReader: () => ({
+                async read() {
+                    if (offset >= buf.length) return { done: true, value: undefined };
+                    const value = buf.subarray(offset, offset + chunkSize);
+                    offset += chunkSize;
+                    return { done: false, value };
+                },
+                async cancel() {}
+            })
+        },
+        json: async () => { throw new Error('json() should not be used when a body is present'); }
+    };
+}
+
+test('a body split across many chunks parses to exactly the same value', async () => {
+    // Releasing the chunk array must not disturb what was read from it. Split at
+    // 7 bytes so boundaries land inside tokens rather than between them.
+    const value = Array.from({ length: 200 }, (_, i) => ({ stream_id: i, name: `Title ${i}` }));
+    const res = chunkedResponse(JSON.stringify(value), 7);
+    assert.deepStrictEqual(await readJsonCapped(res, 'test', 1024 * 1024), value);
+});
+
+test('a multi-byte character split across a chunk boundary survives', async () => {
+    // Decoding per chunk rather than after the concat would corrupt this. The
+    // release only moves references; it must not move the decode.
+    const value = { name: '✪ CANAL+ SPORT — Ω' };
+    const text = JSON.stringify(value);
+    for (let chunkSize = 1; chunkSize <= 4; chunkSize++) {
+        const res = chunkedResponse(text, chunkSize);
+        assert.deepStrictEqual(await readJsonCapped(res, 'test', 1024), value, `chunk size ${chunkSize}`);
+    }
+});
+
+test('each copy of the body is released before the next is allocated', () => {
+    // Asserted on the source, because the property is about *reachability* and
+    // nothing observable from outside the function can distinguish a peak of two
+    // copies from a peak of four — a GC that happens not to run leaves the same
+    // heap either way. The shape is the guarantee, so the shape is what is
+    // pinned: chunks emptied before the stringify, buffer dropped before the
+    // parse. Written as one expression again, this would silently regress.
+    const src = require('node:fs').readFileSync(require.resolve('../index.js'), 'utf8');
+    const body = src.slice(src.indexOf('async function readJsonCapped'));
+    const fn = body.slice(0, body.indexOf('\n}\n'));
+
+    const concat = fn.indexOf('Buffer.concat(chunks)');
+    const drop = fn.indexOf('chunks.length = 0');
+    const stringify = fn.indexOf(".toString('utf8')");
+    const release = fn.indexOf('buf = null');
+    const parse = fn.indexOf('JSON.parse(');
+
+    assert.ok(concat > 0 && drop > 0 && stringify > 0 && release > 0 && parse > 0,
+        'readJsonCapped no longer has the staged shape this test describes');
+    assert.ok(drop > concat && drop < stringify, 'chunks must be released between the concat and the stringify');
+    assert.ok(release > stringify && release < parse, 'the buffer must be released between the stringify and the parse');
+    assert.ok(!/JSON\.parse\(Buffer\.concat/.test(fn), 'the one-expression form keeps every copy alive');
+});

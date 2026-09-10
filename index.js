@@ -877,7 +877,20 @@ async function readJsonCapped(res, label, maxBytes = MAX_UPSTREAM_BYTES) {
         }
         chunks.push(Buffer.from(value));
     }
-    return JSON.parse(Buffer.concat(chunks).toString('utf8'));
+    // Written as four statements rather than one expression because each step
+    // allocates a full copy of the body and the references are what decide how
+    // many of them are alive at once. `Buffer.concat(chunks).toString()` keeps
+    // `chunks` reachable through the concat *and* the stringify, and the buffer
+    // reachable through JSON.parse, so a 64 MB body peaks at four copies.
+    // Dropping each reference as soon as the next copy exists holds the peak to
+    // two: the parse sees the string and the object graph, and nothing else.
+    // One full copy plus the parsed graph is the floor for a non-incremental
+    // parser; this only stops paying for the copies already spent.
+    let buf = Buffer.concat(chunks);
+    chunks.length = 0;
+    const text = buf.toString('utf8');
+    buf = null;
+    return JSON.parse(text);
 }
 
 async function xtremioGet(cfg, action, params = {}, { timeoutMs = 15000 } = {}) {
@@ -1088,6 +1101,15 @@ const CACHE_MAX_SERIES_INFO = Math.max(1, Number(process.env.CACHE_MAX_SERIES_IN
 // kilobytes, not megabytes — so this bound is about entry count, not size.
 const CACHE_MAX_VOD_INFO = Math.max(1, Number(process.env.CACHE_MAX_VOD_INFO) || 500);
 
+// Sorted catalog views: one entry per account / kind / variant / genre / day.
+// An entry holds an array of the *same* item objects the list cache already
+// holds, so it costs one machine word per item, not a second copy of the list —
+// but it does keep that list reachable, which is why the count is bounded and
+// the entries are swept on the ordinary TTL rather than left to the LRU alone.
+// 340 live genres is a real number for one account, so this is sized for a user
+// browsing widely, not for one shelf.
+const CACHE_MAX_SORTED_CATALOGS = Math.max(1, Number(process.env.CACHE_MAX_SORTED_CATALOGS) || 64);
+
 // Per-category stream lists: one entry per category per account. Each is a
 // slice of the full list, so a few hundred KB at most, but the count grows with
 // every genre a user opens.
@@ -1273,6 +1295,23 @@ function createKeyedCache({ maxEntries, ttl = CACHE_TTL }) {
 const liveStreamsCache = createStreamListCache();
 const vodStreamsCache = createStreamListCache();
 const seriesStreamsCache = createStreamListCache();
+
+// Sorted catalog views, memoised so that paginating a shelf does not re-sort the
+// whole list for every page. `[...items].sort(comparator)` copied and sorted up
+// to 50,000 records to keep 100 of them, on every request, and Stremio fires
+// several catalog requests in parallel on install — 50-100 ms of blocking work
+// on the single thread that is also relaying video.
+//
+// Validity is decided by *identity*, not by a second TTL: an entry is reused
+// only when the array it was derived from is still the very array the list cache
+// hands back. Cached lists keep their identity until they are refetched, so a
+// refetch invalidates the sorted view in the same instant, with no window in
+// which the two could disagree. A TTL of its own could only be wrong in one
+// direction or the other.
+const sortedCatalogCache = new BoundedMap({
+    maxEntries: CACHE_MAX_SORTED_CATALOGS,
+    maxAgeMs: CACHE_TTL
+});
 
 // Signing-time vetting of the origins named in an HLS playlist. This was memoised
 // per rewrite pass, which helped within one playlist and not at all across them —
@@ -1486,6 +1525,7 @@ function sweepCaches(now = Date.now()) {
         + liveStreamsCache.map.sweep(now)
         + vodStreamsCache.map.sweep(now)
         + seriesStreamsCache.map.sweep(now)
+        + sortedCatalogCache.sweep(now)
         + hlsOriginVetCache.sweep(now);
 }
 
@@ -2217,7 +2257,16 @@ function toCatalogMetas(items, kind) {
 }
 
 // Items for one genre, or null when the genre does not resolve to a category.
-async function selectCatalogGenre(cfg, kind, genre) {
+// Resolves a genre to its items *and* to the cached array they were derived
+// from. The second half is what lets the sorted view above be invalidated by
+// identity: a genre shelf is usually a fresh `.filter()` of the full list, so
+// the items array is new on every request and says nothing about whether the
+// underlying data changed — but the array it was filtered from is the one the
+// list cache holds, and that is replaced only by a refetch.
+//
+// `selectCatalogGenre` below is the plain-items form, kept because it is the
+// exported surface and the shape the rest of the file describes.
+async function selectCatalogSource(cfg, kind, genre) {
     const cats = await getCategories(cfg);
     const categories = cats[kind.categoryKey] || [];
 
@@ -2227,7 +2276,8 @@ async function selectCatalogGenre(cfg, kind, genre) {
     // answer, and it is the same list search already uses.
     if (!categories.length) {
         console.warn(`[catalog] no ${kind.categoryKey} categories; serving the full list`);
-        return kind.loadAll(cfg);
+        const all = await kind.loadAll(cfg);
+        return { items: all, source: all };
     }
     // Stremio marks genre required, but a bare catalog request still falls back
     // to the first category rather than showing an empty shelf.
@@ -2240,18 +2290,61 @@ async function selectCatalogGenre(cfg, kind, genre) {
     if (kind.matchCategoryName) {
         const genreLower = String(selectedGenre || '').toLowerCase();
         const all = await kind.loadAll(cfg);
-        return all.filter(s => {
-            if (s.category_id != null && s.category_id !== '') return String(s.category_id) === catIdStr;
-            return genreLower && String(s.category_name || '').toLowerCase() === genreLower;
-        });
+        return {
+            items: all.filter(s => {
+                if (s.category_id != null && s.category_id !== '') return String(s.category_id) === catIdStr;
+                return genreLower && String(s.category_name || '').toLowerCase() === genreLower;
+            }),
+            source: all
+        };
     }
 
     // Reuse the warm full list when there is one; otherwise a per-category fetch
     // beats pulling 10-50 MB just to filter it down.
     const fullList = kind.listCache.get(cfg);
-    return fullList
-        ? fullList.filter(s => String(s.category_id) === catIdStr)
-        : await getCategoryStreams(cfg, kind.categoryAction, catIdStr);
+    if (fullList) {
+        return { items: fullList.filter(s => String(s.category_id) === catIdStr), source: fullList };
+    }
+    // The per-category list is itself cached, so it is its own identity token.
+    const catList = await getCategoryStreams(cfg, kind.categoryAction, catIdStr);
+    return { items: catList, source: catList };
+}
+
+async function selectCatalogGenre(cfg, kind, genre) {
+    const selected = await selectCatalogSource(cfg, kind, genre);
+    return selected && selected.items;
+}
+
+// The sorted view of one shelf, memoised against the identity of the list it was
+// derived from (see sortedCatalogCache). Returns `items` untouched when the
+// variant has no comparator — the live shelf and any unsorted kind — so nothing
+// is cached for a shelf whose order was never computed in the first place.
+//
+// The search branch keys separately from the plain shelf even though both may
+// carry an empty genre: a genre-less shelf falls back to the *first* category
+// inside selectCatalogSource, while search always spans the full list, so the
+// two are different arrays under otherwise identical coordinates.
+function sortedCatalogItems(cfg, kind, route, genre, { items, source }, now = Date.now()) {
+    const variant = route.search ? 'new' : route.variant;
+    const comparator = catalogComparator(kind, variant, now);
+    if (!comparator) return items;
+
+    const key = [
+        accountCacheKey(cfg),
+        route.kind,
+        route.search ? `search:${variant}` : variant,
+        genre || '',
+        Math.floor(now / 86400000)
+    ].join('\n');
+
+    const hit = sortedCatalogCache.get(key);
+    // Identity, not equality: a refetched list is a different array even when it
+    // holds the same records, and that is exactly when the sort must be redone.
+    if (hit && hit.source === source) return hit.sorted;
+
+    const sorted = [...items].sort(comparator);
+    sortedCatalogCache.set(key, { source, sorted, ts: now });
+    return sorted;
 }
 
 app.get(['/:config/catalog/:type/:id.json', '/:config/catalog/:type/:id/:extra.json'], async (req, res) => {
@@ -2283,16 +2376,16 @@ app.get(['/:config/catalog/:type/:id.json', '/:config/catalog/:type/:id/:extra.j
         const extra = parseExtra(rawExtraSegment(req));
         const skip = Math.max(0, parseInt(extra.skip) || 0);
 
-        let items;
+        let selected;
         if (route.search) {
             // Global search: one full-list fetch per account (cached), then an
             // in-memory filter. This is what makes search cheap.
             if (!extra.search) return res.json({ metas: [] });
-            items = filterByName(await kind.loadAll(cfg), extra.search);
+            const all = await kind.loadAll(cfg);
+            selected = { items: all, source: all };
         } else {
-            items = await selectCatalogGenre(cfg, kind, extra.genre);
-            if (!items) return res.json({ metas: [] });
-            items = filterByName(items, extra.search);
+            selected = await selectCatalogSource(cfg, kind, extra.genre);
+            if (!selected) return res.json({ metas: [] });
         }
 
         // Both branches sort, and they did not used to. A search catalog has no
@@ -2304,8 +2397,18 @@ app.get(['/:config/catalog/:type/:id.json', '/:config/catalog/:type/:id/:extra.j
         // ends in the item id, like every comparator here) and "most recently
         // added first" is the most useful ranking available behind a substring
         // match, which carries no relevance signal of its own.
-        const comparator = catalogComparator(kind, route.search ? 'new' : route.variant);
-        if (comparator) items = [...items].sort(comparator);
+        //
+        // The sort now runs *before* the search filter rather than after it. The
+        // two commute — a filter preserves relative order, and every comparator
+        // here is a total order, so filtering a sorted list gives exactly the
+        // list a sort of the filtered items would — and doing it in this order
+        // means the sorted array depends only on the shelf, not on the search
+        // term, which is what makes it memoisable at all. Keying a cache by a
+        // caller-supplied search string would be an unbounded key space.
+        const items = filterByName(
+            sortedCatalogItems(cfg, kind, route, extra.genre, selected),
+            extra.search
+        );
 
         const metas = toCatalogMetas(items.slice(skip, skip + PAGE_SIZE), kind);
         return res.json({ metas, ...withCacheHints(res, 300, 600) });
@@ -2985,12 +3088,85 @@ function makeHlsProxyMapper(base, configToken, allowedOrigins) {
     };
 }
 
+// An install URL is a bearer credential, and one that leaks or is deliberately
+// shared can open as many simultaneous relays as the sharers have players — each
+// one a full-rate video stream out of this server's egress, paid for by the
+// operator. Nothing else here bounds that: the caches bound memory and the
+// timeouts bound stalled requests, but a thousand healthy concurrent relays look
+// exactly like a popular household.
+//
+// The counter is keyed by *account* rather than by the token string, even though
+// the limit is named for the token: `/configure` will mint a fresh token for the
+// same credentials on demand (the IV is random, so the ciphertext differs every
+// time), and a budget that a new install URL resets is not a budget. Two people
+// legitimately sharing one account share one allowance, which is the same thing
+// the provider's own connection limit already does.
+//
+// Set to 0 to disable, for an operator whose reverse proxy already does this.
+// The default is generous on purpose — a single player keeps one or two relays
+// open, a live HLS channel two or three, and a household with several devices
+// still lands far below it — so reaching it means something is wrong rather than
+// something is popular.
+//
+// Parsed by hand rather than with the `Number(x) || default` the cache bounds
+// use, because 0 is a *meaningful* value here and that idiom would quietly turn
+// the documented way to disable the limit into the default. An empty or
+// unparseable setting is treated as unset.
+const PROXY_MAX_CONCURRENT_PER_TOKEN = (() => {
+    const raw = process.env.PROXY_MAX_CONCURRENT_PER_TOKEN;
+    if (typeof raw !== 'string' || !raw.trim()) return 16;
+    const n = Number(raw);
+    return Number.isFinite(n) && n >= 0 ? Math.floor(n) : 16;
+})();
+
+const proxyInFlight = new Map();
+
+// Takes a slot for the life of this response, or answers 429 and returns false.
+// The release is bound to the response's `close` event rather than to the end of
+// the handler: `relayUpstream` returns as soon as the body is piped, while the
+// relay it started may run for hours. `close` fires exactly once, on a finished
+// response and on a dropped connection alike, which is what keeps the count from
+// drifting upward until the cap locks an account out permanently.
+function acquireProxySlot(cfg, res) {
+    if (!PROXY_MAX_CONCURRENT_PER_TOKEN) return true;
+    const key = accountCacheKey(cfg);
+    const current = proxyInFlight.get(key) || 0;
+    if (current >= PROXY_MAX_CONCURRENT_PER_TOKEN) {
+        console.warn(
+            `[proxy] concurrency cap reached (${current}/${PROXY_MAX_CONCURRENT_PER_TOKEN}); ` +
+            'raise PROXY_MAX_CONCURRENT_PER_TOKEN if this is legitimate traffic'
+        );
+        return false;
+    }
+    proxyInFlight.set(key, current + 1);
+    let released = false;
+    res.once('close', () => {
+        if (released) return;
+        released = true;
+        const left = (proxyInFlight.get(key) || 1) - 1;
+        // Delete at zero: the key space is every account that ever streamed, and
+        // an idle account must not cost an entry.
+        if (left > 0) proxyInFlight.set(key, left);
+        else proxyInFlight.delete(key);
+    });
+    return true;
+}
+
+// 429 rather than 503: the limit is a property of this caller's own usage, not
+// of the server's health, and Retry-After tells a player to come back for the
+// segment rather than treating it as the end of the stream.
+function rejectOverCap(res) {
+    res.setHeader('Retry-After', '1');
+    return res.status(429).end('too many concurrent streams');
+}
+
 app.all('/:config/proxy/:kind/:file', async (req, res) => {
     if (req.method !== 'GET' && req.method !== 'HEAD') {
         return res.status(405).end('method not allowed');
     }
     const cfg = decodeConfig(req.params.config);
     if (!cfg) return res.status(401).end('unauthorized');
+    if (!acquireProxySlot(cfg, res)) return rejectOverCap(res);
 
     const { kind, file } = req.params;
     if (!['movie', 'series', 'live'].includes(kind)) {
@@ -3033,6 +3209,7 @@ app.all('/:config/proxy/hls', async (req, res) => {
     }
     const cfg = decodeConfig(req.params.config);
     if (!cfg) return res.status(401).end('unauthorized');
+    if (!acquireProxySlot(cfg, res)) return rejectOverCap(res);
 
     // Bound to this config token: a signature minted for another account's
     // playlist does not verify here, even though the MAC key is global.
@@ -3389,6 +3566,10 @@ module.exports = {
     filterByName,
     toCatalogMetas,
     selectCatalogGenre,
+    selectCatalogSource,
+    sortedCatalogItems,
+    sortedCatalogCache,
+    CACHE_MAX_SORTED_CATALOGS,
     normalizeContainerExt,
     isNotWebReady,
     normalizeAcceptRanges,
@@ -3410,6 +3591,9 @@ module.exports = {
     MAX_UPSTREAM_BYTES,
     assertSafeOutboundUrl,
     discardBody,
+    acquireProxySlot,
+    proxyInFlight,
+    PROXY_MAX_CONCURRENT_PER_TOKEN,
     makeHlsProxyMapper,
     hlsTargetOrigins,
     HLS_TARGET_ALLOWED_HOSTS,
