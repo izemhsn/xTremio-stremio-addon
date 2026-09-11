@@ -156,8 +156,8 @@ test('a multi-byte character split across a chunk boundary survives', async () =
 
 test('each copy of the body is released before the next is allocated', () => {
     // Asserted on the source, because the property is about *reachability* and
-    // nothing observable from outside the function can distinguish a peak of two
-    // copies from a peak of four — a GC that happens not to run leaves the same
+    // nothing observable from outside the function can distinguish one copy of the
+    // body alive at parse time from three — a GC that happens not to run leaves the same
     // heap either way. The shape is the guarantee, so the shape is what is
     // pinned: chunks emptied before the stringify, buffer dropped before the
     // parse. Written as one expression again, this would silently regress.

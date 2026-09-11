@@ -837,10 +837,10 @@ async function safeFetch(inputUrl, options = {}, { maxRedirects = 3, onFinalUrl 
             onFinalUrl?.(url.toString());
             return res;
         }
-        // The redirect's own body is never read. Every proxy request traverses at
-        // least one 302, so this is the hot path for leaked connections.
-        // The redirect's own body is never read. The audit expected undici to
-        // hold that connection until GC; measured, it does not — the abandoned
+        // The redirect's own body is never read, and every proxy request traverses
+        // at least one 302, so this is the hot path for leaked connections. The
+        // audit expected undici to hold that connection until GC; measured, it
+        // does not — the abandoned
         // socket closed in under 10 ms with and without this call, because a
         // half-read response cannot be returned to the pool anyway. Kept as
         // explicit hygiene rather than as a fix for a leak that reproduces: it
@@ -885,13 +885,14 @@ async function readJsonCapped(res, label, maxBytes = MAX_UPSTREAM_BYTES) {
     }
     // Written as four statements rather than one expression because each step
     // allocates a full copy of the body and the references are what decide how
-    // many of them are alive at once. `Buffer.concat(chunks).toString()` keeps
-    // `chunks` reachable through the concat *and* the stringify, and the buffer
-    // reachable through JSON.parse, so a 64 MB body peaks at four copies.
-    // Dropping each reference as soon as the next copy exists holds the peak to
-    // two: the parse sees the string and the object graph, and nothing else.
-    // One full copy plus the parsed graph is the floor for a non-incremental
-    // parser; this only stops paying for the copies already spent.
+    // many of them are alive at once. `Buffer.concat(chunks).toString()` handed
+    // straight to the parser keeps `chunks` reachable through the concat *and* the
+    // stringify, and the buffer through the parse, so three copies of the body are
+    // alive while the parser builds the object graph — measured on a 21 MB body,
+    // ~3× the body. Dropping each reference as soon as the next copy exists holds
+    // that to one: the string, alongside the graph (~1×). One copy plus the parsed
+    // graph is the floor for a non-incremental parser; this only stops paying for
+    // the copies already spent.
     let buf = Buffer.concat(chunks);
     chunks.length = 0;
     const text = buf.toString('utf8');
@@ -2291,9 +2292,8 @@ function toCatalogMetas(items, kind) {
     }));
 }
 
-// Items for one genre, or null when the genre does not resolve to a category.
 // Resolves a genre to its items *and* to the cached array they were derived
-// from. The second half is what lets the sorted view be invalidated by
+// from, or to null when the genre does not resolve to a category. The second half is what lets the sorted view be invalidated by
 // identity: a genre shelf is usually a fresh `.filter()` of the full list, so
 // the items array is new on every request and says nothing about whether the
 // underlying data changed — but the array it was filtered from is the one the
@@ -2683,6 +2683,9 @@ app.get('/:config/stream/:type/:id.json', async (req, res) => {
             const info = await getVodInfo(cfg, streamId);
             const ext = normalizeContainerExt(info?.movie_data?.container_extension);
             const proxyUrl = `${getBaseUrl(req)}/${req.params.config}/proxy/movie/${streamId}.${ext}`;
+            // Cacheable like the live answer: the proxy URL is stable for a
+            // given title, because it is the proxy that re-resolves the
+            // provider's short-lived token on every playback, not this response.
             return res.json({
                 streams: [
                     {
@@ -2693,7 +2696,8 @@ app.get('/:config/stream/:type/:id.json', async (req, res) => {
                             bingeGroup: `xtremio-movie-${ext}`
                         }
                     }
-                ]
+                ],
+                ...withCacheHints(res, 3600)
             });
         }
 
@@ -2728,7 +2732,8 @@ app.get('/:config/stream/:type/:id.json', async (req, res) => {
                             bingeGroup: `xtremio-series-${seriesId}-${ext}`
                         }
                     }
-                ]
+                ],
+                ...withCacheHints(res, 3600)
             });
         }
 

@@ -91,8 +91,9 @@ test suite still work.
 Changing `CONFIG_SECRET` later invalidates all existing install URLs, as does bumping
 `CONFIG_TOKEN_VERSION` in the source.
 
-Also set `NODE_ENV=production` in deployment, so an unhandled route error returns a bare 500
-instead of a stack trace with filesystem paths.
+Also set `NODE_ENV=production` in deployment: it is what turns a missing or short
+`CONFIG_SECRET` from a warning into a refusal to start. It no longer affects error responses —
+the addon's own error handler returns a bare 400/500 and logs the stack server-side either way.
 
 > **Upgrading from an earlier build:** tokens moved from `v2` to `v3` when the key derivation
 > changed from SHA-256 to scrypt. Every install URL issued by a `v2` build stops working and

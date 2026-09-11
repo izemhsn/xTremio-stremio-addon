@@ -69,6 +69,11 @@ function stubProvider({ gated = false } = {}) {
                 info: { name: `Movie ${u.searchParams.get('vod_id')}` },
                 movie_data: { container_extension: 'mp4' }
             };
+        } else if (action === 'get_series_info') {
+            data = {
+                info: { name: `Series ${u.searchParams.get('series_id')}` },
+                episodes: { 1: [{ id: '501', episode_num: 1, container_extension: 'mkv' }] }
+            };
         }
         return { ok: true, status: 200, headers: { get: () => null }, json: async () => data };
     };
@@ -159,6 +164,30 @@ test('the routes still return what they returned before', async () => {
 
     const stream = await (await realFetch(`${base}/${CFG}/stream/XT-Movies/xtremio_movie_101.json`)).json();
     assert.match(stream.streams[0].url, /\/proxy\/movie\/101\.mp4$/);
+});
+
+// --- L-14: a successful stream answer is cacheable --------------------------
+
+test('movie and episode stream answers carry cache hints, as the live one does', async () => {
+    // L-1 made no-store the route's default and relied on withCacheHints to
+    // replace it wherever a request succeeds. The movie and episode branches never
+    // called it, so every open of a title re-asked for a proxy URL that does not
+    // change.
+    for (const path of [
+        '/stream/XT-Movies/xtremio_movie_101.json',
+        '/stream/series/xtremio_episode_900:1:501.json',
+        '/stream/Live%20TV/xtremio_live_7.json'
+    ]) {
+        const res = await realFetch(`${base}/${CFG}${path}`);
+        const body = await res.json();
+        assert.ok(body.streams.length > 0, `${path} served no stream`);
+        assert.equal(body.cacheMaxAge, 3600, `${path} lost its cacheMaxAge`);
+        assert.equal(res.headers.get('cache-control'), 'private, max-age=3600', path);
+    }
+
+    // A failure is still never cacheable.
+    const bad = await realFetch(`${base}/${CFG}/stream/XT-Movies/xtremio_movie_abc.json`);
+    assert.equal(bad.headers.get('cache-control'), 'no-store');
 });
 
 // --- the per-category fetch ------------------------------------------------
