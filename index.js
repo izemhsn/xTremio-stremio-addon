@@ -1216,8 +1216,16 @@ function createStreamListCache() {
             return null;
         },
         set(cfg, items) {
+            // An empty list is a legitimate answer, but a real provider also returns
+            // one transiently. Held for the full TTL it left search empty for half an
+            // hour after one bad answer; held for CACHE_FAILURE_TTL it is still a hit
+            // for the burst of requests that arrive together, and is asked again a
+            // minute later.
             map.set(accountCacheKey(cfg), {
-                data: items, ts: Date.now(), ttl: CACHE_TTL, bytes: estimateBytes(items)
+                data: items,
+                ts: Date.now(),
+                ttl: items.length ? CACHE_TTL : CACHE_FAILURE_TTL,
+                bytes: estimateBytes(items)
             });
         },
         // Cache-aside read: serves a warm entry, otherwise runs `fetcher` once
@@ -1260,14 +1268,16 @@ function createStreamListCache() {
 // and carry behaviour of their own — per-entry TTLs, negative caching, a stale
 // fallback — so they keep their bespoke forms. This is the plain case, and both
 // caches added for the per-item and per-category paths are exactly it.
-function createKeyedCache({ maxEntries, ttl = CACHE_TTL }) {
+// `ttlFor(data)` shortens one entry's lifetime. It is capped at `ttl`, which is
+// also the age the sweeper reclaims entries at.
+function createKeyedCache({ maxEntries, ttl = CACHE_TTL, ttlFor = null }) {
     const map = new BoundedMap({ maxEntries, maxAgeMs: ttl });
     const singleFlight = createSingleFlight();
     // Returns the entry, not the value: a legitimately null payload must still
     // read as a hit rather than sending every caller back upstream.
     const liveEntry = (key) => {
         const entry = map.get(key);
-        return entry && entry.ts > Date.now() - ttl ? entry : null;
+        return entry && entry.ts > Date.now() - (entry.ttl ?? ttl) ? entry : null;
     };
     return {
         map,
@@ -1283,7 +1293,7 @@ function createKeyedCache({ maxEntries, ttl = CACHE_TTL }) {
                 const warm = liveEntry(key);
                 if (warm) return warm.data;
                 const data = await fetcher();
-                map.set(key, { data, ts: Date.now() });
+                map.set(key, { data, ts: Date.now(), ttl: ttlFor ? Math.min(ttl, ttlFor(data)) : ttl });
                 return data;
             });
         }
@@ -1455,6 +1465,13 @@ async function getStreams(cfg, action, params = {}) {
     if (!Array.isArray(data)) {
         throw new Error(`${action} returned ${data === null ? 'null' : typeof data}, not a list`);
     }
+    // Without this the symptom is a search that finds nothing and no trace of why.
+    if (!data.length && params.category_id === undefined) {
+        console.warn(
+            `[getStreams] ${action} returned an empty list; retrying in ${CACHE_FAILURE_TTL / 1000}s. ` +
+            'Genre shelves use per-category fetches meanwhile, but search has nothing to search.'
+        );
+    }
     return data;
 }
 
@@ -1463,7 +1480,12 @@ async function getStreams(cfg, action, params = {}) {
 // requests arrive, and it was neither cached nor single-flighted. Paginating a
 // genre re-pulled the whole category from upstream on every page, and four
 // sequential loads of one genre cost four upstream calls.
-const categoryStreamsCache = createKeyedCache({ maxEntries: CACHE_MAX_CATEGORY_LISTS });
+// An empty category is asked again within a minute: a real provider has answered
+// a category that served 500 items with an empty list on a later load.
+const categoryStreamsCache = createKeyedCache({
+    maxEntries: CACHE_MAX_CATEGORY_LISTS,
+    ttlFor: list => (list.length ? CACHE_TTL : CACHE_FAILURE_TTL)
+});
 
 function categoryStreamsCacheKey(cfg, action, categoryId) {
     return `${accountCacheKey(cfg)}\n${action}\n${categoryId}`;
@@ -2169,6 +2191,9 @@ const CATALOG_KINDS = {
         // get_live_streams items may carry category_id, category_name, or neither,
         // so live also matches on the category name.
         matchCategoryName: true,
+        // Live always loads the full list first; this is only for a category that
+        // list has nothing for (see selectCatalogSource).
+        categoryAction: 'get_live_streams',
         idField: 'stream_id',
         idPrefix: 'xtremio_live_',
         metaType: 'Live TV',
@@ -2326,27 +2351,35 @@ async function selectCatalogSource(cfg, kind, genre) {
 
     const catIdStr = String(cat.category_id);
 
+    const selection = `category:${catIdStr}`;
+
+    // A full list is a shortcut for the per-category fetch, and either one can be
+    // wrong: a real provider has answered the unscoped get_vod_streams with an
+    // empty list while its category_id calls worked, and on another load answered
+    // a category_id call with an empty list while the full list worked. Any cached
+    // array used to count as warm — `[]` is truthy — so one search cached the empty
+    // full list and blanked every movie shelf for its whole TTL. The full list now
+    // serves a genre only when it has something for it; otherwise the category is
+    // asked directly. Both caches hold an empty answer for a minute, not thirty.
     if (kind.matchCategoryName) {
         const genreLower = String(selectedGenre || '').toLowerCase();
         const all = await kind.loadAll(cfg);
-        return {
-            items: all.filter(s => {
-                if (s.category_id != null && s.category_id !== '') return String(s.category_id) === catIdStr;
-                return genreLower && String(s.category_name || '').toLowerCase() === genreLower;
-            }),
-            source: all,
-            // The name takes part in this filter, so it takes part in the selection.
-            selection: `category:${catIdStr}\n${genreLower}`
-        };
+        const items = all.filter(s => {
+            if (s.category_id != null && s.category_id !== '') return String(s.category_id) === catIdStr;
+            return genreLower && String(s.category_name || '').toLowerCase() === genreLower;
+        });
+        // The name takes part in this filter, so it takes part in the selection.
+        if (items.length) return { items, source: all, selection: `${selection}\n${genreLower}` };
+    } else {
+        // Reuse the warm full list when there is one; otherwise a per-category
+        // fetch beats pulling 10-50 MB just to filter it down.
+        const fullList = kind.listCache.get(cfg);
+        if (fullList) {
+            const items = fullList.filter(s => String(s.category_id) === catIdStr);
+            if (items.length) return { items, source: fullList, selection };
+        }
     }
 
-    const selection = `category:${catIdStr}`;
-    // Reuse the warm full list when there is one; otherwise a per-category fetch
-    // beats pulling 10-50 MB just to filter it down.
-    const fullList = kind.listCache.get(cfg);
-    if (fullList) {
-        return { items: fullList.filter(s => String(s.category_id) === catIdStr), source: fullList, selection };
-    }
     // The per-category list is itself cached, so it is its own identity token.
     const catList = await getCategoryStreams(cfg, kind.categoryAction, catIdStr);
     return { items: catList, source: catList, selection };
@@ -2461,6 +2494,12 @@ app.get(['/:config/catalog/:type/:id.json', '/:config/catalog/:type/:id/:extra.j
         );
 
         const metas = toCatalogMetas(items.slice(skip, skip + PAGE_SIZE), kind);
+        // An empty page stays no-store, like the degraded answers above. Real
+        // providers return empty lists transiently and the server-side caches
+        // retry those within a minute, but a client told to keep the page for
+        // 300 s plus 600 s stale would pin the blank shelf long after the server
+        // had recovered. Recomputing an empty page costs nothing.
+        if (!metas.length) return res.json({ metas });
         return res.json({ metas, ...withCacheHints(res, 300, 600) });
     } catch (e) {
         console.error('[catalog] Error:', e.message);
