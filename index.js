@@ -379,9 +379,15 @@ function typeMatchesId(type, id) {
 // starts with `xtremio_series_`), so catalogs are matched separately — see
 // `catalogTypesFor`, which lives with the catalog table further down.
 
+// The container the provider named, or null when it named none usable. The
+// stream route needs that difference: a guessed extension must not be cached.
+function statedContainerExt(ext) {
+    const clean = String(ext || '').trim();
+    return /^[A-Za-z0-9]+$/.test(clean) ? clean : null;
+}
+
 function normalizeContainerExt(ext) {
-    const clean = String(ext || 'mp4').trim();
-    return /^[A-Za-z0-9]+$/.test(clean) ? clean : 'mp4';
+    return statedContainerExt(ext) || 'mp4';
 }
 
 // Per Stremio SDK: notWebReady must be true when the URL is http:// or
@@ -1665,11 +1671,30 @@ function vodInfoCacheKey(cfg, vodId) {
     return `${accountCacheKey(cfg)}\n${vodId}`;
 }
 
+// The rule isUsableSeriesInfo states for series, for the same reason: the meta
+// route needs a name and the stream route a container. A payload with neither
+// was cached for 30 minutes and rendered as a movie called "Unknown" with a
+// playable-looking mp4 stream — measured against a real account with a movie id
+// that does not exist. Some panels put the fields at the root, which is why the
+// meta route reads `info?.info ?? info` and why this does too.
+function isUsableVodInfo(payload) {
+    const isObject = v => Boolean(v) && typeof v === 'object' && !Array.isArray(v);
+    if (!isObject(payload)) return false;
+    const movie = isObject(payload.info) ? payload.info : payload;
+    const named = Boolean(movie.name || movie.o_name);
+    const data = payload.movie_data;
+    const playable = isObject(data) && Boolean(data.stream_id || data.container_extension);
+    return named || playable;
+}
+
 function getVodInfo(cfg, vodId) {
-    return vodInfoCache.load(
-        vodInfoCacheKey(cfg, vodId),
-        () => xtremioGet(cfg, 'get_vod_info', { vod_id: vodId })
-    );
+    return vodInfoCache.load(vodInfoCacheKey(cfg, vodId), async () => {
+        const info = await xtremioGet(cfg, 'get_vod_info', { vod_id: vodId });
+        // Thrown rather than returned because rejections are not cached, so a
+        // movie the provider fills in later is picked up on the next request.
+        if (!isUsableVodInfo(info)) throw new Error(`get_vod_info returned no usable data for movie ${vodId}`);
+        return info;
+    });
 }
 
 function schemeOf(url) {
@@ -2554,7 +2579,7 @@ app.get('/:config/meta/:type/:id.json', async (req, res) => {
             const meta = {
                 id: `xtremio_movie_${streamId}`,
                 type: 'XT-Movies',
-                name: movie.name || movie.o_name || 'Unknown',
+                name: movie.name || movie.o_name || info?.movie_data?.name || 'Unknown',
                 poster: movie.cover_big || movie.movie_image || undefined,
                 posterShape: 'poster',
                 background: backdrop,
@@ -2720,11 +2745,16 @@ app.get('/:config/stream/:type/:id.json', async (req, res) => {
             const streamId = getPrefixedNumericId(id, 'xtremio_movie_');
             if (!streamId) return res.status(400).json({ streams: [] });
             const info = await getVodInfo(cfg, streamId);
-            const ext = normalizeContainerExt(info?.movie_data?.container_extension);
+            const rawExt = info?.movie_data?.container_extension;
+            const ext = normalizeContainerExt(rawExt);
+            const extStated = statedContainerExt(rawExt) !== null;
             const proxyUrl = `${getBaseUrl(req)}/${req.params.config}/proxy/movie/${streamId}.${ext}`;
             // Cacheable like the live answer: the proxy URL is stable for a
             // given title, because it is the proxy that re-resolves the
             // provider's short-lived token on every playback, not this response.
+            // Only when the provider named the container, though: a guessed mp4
+            // held by the client for an hour outlives any fix to the provider's
+            // data.
             return res.json({
                 streams: [
                     {
@@ -2736,7 +2766,7 @@ app.get('/:config/stream/:type/:id.json', async (req, res) => {
                         }
                     }
                 ],
-                ...withCacheHints(res, 3600)
+                ...(extStated ? withCacheHints(res, 3600) : {})
             });
         }
 
@@ -2746,19 +2776,19 @@ app.get('/:config/stream/:type/:id.json', async (req, res) => {
             if (!parsed) return res.status(400).json({ streams: [] });
             const { seriesId, seasonNum, episodeId } = parsed;
 
-            const findExt = (data) => {
+            const findEpisode = (data) => {
                 const eps = (data?.episodes ?? {})[seasonNum];
-                if (!Array.isArray(eps)) return null;
-                const ep = eps.find(e => String(e.id) === episodeId);
-                return ep ? normalizeContainerExt(ep.container_extension) : null;
+                return Array.isArray(eps) ? eps.find(e => String(e.id) === episodeId) || null : null;
             };
 
             const info = await getSeriesInfo(cfg, seriesId);
-            let ext = findExt(info);
-            if (!ext) {
-                console.warn(`[stream] episode ${episodeId} not found in series ${seriesId} info; defaulting to mp4`);
-                ext = 'mp4';
+            const rawExt = findEpisode(info)?.container_extension;
+            // Not cached when guessed, for the same reason as the movie branch.
+            const extStated = statedContainerExt(rawExt) !== null;
+            if (!extStated) {
+                console.warn(`[stream] episode ${episodeId} is missing from series ${seriesId} info or names no container; defaulting to mp4`);
             }
+            const ext = normalizeContainerExt(rawExt);
 
             const proxyUrl = `${getBaseUrl(req)}/${req.params.config}/proxy/series/${episodeId}.${ext}`;
             return res.json({
@@ -2772,7 +2802,7 @@ app.get('/:config/stream/:type/:id.json', async (req, res) => {
                         }
                     }
                 ],
-                ...withCacheHints(res, 3600)
+                ...(extStated ? withCacheHints(res, 3600) : {})
             });
         }
 
@@ -3685,6 +3715,7 @@ module.exports = {
     sortedCatalogItems,
     sortedCatalogViews,
     normalizeContainerExt,
+    statedContainerExt,
     isNotWebReady,
     normalizeAcceptRanges,
     estimateBytes,
@@ -3728,6 +3759,7 @@ module.exports = {
     splitList,
     pickBackdrop,
     isUsableSeriesInfo,
+    isUsableVodInfo,
     getCategories,
     getAllVodStreams,
     getAllSeriesStreams,
