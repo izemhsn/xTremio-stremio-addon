@@ -133,7 +133,10 @@ test('the two search catalogs are unaffected either way', async () => {
 
         for (const id of ['xtremio_search_movies', 'xtremio_search_series']) {
             const catalog = manifest.catalogs.find(c => c.id === id);
-            assert.deepEqual(catalog.extra, [{ name: 'search', isRequired: true }], `${id} working=[${working}]`);
+            // `skip` too: Stremio sends only declared extras, so without it a
+            // search could never reach its second page.
+            assert.deepEqual(catalog.extra, [{ name: 'search', isRequired: true }, { name: 'skip' }],
+                `${id} working=[${working}]`);
             assert.deepEqual(catalog.searchProperties, ['name']);
         }
     }

@@ -454,3 +454,23 @@ test('evicting a stream list releases it, sorted views and all', async () => {
     assert.ok(await collected(listRef),
         'an evicted list stayed reachable — the stream cache bound no longer bounds memory');
 });
+
+// --- L-13: search pages past its first 100 matches -------------------------
+
+test('a search paginates with skip, without overlap and in one order', async () => {
+    // The manifest now declares `skip` on the search catalogs, which is what makes
+    // Stremio send it. This is the other half: the route honouring it.
+    stubProvider();
+    clearCaches();
+    provided = movies(250);
+
+    const pages = [];
+    for (const skip of [0, 100, 200]) {
+        pages.push(await getCatalog('xtremio_search_movies', `search=Movie&skip=${skip}`));
+    }
+    assert.deepStrictEqual(pages.map(p => p.metas.length), [100, 100, 50]);
+
+    const ids = pages.flatMap(idsOf);
+    assert.equal(new Set(ids).size, 250, 'the pages overlap or drop matches');
+    assert.deepStrictEqual(ids, [...ids].sort((a, b) => b - a), 'newest first across page boundaries');
+});

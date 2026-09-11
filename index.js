@@ -244,7 +244,10 @@ async function getManifest(baseUrl = `http://localhost:${PORT}`, cfg = null) {
                 type: 'XT-Movies',
                 id: 'xtremio_search_movies',
                 name: 'Search Movies',
-                extra: [{ name: 'search', isRequired: true }],
+                // Stremio sends only the extras a catalog declares, so without
+                // `skip` a search never asks for page two and a common word stops
+                // at the 100 most recently added matches.
+                extra: [{ name: 'search', isRequired: true }, { name: 'skip' }],
                 // Not a field the Stremio SDK defines, so no client reads it.
                 // Kept because it is accurate documentation of what the search
                 // route actually does — filterByName matches on `name` only —
@@ -256,7 +259,10 @@ async function getManifest(baseUrl = `http://localhost:${PORT}`, cfg = null) {
                 type: 'XT-Series',
                 id: 'xtremio_search_series',
                 name: 'Search Series',
-                extra: [{ name: 'search', isRequired: true }],
+                // Stremio sends only the extras a catalog declares, so without
+                // `skip` a search never asks for page two and a common word stops
+                // at the 100 most recently added matches.
+                extra: [{ name: 'search', isRequired: true }, { name: 'skip' }],
                 // Not a field the Stremio SDK defines, so no client reads it.
                 // Kept because it is accurate documentation of what the search
                 // route actually does — filterByName matches on `name` only —
