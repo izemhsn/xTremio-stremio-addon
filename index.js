@@ -3084,8 +3084,26 @@ async function relayUpstream(req, res, { upstreamUrl, label, ext, rewriteFor }) 
         if (!isAbortErr(e)) {
             console.warn(`[proxy] stream error for ${label}: ${e.message}`);
         }
-        if (!res.headersSent) res.status(502);
-        res.end();
+        // The client is already gone, or the response already finished.
+        if (res.destroyed || res.writableEnded) return;
+        // Once bytes are on the wire the status and length are promised, and a
+        // dead connection is the only honest signal left. Ending the response
+        // instead left a keep-alive socket open with the client waiting for the
+        // bytes its Content-Length still promised — measured against this relay:
+        // 500 of 1,000 bytes, socket still open 8 s later, until keepAliveTimeout.
+        // A closed connection is what makes a player retry with a Range request.
+        if (res.headersSent) return res.destroy();
+        // Nothing sent yet, but the headers set above describe the upstream body,
+        // not a 502: sent as they were, the 502 promised the movie's full length
+        // and delivered nothing. The length is set again explicitly because
+        // removing it tells Node the response has none, and it falls back to
+        // chunked encoding.
+        for (const h of [...forward, 'accept-ranges']) res.removeHeader(h);
+        const body = 'upstream stream failed';
+        res.status(502);
+        res.setHeader('Content-Type', 'text/plain; charset=utf-8');
+        res.setHeader('Content-Length', String(Buffer.byteLength(body)));
+        res.end(body);
     });
     res.on('error', () => abort());
     res.on('close', () => {
