@@ -55,19 +55,38 @@ const IS_PRODUCTION = process.env.NODE_ENV === 'production';
 // MAC, which is everything an attacker needs to test candidate secrets offline;
 // a single hash makes each guess essentially free, so a memorable passphrase
 // falls quickly. N=32768/r=8 costs ~80 ms and 32 MB per guess, and being
-// memory-hard it resists GPU parallelism too. Two derivations put ~170 ms on
+// memory-hard it resists GPU parallelism too. Three derivations put ~200 ms on
 // startup, paid once.
 // The salts are fixed strings because the keys must be re-derivable at boot from
 // the secret alone — there is nowhere to persist a random salt. That is what the
-// per-purpose labels stand in for: they keep the two keys independent.
+// per-purpose labels stand in for: they keep the derived keys independent.
 const SCRYPT_PARAMS = { N: 32768, r: 8, p: 1, maxmem: 96 * 1024 * 1024 };
 
-function deriveConfigKey(label) {
-    return crypto.scryptSync(CONFIG_SECRET, `xtremio-${label}-${CONFIG_TOKEN_VERSION}`, 32, SCRYPT_PARAMS);
+function deriveConfigKey(label, bytes = 32) {
+    return crypto.scryptSync(CONFIG_SECRET, `xtremio-${label}-${CONFIG_TOKEN_VERSION}`, bytes, SCRYPT_PARAMS);
 }
 
 const CONFIG_ENC_KEY = deriveConfigKey('config-enc');
 const CONFIG_MAC_KEY = deriveConfigKey('config-mac');
+
+// The keys protecting HLS sub-resource links are separate from the config-token
+// pair. Those two purposes were domain-separated only by the `hls:` prefix
+// inside the signed string; a distinct key makes the separation structural, so
+// no future change to either message format can make a value valid in one
+// position replayable in the other.
+// They come from one derivation rather than two because scrypt's cost is the
+// memory-hard mixing and not the output length: 64 bytes cost the same ~65 ms as
+// 32, so splitting a single output keeps boot — and the module load every test
+// file pays — at three derivations rather than four.
+const HLS_KEY_MATERIAL = deriveConfigKey('hls', 64);
+const HLS_ENC_KEY = HLS_KEY_MATERIAL.subarray(0, 32);
+const HLS_MAC_KEY = HLS_KEY_MATERIAL.subarray(32);
+
+// GCM's standard nonce and tag sizes, shared by the config token and the HLS
+// target payload. Both are named rather than inlined because the decrypt side
+// has to slice by them and state the tag length explicitly.
+const GCM_IV_BYTES = 12;
+const GCM_TAG_BYTES = 16;
 const ALLOW_PRIVATE_NETWORKS = process.env.ALLOW_PRIVATE_NETWORKS === 'true';
 const PUBLIC_URL = process.env.PUBLIC_URL ? normalizeUrl(process.env.PUBLIC_URL) : null;
 
@@ -154,7 +173,7 @@ function encodeConfig(cfg) {
     const clean = validateConfig(cfg);
     if (!clean) throw new Error('Invalid config');
 
-    const iv = crypto.randomBytes(12);
+    const iv = crypto.randomBytes(GCM_IV_BYTES);
     const cipher = crypto.createCipheriv('aes-256-gcm', CONFIG_ENC_KEY, iv);
     const ciphertext = Buffer.concat([
         cipher.update(JSON.stringify(clean), 'utf8'),
@@ -180,7 +199,11 @@ function decodeConfig(encoded) {
         const body = [version, ivPart, tagPart, ciphertextPart].join('.');
         if (!timingSafeEqualString(signTokenBody(body), macPart)) return null;
 
-        const decipher = crypto.createDecipheriv('aes-256-gcm', CONFIG_ENC_KEY, Buffer.from(ivPart, 'base64url'));
+        // authTagLength is explicit: without it setAuthTag accepts a truncated
+        // tag, and a short tag is proportionally easier to forge. Unreachable
+        // today because the MAC over the same bytes is checked first, which is
+        // why this is defence in depth rather than a fix.
+        const decipher = crypto.createDecipheriv('aes-256-gcm', CONFIG_ENC_KEY, Buffer.from(ivPart, 'base64url'), { authTagLength: GCM_TAG_BYTES });
         decipher.setAuthTag(Buffer.from(tagPart, 'base64url'));
         const plaintext = Buffer.concat([
             decipher.update(Buffer.from(ciphertextPart, 'base64url')),
@@ -441,9 +464,21 @@ const PLAYLIST_REWRITE_TIMEOUT_MS = Math.max(1000, Number(process.env.PLAYLIST_R
 //
 // Those rewritten links must not turn the proxy into an open relay for
 // arbitrary URLs, so each target is HMAC-signed and the signature is checked
-// before any outbound request. The `hls:` prefix domain-separates these from
-// config-token MACs, which use the same key: without it a value valid in one
-// position could be replayed in the other.
+// before any outbound request. The MAC uses its own key (HLS_MAC_KEY) and its
+// `hls:` prefix domain-separates the signed string as well, so a value valid in
+// one position cannot be replayed in the other.
+//
+// The target itself is encrypted, not merely encoded. It used to be plain
+// base64url, and the URL it names is the provider's own: for many panels that
+// is /live/<username>/<password>/<id>.ts, so anyone who read the query string
+// could decode working account credentials — credentials that keep working
+// against the provider directly and survive a CONFIG_SECRET rotation. Query
+// strings are recorded in player logs, in Stremio's history and in every
+// reverse-proxy access log, which is the same disclosure /configure refuses to
+// make when it declines to prefill the password back into its form.
+// The config token and the expiry are the ciphertext's associated data, so the
+// GCM tag covers exactly what the MAC covers: a payload minted for one account
+// will not decrypt under another's token, nor under a deadline someone extended.
 // A signature covers the config token and an expiry as well as the URL, so the
 // capability it grants is neither transferable nor permanent. It was previously
 // a pure function of the URL and the global MAC key, which meant one minted
@@ -459,14 +494,29 @@ const PLAYLIST_REWRITE_TIMEOUT_MS = Math.max(1000, Number(process.env.PLAYLIST_R
 const HLS_SIGNATURE_TTL_MS = Math.max(60 * 1000, Number(process.env.HLS_SIGNATURE_TTL_MS) || 60 * 60 * 1000);
 
 function signHlsTarget(payload, configToken = '', expiresAt = 0) {
-    return crypto.createHmac('sha256', CONFIG_MAC_KEY)
+    return crypto.createHmac('sha256', HLS_MAC_KEY)
         .update(`hls:${configToken}:${expiresAt}:${payload}`)
         .digest('base64url');
 }
 
+// The same three fields the MAC covers, in the same order, bound to the
+// ciphertext instead of concatenated with it. `expiresAt` is stringified here
+// because the query carries it as a string and the decrypt side must associate
+// the identical bytes.
+function hlsTargetAad(configToken, expiresAt) {
+    return Buffer.from(`hls:${configToken}:${expiresAt}`, 'utf8');
+}
+
 function encodeHlsTarget(absoluteUrl, configToken = '', now = Date.now()) {
-    const payload = Buffer.from(absoluteUrl, 'utf8').toString('base64url');
     const expiresAt = now + HLS_SIGNATURE_TTL_MS;
+    const iv = crypto.randomBytes(GCM_IV_BYTES);
+    const cipher = crypto.createCipheriv('aes-256-gcm', HLS_ENC_KEY, iv);
+    cipher.setAAD(hlsTargetAad(configToken, String(expiresAt)));
+    const ciphertext = Buffer.concat([cipher.update(absoluteUrl, 'utf8'), cipher.final()]);
+    // iv | tag | ciphertext in one field: the lengths are fixed, so the decrypt
+    // side slices rather than splitting, and the payload stays a single
+    // separator-free base64url string the way the signed string requires.
+    const payload = Buffer.concat([iv, cipher.getAuthTag(), ciphertext]).toString('base64url');
     return { u: payload, s: signHlsTarget(payload, configToken, expiresAt), e: String(expiresAt) };
 }
 
@@ -483,14 +533,31 @@ function decodeHlsTarget(payload, signature, expiry, configToken = '', now = Dat
     const expiresAt = typeof expiry === 'string' && /^\d{1,15}$/.test(expiry) ? Number(expiry) : NaN;
     if (!Number.isSafeInteger(expiresAt)) return null;
 
-    // Signature first, then the clock: both are cheap, but checking the MAC
-    // before anything derived from caller-supplied input keeps the order of
-    // operations obvious.
+    // Signature first, then the clock, then the decrypt: the MAC is the cheapest
+    // of the three and rejects a forged link before any key schedule is set up,
+    // the same order the config token uses.
     if (!timingSafeEqualString(signHlsTarget(payload, configToken, expiry), signature)) return null;
     if (expiresAt <= now) return null;
 
     try {
-        const url = new URL(Buffer.from(payload, 'base64url').toString('utf8'));
+        const raw = Buffer.from(payload, 'base64url');
+        // Strictly greater: the nonce and tag alone are a well-formed payload
+        // carrying an empty URL, which no minting path produces.
+        if (raw.length <= GCM_IV_BYTES + GCM_TAG_BYTES) return null;
+        const decipher = crypto.createDecipheriv(
+            'aes-256-gcm',
+            HLS_ENC_KEY,
+            raw.subarray(0, GCM_IV_BYTES),
+            { authTagLength: GCM_TAG_BYTES }
+        );
+        decipher.setAuthTag(raw.subarray(GCM_IV_BYTES, GCM_IV_BYTES + GCM_TAG_BYTES));
+        decipher.setAAD(hlsTargetAad(configToken, expiry));
+        const target = Buffer.concat([
+            decipher.update(raw.subarray(GCM_IV_BYTES + GCM_TAG_BYTES)),
+            decipher.final()
+        ]).toString('utf8');
+
+        const url = new URL(target);
         if (!['http:', 'https:'].includes(url.protocol)) return null;
         return url.toString();
     } catch {

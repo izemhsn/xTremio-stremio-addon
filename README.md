@@ -128,7 +128,8 @@ stremio://your-host/<config-token>/manifest.json
 The token is a five-part `v3.iv.tag.ciphertext.mac` string: the credentials are encrypted with
 AES-256-GCM under a random per-token IV, then the whole body is signed with a separate HMAC key
 (encrypt-then-MAC). Both keys are derived from `CONFIG_SECRET` with scrypt, under different
-per-purpose labels so they stay independent. A token that fails its MAC check, its
+per-purpose labels so they stay independent; the keys protecting HLS links come from a third
+derivation, so those two purposes share no key material. A token that fails its MAC check, its
 GCM tag, or its version prefix is rejected, and the route degrades to empty results rather than
 an error — Stremio surfaces raw errors to the user.
 
@@ -158,8 +159,12 @@ are the norm. Both formats are still offered:
   Xtream one names its segments by absolute URLs that carry the same credentials, so passing the
   body through would move the disclosure from the URL into the body. The playlist is instead
   rewritten: every segment, key and variant URI is replaced with a `/:config/proxy/hls` link.
-  Those links carry their target HMAC-signed, so the route cannot be used to fetch a URL of the
-  caller's choosing.
+  Those links carry their target encrypted and signed under their own keys, so the route cannot
+  be used to fetch a URL of the caller's choosing, and the provider URL inside — which for many
+  panels holds the account's username and password — is not readable from the link. That matters
+  because query strings end up in player logs, in Stremio's history and in reverse-proxy access
+  logs. Upgrading to this version invalidates HLS links minted by an older one; a player simply
+  reloads the playlist, which is re-minted on every fetch, so nothing needs reissuing.
 
 The practical consequence is that **all streaming bandwidth flows through your host**, live
 included, which drives both platform choice and cost. A single 1080p stream is roughly 5-10 Mbps

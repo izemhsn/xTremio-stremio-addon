@@ -95,6 +95,63 @@ test('a missing expiry is not treated as no expiry', () => {
     assert.equal(decodeHlsTarget(u, s, null, ALICE), null);
 });
 
+// --- S1: the target itself is confidential ---------------------------------
+
+test('the link does not carry the provider credentials it points at', () => {
+    // The payload used to be plain base64url of the target, and the target is an
+    // Xtream URL with /username/password/ in its path. Query strings are written
+    // to player logs, to Stremio's history and to every reverse-proxy access
+    // log, so anyone who read one held credentials that work against the
+    // provider directly and outlive a CONFIG_SECRET rotation.
+    const { u, s, e } = encodeHlsTarget(TARGET, ALICE);
+    const query = `u=${u}&s=${s}&e=${e}`;
+    // latin1 rather than utf8: the payload is ciphertext, and utf8 would replace
+    // the bytes that do not form characters instead of comparing them.
+    const decoded = Buffer.from(u, 'base64url').toString('latin1');
+
+    assert.ok(!query.includes('secret'), 'no credential in the link as written');
+    assert.ok(!decoded.includes('secret'), 'and none once the payload is decoded');
+    assert.ok(!decoded.includes('cdn.test'), 'the host it names is not readable either');
+
+    // And it still works for the account it was minted for.
+    assert.equal(decodeHlsTarget(u, s, e, ALICE), TARGET);
+});
+
+test('the ciphertext is bound to the token and the expiry, not only the MAC', () => {
+    // The same three fields the MAC covers are the GCM associated data, so this
+    // holds even for someone who can mint a MAC over fields of their choosing:
+    // a payload lifted onto another account's token, or onto a deadline they
+    // pushed out, does not decrypt.
+    const { u, e } = encodeHlsTarget(TARGET, ALICE);
+
+    assert.equal(decodeHlsTarget(u, signHlsTarget(u, BOB, e), e, BOB), null, 'another token');
+
+    const later = String(Number(e) + 60000);
+    assert.equal(decodeHlsTarget(u, signHlsTarget(u, ALICE, later), later, ALICE), null, 'a later deadline');
+});
+
+test('a tampered payload is rejected even when the MAC agrees', () => {
+    const { u, e } = encodeHlsTarget(TARGET, ALICE);
+    const raw = Buffer.from(u, 'base64url');
+    raw[raw.length - 1] ^= 0x01;
+    const tampered = raw.toString('base64url');
+
+    assert.equal(decodeHlsTarget(tampered, signHlsTarget(tampered, ALICE, e), e, ALICE), null);
+});
+
+test('a payload too short to hold a nonce, a tag and a target is rejected', () => {
+    // Without the length check the slices would read an empty ciphertext, and a
+    // nonce and tag alone would be a well-formed link to nowhere.
+    const e = String(Date.now() + 60000);
+    for (const short of ['', 'AAAA', Buffer.alloc(28).toString('base64url')]) {
+        assert.equal(
+            decodeHlsTarget(short, signHlsTarget(short, ALICE, e), e, ALICE),
+            null,
+            `payload ${JSON.stringify(short)}`
+        );
+    }
+});
+
 // --- what must keep working ------------------------------------------------
 
 test('the earlier guarantees still hold', () => {
@@ -105,7 +162,8 @@ test('the earlier guarantees still hold', () => {
     assert.equal(decodeHlsTarget(evil, s, e, ALICE, now), null, 'signature for a different payload');
     assert.equal(decodeHlsTarget(u, 'forged', e, ALICE, now), null);
 
-    // Still domain-separated from config-token MACs, which share the key.
+    // Still domain-separated from config-token MACs, which no longer share the
+    // key either.
     const body = 'v3.aaa.bbb.ccc';
     assert.notEqual(signHlsTarget(body, ALICE, e), signTokenBody(body));
 

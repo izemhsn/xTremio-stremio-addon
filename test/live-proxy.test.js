@@ -175,6 +175,15 @@ test.beforeEach(() => { providerHits = []; });
 // not, so it uses the reference saved before any stubbing.
 const get = (path) => realFetch(`${base}/${CFG}${path}`);
 
+// A rewritten link names its target as ciphertext bound to this account's token
+// and to the link's own expiry, so a test reads it back the way the route does.
+// Decoding the `u` payload directly used to work, which was the whole problem:
+// anything that could read the URL could read the provider credentials in it.
+const targetOf = (link) => {
+    const q = new URL(link).searchParams;
+    return decodeHlsTarget(q.get('u'), q.get('s'), q.get('e'), CFG);
+};
+
 // --- rewriteHlsPlaylist ----------------------------------------------------
 
 const proxied = (url) => `PROXY(${url})`;
@@ -272,14 +281,17 @@ test('an unsigned or forged target is rejected', () => {
 });
 
 test('non-http targets are rejected even when correctly signed', () => {
-    const payload = Buffer.from('file:///etc/passwd', 'utf8').toString('base64url');
-    const expiry = String(Date.now() + 60000);
-    assert.strictEqual(decodeHlsTarget(payload, signHlsTarget(payload, CFG, expiry), expiry, CFG), null);
+    // Minted through encodeHlsTarget so the payload is genuinely this server's
+    // own ciphertext: a hand-built one would be turned away by the MAC or the
+    // GCM tag first and never reach the protocol check this test is about.
+    const { u, s, e } = encodeHlsTarget('file:///etc/passwd', CFG);
+    assert.strictEqual(decodeHlsTarget(u, s, e, CFG), null);
 });
 
 test('HLS signatures are domain-separated from config-token MACs', () => {
-    // Both use CONFIG_MAC_KEY. Without the "hls:" prefix a value valid in one
-    // position could be replayed in the other.
+    // They use different keys, and the "hls:" prefix separates the signed
+    // strings as well, so a value valid in one position cannot be replayed in
+    // the other however either format changes.
     const body = 'v3.aaa.bbb.ccc';
     assert.notStrictEqual(signHlsTarget(body), signTokenBody(body));
 });
@@ -387,10 +399,7 @@ test('a relative segment resolves against the playlist, not the proxy path', asy
     // /live/<creds>/seg2.ts, not a URL on this server.
     const playlist = await (await get('/proxy/live/5.m3u8')).text();
     const lines = playlist.split('\n').filter(l => l.includes('/proxy/hls?u='));
-    const targets = lines.map((l) => {
-        const u = new URL(l.replace(/^#.*URI="/, '').replace(/"$/, '')).searchParams.get('u');
-        return Buffer.from(u, 'base64url').toString('utf8');
-    });
+    const targets = lines.map((l) => targetOf(l.replace(/^#.*URI="/, '').replace(/"$/, '')));
     assert.ok(
         targets.some(t => t === `${providerBase}/live/${USERNAME}/${PASSWORD}/seg2.ts`),
         `relative segment resolved wrongly: ${JSON.stringify(targets)}`
@@ -405,9 +414,7 @@ test('relative segments resolve against the post-redirect playlist URL', async (
     const line = playlist.split('\n').find(l => l.includes('/proxy/hls?u='));
     assert.ok(line, 'segment rewritten');
 
-    const u = new URL(line).searchParams.get('u');
-    const target = Buffer.from(u, 'base64url').toString('utf8');
-    assert.strictEqual(target, `${providerBase}/cdn/deep/path/relseg.ts`);
+    assert.strictEqual(targetOf(line), `${providerBase}/cdn/deep/path/relseg.ts`);
 });
 
 test('a master playlist has its variant playlists rewritten in turn', async () => {
