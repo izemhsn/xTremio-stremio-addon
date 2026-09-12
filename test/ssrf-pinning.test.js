@@ -87,9 +87,11 @@ test('a public target is still signed and still round-trips', async () => {
     );
 });
 
-test('a refused target is left in the playlist verbatim, not dropped', async () => {
-    // Removing the line would silently corrupt the playlist; leaving it means
-    // the player fails on that one sub-resource, which is the honest outcome.
+test('a playlist naming a refused target is refused whole, not half-rewritten', async () => {
+    // This used to assert that a refused line was left exactly as the provider
+    // wrote it, so the player failed on that one sub-resource. That is the S2
+    // leak: on an Xtream panel the lines left behind are absolute URLs carrying
+    // the account's credentials, so half a rewrite discloses them to the player.
     const playlist = [
         '#EXTM3U',
         '#EXT-X-KEY:METHOD=AES-128,URI="http://169.254.169.254/latest/meta-data/"',
@@ -100,16 +102,27 @@ test('a refused target is left in the playlist verbatim, not dropped', async () 
         ''
     ].join('\n');
 
+    await assert.rejects(
+        () => rewriteHlsPlaylist(
+            playlist,
+            `http://${PUBLIC_IP}/a/play.m3u8`,
+            makeHlsProxyMapper('https://addon.test', 'CFG', ALLOWED)
+        ),
+        (e) => e.code === 'PLAYLIST_TARGET_REFUSED'
+    );
+});
+
+test('a playlist whose targets all pass is still rewritten in full', async () => {
+    const playlist = ['#EXTM3U', '#EXTINF:10,', `http://${PUBLIC_IP}/ok/seg2.ts`, ''].join('\n');
+
     const out = await rewriteHlsPlaylist(
         playlist,
         `http://${PUBLIC_IP}/a/play.m3u8`,
         makeHlsProxyMapper('https://addon.test', 'CFG', ALLOWED)
     );
 
-    assert.ok(out.includes('URI="http://169.254.169.254/latest/meta-data/"'), 'key line should be untouched');
-    assert.ok(out.includes('http://127.0.0.1:1234/internal/admin?secret=1'), 'segment line should be untouched');
-    // Exactly one line was rewritten: the public one.
     assert.equal((out.match(/proxy\/hls\?/g) || []).length, 1);
+    assert.ok(!out.includes(`http://${PUBLIC_IP}/ok/seg2.ts`), 'nothing may be relayed raw');
 });
 
 test('the fetch-time check still refuses those targets too', async () => {

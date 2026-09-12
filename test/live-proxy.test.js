@@ -122,6 +122,19 @@ function providerHandler(req, res) {
         return sendPlaylist('#EXTM3U\n#EXTINF:8.000,\nrelseg.ts\n');
     }
 
+    // A playlist that names a host outside both the account's panel and the
+    // origin it was served from. Nothing on that host may be signed.
+    if (req.url === `/live/${creds}/8.m3u8`) {
+        return sendPlaylist([
+            '#EXTM3U',
+            '#EXTINF:8.000,',
+            `${providerBase}/hls/${creds}/seg1.ts`,
+            '#EXTINF:8.000,',
+            'http://foreign-cdn.example.net/seg9.ts',
+            ''
+        ].join('\n'));
+    }
+
     if (req.url === `/hls/${creds}/variant.m3u8`) {
         return sendPlaylist(`#EXTM3U\n#EXTINF:8.000,\n${providerBase}/hls/${creds}/seg9.ts\n`);
     }
@@ -406,6 +419,20 @@ test('a master playlist has its variant playlists rewritten in turn', async () =
     const variant = await (await realFetch(variantLink)).text();
     assert.ok(!variant.includes(PASSWORD), `nested playlist leaked credentials:\n${variant}`);
     assert.ok(variant.includes('/proxy/hls?u='), 'nested segments rewritten');
+});
+
+test('a playlist naming a host the proxy will not fetch is refused, not half-rewritten', async () => {
+    // The route half-rewrote it: the signable segments became proxy links and the
+    // rest were passed through as the provider wrote them — which on this panel
+    // means /live/<user>/<password>/ in the player's hands, the exact disclosure
+    // the rewrite exists to prevent.
+    const res = await get('/proxy/live/8.m3u8');
+    assert.strictEqual(res.status, 502);
+
+    const body = await res.text();
+    assert.strictEqual(body, 'playlist target refused');
+    assert.ok(!body.includes(PASSWORD), 'password must not reach the player');
+    assert.ok(!body.includes(USERNAME), 'username must not reach the player');
 });
 
 test('the passthrough route refuses an unsigned target and makes no request', async () => {

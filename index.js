@@ -545,7 +545,20 @@ async function rewriteHlsPlaylist(text, baseUrl, toProxyUrl, { deadline = null }
             return null;
         }
         if (!['http:', 'https:'].includes(absolute.protocol)) return null;
-        return toProxyUrl(absolute.toString());
+        const mapped = await toProxyUrl(absolute.toString());
+        if (mapped) return mapped;
+        // The mapper refused this target, and leaving the line as the provider
+        // wrote it is the disclosure this rewrite exists to prevent: an Xtream
+        // playlist names its sub-resources by absolute URLs carrying the account's
+        // credentials, so a partly rewritten playlist hands them to the player.
+        // Refusing the whole playlist is the answer the deadline above gives, for
+        // the same reason — and dropping the line is not a safe alternative, since
+        // a dropped EXT-X-KEY URI leaves the player treating encrypted segments as
+        // plaintext. The operator's remedy is HLS_TARGET_ALLOWED_HOSTS, named in
+        // the warning the mapper logs.
+        const err = new Error('playlist names a target this server will not proxy');
+        err.code = 'PLAYLIST_TARGET_REFUSED';
+        throw err;
     };
 
     // replace() cannot await, so URI attributes are walked by hand. The regex is
@@ -780,10 +793,17 @@ function warnOnUndiciMismatch(log = console) {
     return false;
 }
 
+// A refusal by policy — this scheme or address is never allowed — as opposed to a
+// lookup that failed and may succeed next time. vetHlsOrigin remembers the first
+// kind and retries the second.
+function blockedOutbound(message) {
+    return Object.assign(new Error(message), { code: 'OUTBOUND_BLOCKED' });
+}
+
 async function assertSafeOutboundUrl(inputUrl) {
     const url = new URL(inputUrl);
     if (!['http:', 'https:'].includes(url.protocol)) {
-        throw new Error(`Blocked unsupported outbound protocol: ${url.protocol}`);
+        throw blockedOutbound(`Blocked unsupported outbound protocol: ${url.protocol}`);
     }
     if (ALLOW_PRIVATE_NETWORKS) return url;
 
@@ -794,7 +814,7 @@ async function assertSafeOutboundUrl(inputUrl) {
 
     for (const { address } of addresses) {
         if (isPrivateIp(address)) {
-            throw new Error(`Blocked private outbound address for ${hostname}`);
+            throw blockedOutbound(`Blocked private outbound address for ${hostname}`);
         }
     }
     // A literal address needs no pin: the connector recognises it and never
@@ -1357,7 +1377,17 @@ const hlsOriginVetCache = new BoundedMap({
 function vetHlsOrigin(absolute, origin) {
     const cached = hlsOriginVetCache.get(origin);
     if (cached && cached.ts > Date.now() - HLS_ORIGIN_VET_TTL_MS) return cached.ok;
-    const ok = assertSafeOutboundUrl(absolute).then(() => true, () => false);
+    const ok = assertSafeOutboundUrl(absolute).then(() => true, (e) => {
+        // Only a policy refusal is a verdict worth keeping. A resolver blip is
+        // not: remembered as "refused" it made every rewrite naming this origin
+        // fail for the rest of the window, and a refused origin now costs the
+        // whole playlist rather than leaking the provider's own URL.
+        // Checked by identity so a newer entry set after this one is left alone.
+        if (e?.code !== 'OUTBOUND_BLOCKED' && hlsOriginVetCache.peek(origin)?.ok === ok) {
+            hlsOriginVetCache.delete(origin);
+        }
+        return false;
+    });
     hlsOriginVetCache.set(origin, { ok, ts: Date.now() });
     return ok;
 }
@@ -3021,12 +3051,16 @@ async function relayUpstream(req, res, { upstreamUrl, label, ext, rewriteFor }) 
             });
         } catch (e) {
             const timedOut = e.code === 'PLAYLIST_REWRITE_TIMEOUT';
+            const refused = e.code === 'PLAYLIST_TARGET_REFUSED';
+            const how = timedOut
+                ? `timed out after ${PLAYLIST_REWRITE_TIMEOUT_MS}ms`
+                : (refused ? 'refused a target' : 'failed');
             console.warn(
-                `[proxy] playlist rewrite ${timedOut ? `timed out after ${PLAYLIST_REWRITE_TIMEOUT_MS}ms` : 'failed'} ` +
-                `for ${label}${timedOut ? '' : `: ${e.message}`}`
+                `[proxy] playlist rewrite ${how} for ${label}${timedOut ? '' : `: ${e.message}`}`
             );
             if (!res.headersSent) {
-                res.status(timedOut ? 504 : 502).end(timedOut ? 'upstream timeout' : 'bad playlist');
+                res.status(timedOut ? 504 : 502)
+                    .end(timedOut ? 'upstream timeout' : (refused ? 'playlist target refused' : 'bad playlist'));
             }
             return;
         }
@@ -3125,8 +3159,10 @@ async function relayUpstream(req, res, { upstreamUrl, label, ext, rewriteFor }) 
 // Signing a target hands out a capability, and the URIs come from the provider,
 // not from us — a hostile or compromised panel can put any absolute URL in its
 // playlist. Signing one the server would refuse to fetch is the wrong default,
-// so the same check runs here: a private or unresolvable target is left in the
-// playlist verbatim (it will simply fail in the player) rather than signed.
+// so the same check runs here. A target that cannot be signed is not left in the
+// playlist verbatim: those lines are the provider's own credential-bearing URLs,
+// so rewriteHlsPlaylist refuses the playlist instead (502) and the warnings below
+// name the setting that would admit the host.
 // This is defence in depth over the fetch-time check, not a replacement for it.
 // Escape hatch for a provider that genuinely fans segments out beyond the panel
 // and the playlist's own origin. Hostnames rather than origins, so a provider
@@ -3176,9 +3212,9 @@ function makeHlsProxyMapper(base, configToken, allowedOrigins) {
     // hlsOriginVetCache rather than only within one.
     //
     // Distinct origins are capped per playlist because each new one costs a
-    // resolution and a real playlist names one or two. Past the cap a URI is left
-    // unsigned, which is the same answer an unresolvable target already gets, and
-    // no further lookups are made.
+    // resolution and a real playlist names one or two. Past the cap nothing more
+    // is signed and no further lookups are made, which refuses the playlist —
+    // a playlist naming more hosts than the cap is hostile or broken either way.
     const seen = new Set();
     let warned = false;
     let refusedOrigin = false;
@@ -3202,7 +3238,7 @@ function makeHlsProxyMapper(base, configToken, allowedOrigins) {
                 refusedOrigin = true;
                 console.warn(
                     `[proxy] playlist names ${origin}, which is neither the account's panel nor the ` +
-                    'origin the playlist came from; leaving it unsigned ' +
+                    'origin the playlist came from; refusing the playlist ' +
                     '(add it to HLS_TARGET_ALLOWED_HOSTS if the provider legitimately uses it)'
                 );
             }
@@ -3215,7 +3251,7 @@ function makeHlsProxyMapper(base, configToken, allowedOrigins) {
                     warned = true;
                     console.warn(
                         `[proxy] playlist names more than ${MAX_PLAYLIST_ORIGINS} distinct origins; ` +
-                        'leaving the rest unsigned (raise MAX_PLAYLIST_ORIGINS if a provider legitimately fans out)'
+                        'refusing the playlist (raise MAX_PLAYLIST_ORIGINS if a provider legitimately fans out)'
                     );
                 }
                 return null;

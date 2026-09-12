@@ -26,11 +26,17 @@ const realLookup = dnsPromises.lookup;
 
 let lookups = [];
 let lookupDelayMs = 0;
+// A public address, so vetting passes and the URI is signed. A test that needs a
+// different answer sets these rather than replacing the function, so it cannot
+// leave the resolver pointing somewhere else for the rest of the file.
+const PUBLIC_ANSWER = [{ address: '93.184.216.34', family: 4 }];
+let lookupAddresses = PUBLIC_ANSWER;
+let lookupError = null;
 dnsPromises.lookup = async (hostname) => {
     lookups.push(hostname);
     if (lookupDelayMs) await new Promise(r => setTimeout(r, lookupDelayMs));
-    // A public address, so the vetting passes and the URI is signed.
-    return [{ address: '93.184.216.34', family: 4 }];
+    if (lookupError) throw lookupError;
+    return lookupAddresses;
 };
 
 const {
@@ -64,6 +70,8 @@ function playlistOver(hosts) {
 function reset() {
     lookups = [];
     lookupDelayMs = 0;
+    lookupAddresses = PUBLIC_ANSWER;
+    lookupError = null;
     hlsOriginVetCache.clear();
     dnsPins.clear();
 }
@@ -77,24 +85,25 @@ test('the bounds are configurable', () => {
 });
 
 test('a playlist naming many origins resolves only up to the cap', async () => {
+    // The assertion on the excess URIs used to be that they were left exactly as
+    // the provider wrote them. That was the leak: on an Xtream panel those lines
+    // are absolute URLs carrying the account's credentials, so a playlist served
+    // half-rewritten hands them to the player. Past the cap the playlist is
+    // refused instead, the same answer the deadline gives.
     const hosts = Array.from({ length: 40 }, (_, i) => `h${i}.example.com`);
-    const out = await rewriteHlsPlaylist(
-        playlistOver(hosts),
-        'http://h0.example.com/live.m3u8',
-        makeHlsProxyMapper('http://addon.test', CFG, ALLOWED)
+    await assert.rejects(
+        () => rewriteHlsPlaylist(
+            playlistOver(hosts),
+            'http://h0.example.com/live.m3u8',
+            makeHlsProxyMapper('http://addon.test', CFG, ALLOWED)
+        ),
+        (e) => e.code === 'PLAYLIST_TARGET_REFUSED'
     );
-
-    const signed = out.split('\n').filter(l => l.includes('/proxy/hls?u=')).length;
-    assert.equal(signed, MAX_PLAYLIST_ORIGINS, 'only the capped origins may be signed');
 
     // The cap has to stop the *work*, not just the signing — that is the whole
     // point. 40 origins must not cost 40 resolutions.
     assert.equal(new Set(lookups).size, MAX_PLAYLIST_ORIGINS,
         `resolved ${new Set(lookups).size} hosts, expected ${MAX_PLAYLIST_ORIGINS}`);
-
-    // Past the cap a URI is left exactly as the provider wrote it, which is the
-    // same answer an unresolvable target already gets — not dropped.
-    assert.ok(out.includes('http://h39.example.com/seg.ts'), 'excess URIs must be left verbatim');
 });
 
 test('a real playlist, all on one host, is unaffected by the cap', async () => {
@@ -147,9 +156,51 @@ test('concurrent rewrites of the same origin share one resolution', async () => 
     assert.equal(lookups.length, 1);
 });
 
+test('a lookup that merely failed is not remembered as a refusal', async () => {
+    // The vet cache holds a verdict for DNS_PIN_TTL_MS. A resolver blip cached as
+    // "refused" used to leave the origin unsignable for the rest of that window,
+    // and an unsignable origin now costs the whole playlist — so one failed
+    // lookup would take a live channel down for a minute.
+    const body = playlistOver(['cdn.example.com']);
+    const map = () => makeHlsProxyMapper('http://addon.test', CFG, ALLOWED);
+
+    lookupError = new Error('queryA EAI_AGAIN cdn.example.com');
+    await assert.rejects(
+        () => rewriteHlsPlaylist(body, 'http://cdn.example.com/live.m3u8', map()),
+        (e) => e.code === 'PLAYLIST_TARGET_REFUSED'
+    );
+
+    // The resolver recovers, and the very next rewrite succeeds.
+    lookupError = null;
+    const out = await rewriteHlsPlaylist(body, 'http://cdn.example.com/live.m3u8', map());
+    assert.ok(out.includes('/proxy/hls?u='), 'a transient failure was cached as a verdict');
+});
+
+test('a private address is remembered, so it costs one lookup', async () => {
+    // The other half: a policy refusal is a real verdict and stays cached, which
+    // is what keeps a hostile playlist from re-resolving on every pass.
+    const body = playlistOver(['internal.example.com']);
+    const allowed = new Set(['http://internal.example.com']);
+    const map = () => makeHlsProxyMapper('http://addon.test', CFG, allowed);
+
+    lookupAddresses = [{ address: '10.0.0.5', family: 4 }];
+    for (let i = 0; i < 3; i++) {
+        await assert.rejects(
+            () => rewriteHlsPlaylist(body, 'http://internal.example.com/live.m3u8', map()),
+            (e) => e.code === 'PLAYLIST_TARGET_REFUSED'
+        );
+    }
+    assert.equal(lookups.length, 1, 'a settled refusal was re-resolved');
+});
+
 test('the rewrite phase gives up on its own deadline', async () => {
     // A mapper that never returns quickly is the shape a slow resolver produces.
-    const slow = async () => { await new Promise(r => setTimeout(r, 40)); return null; };
+    // Slow, but it does map: a mapper that refused would now fail the playlist on
+    // its first line and the deadline would never be reached.
+    const slow = async (uri) => {
+        await new Promise(r => setTimeout(r, 40));
+        return `http://addon.test/p?u=${encodeURIComponent(uri)}`;
+    };
     const hosts = Array.from({ length: 500 }, (_, i) => `h${i}.example.com`);
 
     const started = Date.now();

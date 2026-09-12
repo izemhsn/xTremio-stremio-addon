@@ -96,11 +96,14 @@ test('a mapper built without an origin set signs nothing', async () => {
     assert.equal(await forgetful(`${PANEL}/live/u/p/1.ts`), null);
 });
 
-test('a hostile playlist is rewritten into one this server will serve', async () => {
-    // End to end through the rewrite: the provider names its own segments plus
-    // several unrelated hosts. Only its own survive as proxy links, and the rest
-    // are left verbatim rather than dropped, so the playlist is not corrupted —
-    // the player simply fails on those lines.
+test('a playlist naming a host it may not proxy is refused whole', async () => {
+    // This used to assert the opposite: the foreign lines were left verbatim so
+    // the playlist was not corrupted. That is the leak S2 closes — the lines left
+    // behind are the provider's own URLs, and on an Xtream panel those carry the
+    // account's credentials, which is the disclosure the rewrite exists to
+    // prevent. Refusing is also what the rewrite deadline already does, and
+    // dropping only the offending line is not equivalent: a dropped EXT-X-KEY URI
+    // leaves the player treating encrypted segments as plaintext.
     const playlist = [
         '#EXTM3U',
         '#EXT-X-KEY:METHOD=AES-128,URI="https://example.com/secret-key"',
@@ -113,10 +116,28 @@ test('a hostile playlist is rewritten into one this server will serve', async ()
         ''
     ].join('\n');
 
+    await assert.rejects(
+        () => rewriteHlsPlaylist(playlist, `${CDN}/hls/abc/1.m3u8`, mapper()),
+        (e) => e.code === 'PLAYLIST_TARGET_REFUSED'
+    );
+});
+
+test('a playlist naming only allowed origins is rewritten in full', async () => {
+    // The other side of the rule: an ordinary provider playlist still works, and
+    // nothing of the provider's own URLs survives in it.
+    const playlist = [
+        '#EXTM3U',
+        `#EXT-X-KEY:METHOD=AES-128,URI="${CDN}/hls/abc/key.bin"`,
+        '#EXTINF:10,',
+        `${CDN}/hls/abc/1.ts`,
+        '#EXTINF:10,',
+        `${PANEL}/live/u/p/2.ts`,
+        ''
+    ].join('\n');
+
     const out = await rewriteHlsPlaylist(playlist, `${CDN}/hls/abc/1.m3u8`, mapper());
 
-    assert.equal((out.match(/proxy\/hls\?/g) || []).length, 2, 'only the provider segments are signed');
-    assert.ok(out.includes('URI="https://example.com/secret-key"'), 'the foreign key URI is left alone');
-    assert.ok(out.includes('https://www.iana.org/unrelated/asset.ts'), 'the foreign segment is left alone');
+    assert.equal((out.match(/proxy\/hls\?/g) || []).length, 3, 'key and both segments signed');
     assert.ok(!out.includes(`${CDN}/hls/abc/1.ts`), 'the provider segment must not be relayed raw');
+    assert.ok(!out.includes(`${PANEL}/live/u/p/2.ts`), 'the panel URL must not be relayed raw');
 });
