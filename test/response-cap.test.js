@@ -5,7 +5,7 @@ process.env.CONFIG_SECRET = 'test-secret-for-unit-tests';
 const test = require('node:test');
 const assert = require('node:assert');
 
-const { readJsonCapped, MAX_UPSTREAM_BYTES } = require('../index.js');
+const { readJsonCapped, estimateBytes, MAX_UPSTREAM_BYTES, MAX_PARSED_TO_BODY_RATIO } = require('../index.js');
 
 // Builds a fetch-like Response whose body streams `chunkCount` chunks of
 // `chunkSize` bytes, and records whether the reader was cancelled early.
@@ -176,4 +176,112 @@ test('each copy of the body is released before the next is allocated', () => {
     assert.ok(drop > concat && drop < stringify, 'chunks must be released between the concat and the stringify');
     assert.ok(release > stringify && release < parse, 'the buffer must be released between the stringify and the parse');
     assert.ok(!/JSON\.parse\(Buffer\.concat/.test(fn), 'the one-expression form keeps every copy alive');
+});
+
+// --- what a body parses to (audit S4) ----------------------------------------
+//
+// The byte cap bounds the body, not what JSON.parse builds from it, and the two
+// differ by shape. A 16 MB [{},{},…] body retained 341 MB of heap after GC — 21x
+// its size — and blocked for about a second while it was built. At the default
+// MAX_UPSTREAM_MB that is ~1.4 GB from one response, and every byte of it was
+// inside the byte cap.
+
+// Streams `text` in chunks and records what the reader was asked for.
+function trackedResponse(text, chunkSize) {
+    const buf = Buffer.from(text, 'utf8');
+    const state = { chunksRead: 0, cancelled: false, totalChunks: Math.ceil(buf.length / chunkSize) };
+    let offset = 0;
+    return {
+        state,
+        res: {
+            ok: true,
+            status: 200,
+            headers: { get: () => null },
+            body: {
+                getReader: () => ({
+                    async read() {
+                        if (offset >= buf.length) return { done: true, value: undefined };
+                        const value = buf.subarray(offset, offset + chunkSize);
+                        offset += chunkSize;
+                        state.chunksRead++;
+                        return { done: false, value };
+                    },
+                    async cancel() { state.cancelled = true; }
+                })
+            },
+            json: async () => { throw new Error('json() should not be used when a body is present'); }
+        }
+    };
+}
+
+const MB = 1024 * 1024;
+
+test('a body shaped to inflate is refused mid-stream, inside its byte cap', async () => {
+    // 1 MB of [{},{},…] against a 1 MB byte cap, so the byte cap never trips. It
+    // estimates at ~22 MB parsed, so it is refused after roughly a tenth of the
+    // body. Stopping early is also the proof that it was never parsed: JSON.parse
+    // runs only once the read loop has finished.
+    const text = '[' + new Array(Math.floor((MB - 2) / 3)).fill('{}').join(',') + ']';
+    assert.ok(Buffer.byteLength(text) <= MB);
+    const { res, state } = trackedResponse(text, 16 * 1024);
+
+    const allowedMb = MAX_PARSED_TO_BODY_RATIO;
+    await assert.rejects(
+        () => readJsonCapped(res, 'test', MB),
+        new RegExp(`shaped to parse to more than ${allowedMb} MB`)
+    );
+    assert.ok(state.cancelled, 'the socket is released rather than drained');
+    assert.ok(
+        state.chunksRead < state.totalChunks / 4,
+        `stopped after ${state.chunksRead} of ${state.totalChunks} chunks`
+    );
+});
+
+test('a realistic list up to its byte cap is never refused by the shape check', async () => {
+    // The other side of the ratio. Every real list must reach its byte cap before
+    // this check, or a large provider's catalog is turned away by a guard meant for
+    // hostile ones. These are the three list shapes an Xtream panel serves; live
+    // estimates highest of the three, at ~1.3x its size.
+    const shapes = {
+        vod: (i) => ({
+            num: i, name: `Some Movie Title ${i} (2019)`, stream_type: 'movie', stream_id: 100000 + i,
+            stream_icon: `http://img.example.com/posters/p${i}.jpg`, rating: '6.5', rating_5based: 3.25,
+            added: '1577836800', is_adult: '0', category_id: '20', category_ids: [20],
+            container_extension: 'mkv', custom_sid: '', direct_source: ''
+        }),
+        live: (i) => ({
+            num: i, name: `CH ${i}`, stream_type: 'live', stream_id: i, stream_icon: '', epg_channel_id: '',
+            added: '1577836800', is_adult: 0, category_id: '1', category_ids: [1], custom_sid: '',
+            tv_archive: 0, direct_source: '', tv_archive_duration: 0
+        }),
+        series: (i) => ({
+            num: i, name: `Series ${i}`, series_id: 5000 + i, cover: `http://img.example.com/c/${i}.jpg`,
+            plot: 'A family, torn apart by war, must find its way home, against all odds, in a land, far away.',
+            cast: 'Actor One, Actor Two, Actor Three', genre: 'Drama, Action', rating_5based: 3.5,
+            backdrop_path: [`http://img.example.com/b/${i}.jpg`], category_id: '30', category_ids: [30]
+        })
+    };
+    for (const [kind, make] of Object.entries(shapes)) {
+        const items = Array.from({ length: 2000 }, (_, i) => make(i));
+        const text = JSON.stringify(items);
+        const { res } = trackedResponse(text, 16 * 1024);
+        // The byte cap is the body's exact size: as close to refusal as a real list gets.
+        const parsed = await readJsonCapped(res, 'test', Buffer.byteLength(text));
+        assert.equal(parsed.length, items.length, `${kind} list parsed whole`);
+    }
+});
+
+test('a parsed payload is weighed from its whole body, not from a sample', async () => {
+    // A sample can be steered: its positions follow from the list length, so a list
+    // whose sampled items are empty and whose others are deeply nested is weighed
+    // far below its real cost. The body the reader already counted cannot be.
+    const nested = { a: { b: { c: { d: {} } } } };
+    // 2000 items sample every 100th, and every 100th is the empty one.
+    const items = Array.from({ length: 2000 }, (_, i) => (i % 100 === 0 ? {} : nested));
+    const text = JSON.stringify(items);
+    const { res } = trackedResponse(text, 4096);
+
+    const fromBody = estimateBytes(await readJsonCapped(res, 'test', MB));
+    const fromSample = estimateBytes(JSON.parse(text));
+    assert.ok(fromBody > 3 * fromSample, `whole body weighed ${fromBody}, the steered sample ${fromSample}`);
 });

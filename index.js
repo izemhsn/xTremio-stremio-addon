@@ -1019,6 +1019,46 @@ async function safeFetch(inputUrl, options = {}, { maxRedirects = 3, onFinalUrl 
 // return tens of MB for get_vod_streams, so the cap is generous but finite.
 const MAX_UPSTREAM_BYTES = Math.max(1, Number(process.env.MAX_UPSTREAM_MB) || 64) * 1024 * 1024;
 
+// What a JSON body will cost once parsed, estimated from its bytes as they
+// arrive. The byte count alone is the wrong measure, because the parsed graph
+// depends on the body's *shape*, and a hostile shape inflates by more than twenty
+// times. Measured on Node 24 with 16 MB bodies, heap retained after GC:
+//
+//   realistic get_vod_streams     18 MB  (1.1x)      [{},{},…]    341 MB  (21x)
+//   realistic get_series_info     20 MB  (1.2x)      [[],[],…]    213 MB  (13x)
+//
+// Nearly all of that difference is per-value overhead, and the structural bytes
+// expose it: every object opens with `{`, every array with `[`, and every further
+// member or element is preceded by `,`. So those three bytes are weighed by what
+// the value behind them costs — an empty object 56 bytes, an array 32, a slot 8 —
+// plus half a byte per body byte for string payload. Across eleven shapes the
+// estimate lands within 0.78x-1.27x of measured heap for every realistic body,
+// and at or above it for every hostile one (1.02x for [{},{},…]). The one shape
+// it under-counts is a single long string, by half, which is harmless: that
+// string costs about the body itself, and the byte cap already bounds the body.
+// The three bytes are counted wherever they appear, inside strings too. A comma
+// in a plot adds eight bytes that are not really there, and over-counting is the
+// safe side to be wrong on — the alternative is a string-aware scanner running on
+// every byte of every list.
+const PARSED_WEIGHT = new Uint8Array(256);
+PARSED_WEIGHT[0x7b] = 56; // {
+PARSED_WEIGHT[0x5b] = 32; // [
+PARSED_WEIGHT[0x2c] = 8;  // ,
+
+// How large a body may be *estimated* to parse to, relative to its own byte cap.
+// Every realistic body measured estimates at 1.0-1.3x its size, so it reaches the
+// byte cap long before this one. A hostile [{},{},…] body estimates at ~22x, so
+// it is refused after ~6 MB of a 64 MB allowance — mid-download, and before
+// JSON.parse has built any of it. That puts the graph a single response can
+// produce at about 128 MB at the defaults; the same body shape used to reach
+// ~1.4 GB (341 MB measured at 16 MB, scaled to MAX_UPSTREAM_MB).
+const MAX_PARSED_TO_BODY_RATIO = 2;
+
+// The estimate each parsed payload arrived with, so the caches can weigh it from
+// every byte of its body rather than from a sample. Keyed by the parsed value, so
+// an entry lives exactly as long as the value does.
+const parsedSizeEstimates = new WeakMap();
+
 async function readJsonCapped(res, label, maxBytes = MAX_UPSTREAM_BYTES) {
     // Trust a declared length to reject early, before reading a single byte.
     const declared = Number(res.headers?.get?.('content-length'));
@@ -1031,6 +1071,20 @@ async function readJsonCapped(res, label, maxBytes = MAX_UPSTREAM_BYTES) {
     const reader = res.body.getReader();
     const chunks = [];
     let total = 0;
+    let structural = 0;
+    const maxParsedBytes = maxBytes * MAX_PARSED_TO_BODY_RATIO;
+    // The count costs a few milliseconds per megabyte, and it does not spread
+    // itself across the download. When a fast upstream has already buffered the
+    // body, read() resolves chunk after chunk as microtasks without ever returning
+    // to the event loop, so the whole count ran as one block and merged with the
+    // parse that follows it: on a 25 MB list the longest event-loop stall grew from
+    // 179 ms to 247 ms, on the thread that relays every video. Handing the loop
+    // back once per counted megabyte keeps each slice of that work to a few
+    // milliseconds, at the cost of one setImmediate hop per megabyte. Measured
+    // with it, the same list's longest stall is 128 ms, against 131 ms before the
+    // count existed; the count still adds ~80 ms of total time, just not in one go.
+    const YIELD_EVERY_BYTES = 1024 * 1024;
+    let nextYieldAt = YIELD_EVERY_BYTES;
     for (;;) {
         const { done, value } = await reader.read();
         if (done) break;
@@ -1040,7 +1094,21 @@ async function readJsonCapped(res, label, maxBytes = MAX_UPSTREAM_BYTES) {
             await reader.cancel().catch(() => {});
             throw new Error(`${label} response exceeded ${maxBytes} bytes`);
         }
+        // Checked per chunk, like the byte cap, so a hostile body is refused before
+        // the rest of it arrives rather than after JSON.parse has inflated it.
+        for (let i = 0; i < value.length; i++) structural += PARSED_WEIGHT[value[i]];
+        if (structural + total / 2 > maxParsedBytes) {
+            await reader.cancel().catch(() => {});
+            throw new Error(
+                `${label} response is shaped to parse to more than ${Math.round(maxParsedBytes / 1048576)} MB ` +
+                `after ${total} bytes; refusing it before parsing`
+            );
+        }
         chunks.push(Buffer.from(value));
+        if (total >= nextYieldAt) {
+            nextYieldAt = total + YIELD_EVERY_BYTES;
+            await new Promise((resolve) => setImmediate(resolve));
+        }
     }
     // Written as four statements rather than one expression because each step
     // allocates a full copy of the body and the references are what decide how
@@ -1056,7 +1124,9 @@ async function readJsonCapped(res, label, maxBytes = MAX_UPSTREAM_BYTES) {
     chunks.length = 0;
     const text = buf.toString('utf8');
     buf = null;
-    return JSON.parse(text);
+    const data = JSON.parse(text);
+    if (data !== null && typeof data === 'object') parsedSizeEstimates.set(data, structural + total / 2);
+    return data;
 }
 
 async function xtremioGet(cfg, action, params = {}, { timeoutMs = 15000 } = {}) {
@@ -1125,6 +1195,69 @@ function accountCacheKey(cfg) {
     return `${cfg.serverUrl}\n${cfg.username}\n${cfg.password}`;
 }
 
+// One memory budget shared by every data cache (CACHE_MAX_MB). Each cache is also
+// bounded on its own, but those bounds were set independently and only ever added
+// up in prose — and four of them counted entries alone, so the sum was not a bound
+// at all: a hundred per-category lists at 7 MB each is 700 MB inside
+// CACHE_MAX_CATEGORY_LISTS, and an instance serving a few large providers could
+// reach 1-1.5 GB inside every configured limit (audit R2). This is the number a
+// container is actually sized by.
+//
+// It is least-recently-used across all the caches, in one order. A read in any of
+// them moves that entry to the recent end, and when the total is over, the oldest
+// entry anywhere goes first — which can be a stream list evicted to admit a series
+// payload, because the series payload was used more recently. Entries are tracked
+// by the entry object rather than by key, so two caches that happen to share a key
+// string cannot collide here, and each remembers the weight it was added with, so
+// the total cannot drift if an entry is mutated in place.
+class CacheBudget {
+    constructor(maxBytes) {
+        this.maxBytes = maxBytes;
+        this.totalBytes = 0;
+        this.order = new Map(); // entry -> { owner, key, bytes }
+    }
+
+    add(entry, owner, key) {
+        const bytes = weightOf(entry);
+        this.order.set(entry, { owner, key, bytes });
+        this.totalBytes += bytes;
+    }
+
+    touch(entry) {
+        const ref = this.order.get(entry);
+        if (!ref) return;
+        this.order.delete(entry);
+        this.order.set(entry, ref);
+    }
+
+    remove(entry) {
+        const ref = this.order.get(entry);
+        if (!ref) return;
+        this.order.delete(entry);
+        this.totalBytes -= ref.bytes;
+    }
+
+    // Evicts oldest-first until the total fits, never the entry just written.
+    // Eviction goes through the owning cache, so its own total and its onEvict
+    // report stay right; the size check afterwards is what guarantees the loop
+    // ends even if an owner were ever to fail to release its entry.
+    enforce(keep) {
+        while (this.totalBytes > this.maxBytes) {
+            let victim = null;
+            for (const [entry, ref] of this.order) {
+                if (entry !== keep) {
+                    victim = ref;
+                    break;
+                }
+            }
+            if (!victim) break;
+            const before = this.order.size;
+            victim.owner.evict(victim.key, 'global budget');
+            if (this.order.size === before) break;
+        }
+    }
+}
+
 // Every cache below was previously an unbounded Map whose TTL was only checked
 // on read, so nothing was ever deleted: memory grew with every distinct account
 // and every series ever opened, and never shrank when users went away.
@@ -1139,12 +1272,16 @@ class BoundedMap extends Map {
     // 25 MB catalog and another is a few KB of categories. `onEvict` reports
     // what was dropped and why, which is how the stream caches notice they are
     // thrashing rather than caching.
-    constructor({ maxEntries, maxAgeMs = null, maxBytes = null, onEvict = null }) {
+    // `ledger`, when given, is the CacheBudget this map's entries are charged to as
+    // well; every production data cache passes CACHE_BUDGET. Opt-in, so a map made
+    // for a test is not quietly competing with the real caches for their budget.
+    constructor({ maxEntries, maxAgeMs = null, maxBytes = null, onEvict = null, ledger = null }) {
         super();
         this.maxEntries = maxEntries;
         this.maxAgeMs = maxAgeMs;
         this.maxBytes = maxBytes;
         this.onEvict = onEvict;
+        this.ledger = ledger;
         this.totalBytes = 0;
     }
 
@@ -1154,6 +1291,7 @@ class BoundedMap extends Map {
         // Touch: delete + re-insert moves this key to the most-recent end.
         super.delete(key);
         super.set(key, entry);
+        if (this.ledger) this.ledger.touch(entry);
         return entry;
     }
 
@@ -1167,11 +1305,31 @@ class BoundedMap extends Map {
     }
 
     set(key, value) {
+        // An entry the shared budget could never hold is not stored at all. The
+        // rule below keeps a single entry over *this* map's budget rather than
+        // refetch it on every request, and that is right for a per-cache bound. On
+        // the shared one it would evict every other cache's entries — every other
+        // account's data — for an entry that still did not fit, and then keep it.
+        // What it would have replaced goes too: that was the caller's intent.
+        if (this.ledger && weightOf(value) > this.ledger.maxBytes) {
+            this.delete(key);
+            console.warn(
+                `[cache] not caching a ${Math.round(weightOf(value) / 1048576)} MB entry: larger than the ` +
+                `whole CACHE_MAX_MB budget (${Math.round(this.ledger.maxBytes / 1048576)} MB). It will be ` +
+                'fetched again on every request; raise CACHE_MAX_MB if a real provider sends lists this large'
+            );
+            return this;
+        }
+
         const replaced = super.get(key);
-        if (replaced) this.totalBytes -= weightOf(replaced);
+        if (replaced) {
+            this.totalBytes -= weightOf(replaced);
+            if (this.ledger) this.ledger.remove(replaced);
+        }
         super.delete(key);
         super.set(key, value);
         this.totalBytes += weightOf(value);
+        if (this.ledger) this.ledger.add(value, this, key);
 
         // Never evict what was just written, even when a single entry is larger
         // than the whole budget: refusing to cache it at all would mean
@@ -1182,6 +1340,7 @@ class BoundedMap extends Map {
             if (oldest.done || oldest.value === key) break;
             this.evict(oldest.value, this.size > this.maxEntries ? 'entry count' : 'byte budget');
         }
+        if (this.ledger) this.ledger.enforce(value);
         return this;
     }
 
@@ -1193,16 +1352,23 @@ class BoundedMap extends Map {
         const entry = super.get(key);
         super.delete(key);
         this.totalBytes -= weightOf(entry);
+        if (this.ledger) this.ledger.remove(entry);
         if (this.onEvict) this.onEvict(key, entry, reason);
         return entry;
     }
 
     delete(key) {
-        if (super.has(key)) this.totalBytes -= weightOf(super.get(key));
+        if (super.has(key)) {
+            const entry = super.get(key);
+            this.totalBytes -= weightOf(entry);
+            if (this.ledger) this.ledger.remove(entry);
+        }
         return super.delete(key);
     }
 
+    // Releases only this map's share of a shared budget, not the whole of it.
     clear() {
+        if (this.ledger) for (const entry of super.values()) this.ledger.remove(entry);
         this.totalBytes = 0;
         return super.clear();
     }
@@ -1216,6 +1382,7 @@ class BoundedMap extends Map {
             if (entry && typeof entry.ts === 'number' && entry.ts <= now - this.maxAgeMs) {
                 super.delete(key);
                 this.totalBytes -= weightOf(entry);
+                if (this.ledger) this.ledger.remove(entry);
                 dropped++;
             }
         }
@@ -1227,15 +1394,27 @@ function weightOf(entry) {
     return typeof entry?.bytes === 'number' ? entry.bytes : 0;
 }
 
-// Sampled rather than measured: JSON.stringify over a 25 MB list allocates a
-// second 25 MB string to learn what twenty items already say, and doubling peak
-// memory to police memory would be self-defeating. Stream lists are thousands
-// of near-identical records, so a sample is accurate to within a few percent —
-// and a budget only needs a proxy, not a byte count.
+// What a cached value costs in memory — the parsed graph, not its serialized text.
+// It used to be the serialized length, which is what let a hostile list through:
+// `{}` serializes to two bytes and occupies 56, so a [{},{},…] list was weighed at
+// a twentieth of its real size, fitted the stream budget, and was kept for half
+// an hour. The weights are readJsonCapped's; see PARSED_WEIGHT.
 function estimateBytes(value) {
+    // A payload read from upstream was weighed from every byte of its body as it
+    // arrived, which no sample can match — and a sample can be steered, because
+    // its positions follow from the list's length alone.
+    if (value !== null && typeof value === 'object') {
+        const measured = parsedSizeEstimates.get(value);
+        if (measured !== undefined) return Math.round(measured);
+    }
+
+    // Everything else is sampled rather than serialized whole: JSON.stringify over
+    // a 25 MB list allocates a second 25 MB string to learn what twenty items
+    // already say, and doubling peak memory to police memory would be
+    // self-defeating.
     if (!Array.isArray(value)) {
         try {
-            return JSON.stringify(value)?.length ?? 0;
+            return Math.round(weighJson(JSON.stringify(value)));
         } catch {
             return 0;
         }
@@ -1247,13 +1426,29 @@ function estimateBytes(value) {
     let counted = 0;
     for (let i = 0; i < value.length; i += step) {
         try {
-            sampled += JSON.stringify(value[i])?.length ?? 0;
+            sampled += weighJson(JSON.stringify(value[i]));
         } catch {
             // A circular or unserializable item tells us nothing; skip it.
         }
         counted++;
     }
-    return counted ? Math.round((sampled / counted) * value.length) : 0;
+    if (!counted) return 0;
+    // Plus the list's own slots, which no item's JSON includes — the separating
+    // commas the streamed estimate counts. Without them the two paths disagree by
+    // a sixth on exactly the list this exists to catch: [{},{},…], at 57 bytes an
+    // item sampled against 65 streamed.
+    return Math.round((sampled / counted) * value.length + PARSED_WEIGHT[0x2c] * value.length);
+}
+
+// The streaming estimate, applied to text already in hand.
+function weighJson(text) {
+    if (typeof text !== 'string') return 0;
+    let structural = 0;
+    for (let i = 0; i < text.length; i++) {
+        const c = text.charCodeAt(i);
+        if (c < 256) structural += PARSED_WEIGHT[c];
+    }
+    return structural + text.length / 2;
 }
 
 // Category lists are small (a few KB per account), so the bound here is about
@@ -1267,10 +1462,12 @@ const CACHE_MAX_STREAM_ACCOUNTS = Math.max(1, Number(process.env.CACHE_MAX_STREA
 
 // Counting entries is not the same as bounding memory: four accounts' worth of
 // entries could be four megabytes or four hundred, and only the second one
-// matters. This is a serialized-JSON budget *per kind*, so the ceiling across
-// live, movies and series is three times it. Resident cost is a multiple of
-// that again — a parsed graph of many small objects typically runs 3-10× its
-// serialized size — which is the number to scale down on a small container.
+// matters. This is a budget *per kind*, so the ceiling across live, movies and
+// series is three times it, and it is measured in estimated heap — what an entry
+// occupies once parsed (see estimateBytes). It was measured in serialized JSON,
+// with resident cost said to run 3-10× that. Measured, a realistic list occupies
+// 1.1-1.4× its text and a hostile one 21×: no single multiplier describes both,
+// which is why the unit changed rather than the multiplier.
 const CACHE_MAX_STREAM_BYTES = Math.max(1, Number(process.env.CACHE_MAX_STREAM_MB) || 64) * 1024 * 1024;
 
 // One entry per series *per account* — the only dimension that grows without
@@ -1281,10 +1478,18 @@ const CACHE_MAX_SERIES_INFO = Math.max(1, Number(process.env.CACHE_MAX_SERIES_IN
 // kilobytes, not megabytes — so this bound is about entry count, not size.
 const CACHE_MAX_VOD_INFO = Math.max(1, Number(process.env.CACHE_MAX_VOD_INFO) || 500);
 
-// Per-category stream lists: one entry per category per account. Each is a
-// slice of the full list, so a few hundred KB at most, but the count grows with
-// every genre a user opens.
+// Per-category stream lists: one entry per category per account, and the count
+// grows with every genre a user opens. Each is a slice of the full list — usually
+// small, but a 20k-title category is ~7 MB, and a hundred of those is what
+// CACHE_MAX_MB below exists to stop.
 const CACHE_MAX_CATEGORY_LISTS = Math.max(1, Number(process.env.CACHE_MAX_CATEGORY_LISTS) || 100);
+
+// The shared ceiling across every data cache; see CacheBudget. 256 MB is about what
+// the per-cache bounds were meant to add up to — three 64 MB stream budgets, plus
+// room for the small caches — so a deployment that sat inside them before rarely
+// meets this one, and one that did not is now held to it.
+const CACHE_MAX_BYTES = Math.max(1, Number(process.env.CACHE_MAX_MB) || 256) * 1024 * 1024;
+const CACHE_BUDGET = new CacheBudget(CACHE_MAX_BYTES);
 
 // getCategories intentionally serves expired categories when a refresh fails
 // (stale beats empty — see CACHE_FAILURE_TTL), so age-sweeping catCache on the
@@ -1294,7 +1499,8 @@ const CACHE_STALE_MAX_AGE_MS = 24 * 60 * 60 * 1000;
 
 const catCache = new BoundedMap({
     maxEntries: CACHE_MAX_ACCOUNTS,
-    maxAgeMs: CACHE_STALE_MAX_AGE_MS
+    maxAgeMs: CACHE_STALE_MAX_AGE_MS,
+    ledger: CACHE_BUDGET
 });
 
 const categoriesSingleFlight = createSingleFlight();
@@ -1332,6 +1538,10 @@ async function refreshCategories(cfg, key) {
         ts: Date.now(),
         ttl: failed ? CACHE_FAILURE_TTL : CACHE_TTL
     };
+    // Weighed by its three lists. A failed refresh reuses the stale arrays, but the
+    // entry it writes replaces the one that held them, so they are never counted
+    // twice.
+    entry.bytes = estimateBytes(entry.live) + estimateBytes(entry.movies) + estimateBytes(entry.series);
     if (failed) {
         console.warn(`[getCategories] partial or total failure; serving ${cached ? 'stale' : 'empty'} data, retrying in ${CACHE_FAILURE_TTL / 1000}s`);
     }
@@ -1364,16 +1574,21 @@ function createStreamListCache() {
         maxEntries: CACHE_MAX_STREAM_ACCOUNTS,
         maxAgeMs: CACHE_TTL,
         maxBytes: CACHE_MAX_STREAM_BYTES,
+        ledger: CACHE_BUDGET,
         // Evicting an entry that has not expired means the bounds are too tight
         // for the load: that account's next request refetches 10-50 MB, and
         // nothing else would say so. An expired entry leaving is routine and
-        // silent.
+        // silent. The advice names the bound that actually did it — raising the
+        // per-kind budget does nothing when the shared one is the tight one.
         onEvict(key, entry, reason) {
             if (entry && entry.ts > Date.now() - CACHE_TTL) {
+                const knob = reason === 'global budget'
+                    ? 'CACHE_MAX_MB'
+                    : 'CACHE_MAX_STREAM_ACCOUNTS or CACHE_MAX_STREAM_MB';
                 console.warn(
                     `[cache] evicted a live stream list on ${reason} ` +
                     `(${Math.round((entry.bytes || 0) / 1024 / 1024)} MB); ` +
-                    'raise CACHE_MAX_STREAM_ACCOUNTS or CACHE_MAX_STREAM_MB if this repeats'
+                    `raise ${knob} if this repeats`
                 );
             }
         }
@@ -1443,8 +1658,10 @@ function createStreamListCache() {
 // caches added for the per-item and per-category paths are exactly it.
 // `ttlFor(data)` shortens one entry's lifetime. It is capped at `ttl`, which is
 // also the age the sweeper reclaims entries at.
-function createKeyedCache({ maxEntries, ttl = CACHE_TTL, ttlFor = null }) {
-    const map = new BoundedMap({ maxEntries, maxAgeMs: ttl });
+// `ledger` weighs each entry and charges it to that CacheBudget; the production
+// caches pass CACHE_BUDGET. Without one, entries carry no weight, as before.
+function createKeyedCache({ maxEntries, ttl = CACHE_TTL, ttlFor = null, ledger = null }) {
+    const map = new BoundedMap({ maxEntries, maxAgeMs: ttl, ledger });
     const singleFlight = createSingleFlight();
     // Returns the entry, not the value: a legitimately null payload must still
     // read as a hit rather than sending every caller back upstream.
@@ -1466,7 +1683,12 @@ function createKeyedCache({ maxEntries, ttl = CACHE_TTL, ttlFor = null }) {
                 const warm = liveEntry(key);
                 if (warm) return warm.data;
                 const data = await fetcher();
-                map.set(key, { data, ts: Date.now(), ttl: ttlFor ? Math.min(ttl, ttlFor(data)) : ttl });
+                map.set(key, {
+                    data,
+                    ts: Date.now(),
+                    ttl: ttlFor ? Math.min(ttl, ttlFor(data)) : ttl,
+                    ...(ledger ? { bytes: estimateBytes(data) } : {})
+                });
                 return data;
             });
         }
@@ -1667,6 +1889,7 @@ async function getStreams(cfg, action, params = {}) {
 // a category that served 500 items with an empty list on a later load.
 const categoryStreamsCache = createKeyedCache({
     maxEntries: CACHE_MAX_CATEGORY_LISTS,
+    ledger: CACHE_BUDGET,
     ttlFor: list => (list.length ? CACHE_TTL : CACHE_FAILURE_TTL)
 });
 
@@ -1738,7 +1961,8 @@ const SERIES_INFO_NEGATIVE_TTL = Math.max(1000, Number(process.env.SERIES_INFO_N
 
 const seriesInfoCache = new BoundedMap({
     maxEntries: CACHE_MAX_SERIES_INFO,
-    maxAgeMs: CACHE_TTL
+    maxAgeMs: CACHE_TTL,
+    ledger: CACHE_BUDGET
 });
 
 // The LRU bound caps the worst case, but on its own it only reclaims memory
@@ -1788,7 +2012,12 @@ function getCachedSeriesInfo(cfg, seriesId) {
 }
 
 function setCachedSeriesInfo(cfg, seriesId, data) {
-    seriesInfoCache.set(seriesInfoCacheKey(cfg, seriesId), { data, ts: Date.now(), ttl: CACHE_TTL });
+    seriesInfoCache.set(seriesInfoCacheKey(cfg, seriesId), {
+        data,
+        ts: Date.now(),
+        ttl: CACHE_TTL,
+        bytes: estimateBytes(data)
+    });
 }
 
 // Remembers *how* the series failed, so a cached failure reproduces exactly what
@@ -1800,7 +2029,8 @@ function setNegativeSeriesInfo(cfg, seriesId, { data, error }) {
         error,
         negative: true,
         ts: Date.now(),
-        ttl: SERIES_INFO_NEGATIVE_TTL
+        ttl: SERIES_INFO_NEGATIVE_TTL,
+        bytes: estimateBytes(data)
     });
 }
 
@@ -1862,7 +2092,7 @@ async function fetchSeriesInfo(cfg, seriesId) {
 // cache — `get_vod_info` is not flaky the way `get_series_info` is. Opening one
 // movie called it twice, once from the meta route and once from the stream
 // route, and re-opening the same movie paid both again: nothing cached it.
-const vodInfoCache = createKeyedCache({ maxEntries: CACHE_MAX_VOD_INFO });
+const vodInfoCache = createKeyedCache({ maxEntries: CACHE_MAX_VOD_INFO, ledger: CACHE_BUDGET });
 
 function vodInfoCacheKey(cfg, vodId) {
     return `${accountCacheKey(cfg)}\n${vodId}`;
@@ -3982,6 +4212,8 @@ module.exports = {
     isPrivateIp,
     readJsonCapped,
     MAX_UPSTREAM_BYTES,
+    MAX_PARSED_TO_BODY_RATIO,
+    weighJson,
     assertSafeOutboundUrl,
     discardBody,
     acquireProxySlot,
@@ -4036,6 +4268,9 @@ module.exports = {
     CACHE_MAX_SERIES_INFO,
     CACHE_MAX_VOD_INFO,
     CACHE_MAX_CATEGORY_LISTS,
+    CACHE_MAX_BYTES,
+    CACHE_BUDGET,
+    CacheBudget,
     CACHE_STALE_MAX_AGE_MS,
     readSeriesInfoEntry,
     setNegativeSeriesInfo,

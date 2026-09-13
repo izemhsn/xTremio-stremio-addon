@@ -19,6 +19,7 @@ const assert = require('node:assert');
 const {
     BoundedMap,
     estimateBytes,
+    weighJson,
     vodStreamsCache,
     CACHE_TTL,
     CACHE_MAX_STREAM_BYTES,
@@ -162,21 +163,36 @@ test('a cached stream list is weighed when it is stored', () => {
 
 // --- the estimator ---------------------------------------------------------
 
-test('estimateBytes lands close to the real serialized size', () => {
+test('estimateBytes samples a list to within a few percent of weighing all of it', () => {
     // Sampled, so it must be near — not exact — for the homogeneous lists this
-    // actually meters.
+    // actually meters. This used to compare against the serialized length, which
+    // is what the estimator measured; it now measures the parsed graph (see the
+    // next test), so the reference is the same weighing applied to the whole list.
     const items = Array.from({ length: 5000 }, (_, i) => ({
         stream_id: i, name: `Channel ${i}`, stream_icon: `http://cdn.test/${i}.png`, category_id: 7
     }));
-    const actual = JSON.stringify(items).length;
+    const whole = weighJson(JSON.stringify(items));
     const estimated = estimateBytes(items);
-    const error = Math.abs(estimated - actual) / actual;
-    assert.ok(error < 0.05, `estimate ${estimated} vs actual ${actual} (${(error * 100).toFixed(1)}% off)`);
+    const error = Math.abs(estimated - whole) / whole;
+    assert.ok(error < 0.05, `estimate ${estimated} vs whole list ${Math.round(whole)} (${(error * 100).toFixed(1)}% off)`);
+});
+
+test('a list of empty objects is weighed by what it occupies, not what it serializes to', () => {
+    // Audit S4. `{}` serializes to two bytes and occupies 56 once parsed. Weighing
+    // the text let a hostile [{},{},…] list fit the stream budget at a twentieth of
+    // its real size and stay cached for half an hour; measured, 16 MB of that body
+    // retained 341 MB of heap — 21x.
+    const items = Array.from({ length: 100000 }, () => ({}));
+    const serialized = JSON.stringify(items).length;
+    const weighed = estimateBytes(items);
+    assert.ok(weighed >= 20 * serialized, `weighed ${weighed} for ${serialized} bytes of text`);
 });
 
 test('estimateBytes handles the shapes that are not a big homogeneous list', () => {
     assert.equal(estimateBytes([]), 0);
-    assert.equal(estimateBytes(null), 4, 'JSON.stringify(null) is "null"');
+    // Was 4, the length of "null". Weighed as a graph it is four characters of
+    // text at half a byte each, and no structure.
+    assert.equal(estimateBytes(null), 2);
     assert.ok(estimateBytes({ a: 'x'.repeat(100) }) > 100);
 
     // A circular item cannot be measured; it must not throw or poison the total.
