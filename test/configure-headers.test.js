@@ -83,6 +83,16 @@ test('GET /configure sends the framing, CSP and sniffing headers', async () => {
     });
 });
 
+test('no response names the framework it runs on', async () => {
+    // Express announces itself with X-Powered-By unless told not to.
+    await withServer(async (base) => {
+        for (const path of ['/manifest.json', '/configure', '/no-such-route']) {
+            const res = await realFetch(`${base}${path}`);
+            assert.equal(res.headers.get('x-powered-by'), null, `${path} sent X-Powered-By`);
+        }
+    });
+});
+
 test('POST /configure sends them too', async () => {
     await withServer(async (base) => {
         // An empty body fails validation without any outbound call, which is

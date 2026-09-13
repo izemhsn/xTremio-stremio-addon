@@ -9,7 +9,11 @@ const net = require('net');
 const { Agent: UndiciAgent } = require('undici');
 
 const app = express();
-app.use(express.urlencoded({ extended: true }));
+// Free stack fingerprinting for anyone who can reach the port.
+app.disable('x-powered-by');
+// The only form is three flat string fields. Extended parsing (qs) would build
+// nested objects and arrays that asString then has to defend against.
+app.use(express.urlencoded({ extended: false }));
 
 // The Stremio addon protocol is called cross-origin by web.stremio.com, so its
 // JSON resources genuinely need a wildcard. Nothing else here does: /configure
@@ -2528,7 +2532,9 @@ async function validateXtremioCredentials(serverUrl, username, password) {
             // cap here, since an auth response is tiny and anything large is abuse.
             const json = await readJsonCapped(res, 'credential check', 1024 * 1024);
 
-            if (!json.user_info) return { valid: false, error: 'Not a valid xTremio server' };
+            // `?.`: a panel answering a literal `null` threw here, and the catch
+            // reported it as "Cannot reach that server", which it plainly could.
+            if (!json?.user_info) return { valid: false, error: 'Not a valid xTremio server' };
             if (json.user_info.auth !== 1) return { valid: false, error: 'Invalid username or password' };
             if (json.user_info.status !== 'Active') return { valid: false, error: `Account is ${json.user_info.status || 'inactive'}` };
 
@@ -3808,6 +3814,12 @@ async function relayUpstream(req, res, { upstreamUrl, label, ext, rewriteFor }) 
     // know from the extension that one is coming.
     const expectPlaylist = String(ext || '').toLowerCase() === 'm3u8';
     if (!expectPlaylist) {
+        // Left unset, undici's fetch offers gzip/deflate. An origin that honours
+        // that on a byte relay answers a Range with a Content-Range in
+        // *compressed* offsets, which no longer describe the decompressed bytes
+        // relayed — and decompressing video spends CPU on the relaying thread.
+        // Playlists keep the default: they are text and rewritten whole.
+        headers['Accept-Encoding'] = 'identity';
         if (req.headers.range) headers['Range'] = req.headers.range;
         if (req.headers['if-range']) headers['If-Range'] = req.headers['if-range'];
     }
@@ -3889,8 +3901,10 @@ async function relayUpstream(req, res, { upstreamUrl, label, ext, rewriteFor }) 
 
     const contentType = upstream.headers.get('content-type');
     // Only a complete 200 body is rewritable; a 206 is a fragment, and an error
-    // body is not a playlist whatever the extension says.
-    const mapper = (upstream.status === 200 && upstream.body && rewriteFor)
+    // body is not a playlist whatever the extension says. A successful HEAD has
+    // no body at all, but still needs to know a GET would be rewritten, so its
+    // headers do not describe the provider's unrewritten body.
+    const mapper = (upstream.status === 200 && (upstream.body || req.method === 'HEAD') && rewriteFor)
         ? rewriteFor(finalUrl, contentType)
         : null;
 
@@ -4001,13 +4015,17 @@ async function relayUpstream(req, res, { upstreamUrl, label, ext, rewriteFor }) 
     // or an error page, and the length is optional — Express falls back to
     // chunked encoding without it.
     const encoded = Boolean(upstream.headers.get('content-encoding'));
+    // Only a HEAD reaches here with a mapper. The GET it previews is rewritten,
+    // so upstream's length is the wrong body's, and a playlist is not seekable —
+    // the same two headers the rewrite branch above leaves out.
+    const previewsRewrite = Boolean(mapper);
     for (const h of forward) {
-        if (encoded && h === 'content-length') continue;
+        if ((encoded || previewsRewrite) && h === 'content-length') continue;
         const v = upstream.headers.get(h);
         if (v) res.setHeader(h, v);
     }
 
-    const acceptRanges = normalizeAcceptRanges({
+    const acceptRanges = previewsRewrite ? null : normalizeAcceptRanges({
         status: upstream.status,
         upstreamValue: upstream.headers.get('accept-ranges'),
         sentRange,

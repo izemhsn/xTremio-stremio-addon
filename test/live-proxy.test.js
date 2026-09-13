@@ -40,6 +40,7 @@ const PASSWORD = 'p4ssword-must-not-leak';
 let provider;          // the fake Xtream server
 let providerBase;
 let providerHits;      // every path the addon requested upstream
+let providerEncodings; // the Accept-Encoding sent with each of those requests
 
 let server;            // the addon under test
 let base;
@@ -52,6 +53,7 @@ let CFG;
 
 function providerHandler(req, res) {
     providerHits.push(req.url);
+    providerEncodings.push(req.headers['accept-encoding']);
     const creds = `${USERNAME}/${PASSWORD}`;
 
     // Playlists go out with an explicit Content-Length, the way a real panel
@@ -190,7 +192,9 @@ function providerHandler(req, res) {
     }
 
     if (req.url.endsWith('seg1.ts') || req.url.endsWith('seg9.ts')) {
-        res.writeHead(200, { 'Content-Type': 'video/mp2t' });
+        // Explicit, because Node only derives a length from the body on a GET, and
+        // a HEAD test needs one upstream to prove it is forwarded.
+        res.writeHead(200, { 'Content-Type': 'video/mp2t', 'Content-Length': Buffer.byteLength('SEGMENT-BYTES') });
         return res.end('SEGMENT-BYTES');
     }
 
@@ -219,7 +223,7 @@ test.after(async () => {
     await new Promise(resolve => provider.close(resolve));
 });
 
-test.beforeEach(() => { providerHits = []; });
+test.beforeEach(() => { providerHits = []; providerEncodings = []; });
 
 // The addon's own outbound calls go through global.fetch; the test client must
 // not, so it uses the reference saved before any stubbing.
@@ -404,6 +408,44 @@ test('the .m3u8 proxy rewrites the playlist so no credentials reach the player',
     assert.match(body, /seg2\.ts|\/proxy\/hls\?u=[^\n]*\n?$/, 'body reaches its final line');
     assert.ok(body.trimEnd().split('\n').length === 8, `all 8 lines present:\n${body}`);
     assert.strictEqual(res.headers.get('content-length'), String(Buffer.byteLength(body)));
+});
+
+test('a byte relay asks upstream for an unencoded body', async () => {
+    // Left to undici's default it offered gzip, and an origin honouring that on
+    // a ranged request answers with offsets into the compressed representation,
+    // which do not describe the decompressed bytes being relayed.
+    const res = await get('/proxy/live/5.ts');
+    assert.strictEqual(res.status, 200);
+    await res.text();
+    assert.deepStrictEqual(providerEncodings, ['identity']);
+});
+
+test('a playlist fetch keeps compression negotiable', async () => {
+    // Playlists are text, read whole and rewritten, so gzip is a plain win there.
+    await (await get('/proxy/live/5.m3u8')).text();
+    assert.strictEqual(providerEncodings.length, 1);
+    assert.notStrictEqual(providerEncodings[0], 'identity');
+});
+
+test('a HEAD on a playlist does not advertise the unrewritten length', async () => {
+    // HEAD used to forward upstream's Content-Length, which describes the
+    // provider's body; the GET that follows returns a rewritten, longer one.
+    const head = await realFetch(`${base}/${CFG}/proxy/live/5.m3u8`, { method: 'HEAD' });
+    assert.strictEqual(head.status, 200);
+    assert.strictEqual(head.headers.get('content-length'), null);
+    assert.strictEqual(head.headers.get('accept-ranges'), null, 'a playlist is not seekable');
+    assert.match(head.headers.get('content-type') || '', /mpegurl/i);
+});
+
+test('a HEAD on a byte relay still forwards its length and range support', async () => {
+    // The other side of the change above: nothing is rewritten here, so the
+    // upstream length is the real one.
+    const head = await realFetch(`${base}/${CFG}/proxy/hls?${new URLSearchParams(
+        encodeHlsTarget(`${providerBase}/hls/${USERNAME}/${PASSWORD}/seg1.ts`, CFG)
+    )}`, { method: 'HEAD' });
+    assert.strictEqual(head.status, 200);
+    assert.strictEqual(head.headers.get('content-length'), String(Buffer.byteLength('SEGMENT-BYTES')));
+    assert.strictEqual(head.headers.get('accept-ranges'), 'bytes');
 });
 
 test('a Range header is not forwarded to a playlist request', async () => {

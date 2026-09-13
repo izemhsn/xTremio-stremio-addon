@@ -118,6 +118,18 @@ test('an unusable server_info is ignored in favour of the URL that connected', a
     }
 });
 
+test('a panel answering a JSON null is not a valid server, not an unreachable one', async () => {
+    // `json.user_info` threw on null, and the catch reported "Cannot reach that
+    // server" about a server that had just answered.
+    global.fetch = async () => new Response('null', {
+        status: 200,
+        headers: { 'Content-Type': 'application/json' }
+    });
+    const result = await validateXtremioCredentials('http://provider.test:8080', 'alice', SECRET);
+    assert.equal(result.valid, false);
+    assert.equal(result.error, 'Not a valid xTremio server');
+});
+
 test('a usable server_info is still honoured', async () => {
     stubProvider({ url: 'cdn.provider.test', port: '25461' });
     const result = await validateXtremioCredentials('http://provider.test:8080', 'alice', SECRET);
