@@ -139,6 +139,56 @@ function providerHandler(req, res) {
         return sendPlaylist(`#EXTM3U\n#EXTINF:8.000,\n${providerBase}/hls/${creds}/seg9.ts\n`);
     }
 
+    // C5 — a master playlist whose variant is named without an extension. Real
+    // panels do this, and serve the variant as text/plain, so neither the path
+    // nor the content type says "playlist".
+    if (req.url === `/live/${creds}/11.m3u8`) {
+        return sendPlaylist([
+            '#EXTM3U',
+            '#EXT-X-STREAM-INF:BANDWIDTH=1200000',
+            `${providerBase}/hls/${creds}/chunklist_dvr`,
+            ''
+        ].join('\n'));
+    }
+
+    // An .m3u8 path with a content type that says nothing, so only the path can
+    // identify it.
+    if (req.url === `/hls/${creds}/plain.m3u8`) {
+        const body = `#EXTM3U\n#EXTINF:8.000,\n${providerBase}/hls/${creds}/seg9.ts\n`;
+        res.writeHead(200, {
+            'Content-Type': 'application/octet-stream',
+            'Content-Length': Buffer.byteLength(body)
+        });
+        return res.end(body);
+    }
+
+    if (req.url === `/hls/${creds}/chunklist_dvr`) {
+        const body = `#EXTM3U\n#EXTINF:8.000,\n${providerBase}/hls/${creds}/seg9.ts\n`;
+        res.writeHead(200, { 'Content-Type': 'text/plain', 'Content-Length': Buffer.byteLength(body) });
+        return res.end(body);
+    }
+
+    // Answers 206 whether or not a Range was asked for, which is the only way a
+    // fragment of a playlist can still reach the relay now that Range is
+    // withheld for anything known to be one.
+    if (req.url === `/hls/${creds}/rogue206.m3u8`) {
+        const body = `#EXTM3U\n#EXTINF:8.000,\n${providerBase}/hls/${creds}/seg1.ts\n`;
+        const fragment = Buffer.from(body, 'utf8').subarray(0, 12);
+        res.writeHead(206, {
+            'Content-Type': 'application/vnd.apple.mpegurl',
+            'Content-Range': `bytes 0-11/${Buffer.byteLength(body)}`,
+            'Content-Length': fragment.length
+        });
+        return res.end(fragment);
+    }
+
+    // Named .m3u8 and really a transport stream. Detection happens before the
+    // body arrives, so this is what reaches the rewrite.
+    if (req.url === `/hls/${creds}/notreally.m3u8`) {
+        res.writeHead(200, { 'Content-Type': 'video/mp2t' });
+        return res.end(Buffer.from([0x47, 0x40, 0x00, 0x10, 0x00, 0x01, 0x02, 0x03]));
+    }
+
     if (req.url.endsWith('seg1.ts') || req.url.endsWith('seg9.ts')) {
         res.writeHead(200, { 'Content-Type': 'video/mp2t' });
         return res.end('SEGMENT-BYTES');
@@ -181,7 +231,7 @@ const get = (path) => realFetch(`${base}/${CFG}${path}`);
 // anything that could read the URL could read the provider credentials in it.
 const targetOf = (link) => {
     const q = new URL(link).searchParams;
-    return decodeHlsTarget(q.get('u'), q.get('s'), q.get('e'), CFG);
+    return decodeHlsTarget(q.get('u'), q.get('s'), q.get('e'), CFG)?.url;
 };
 
 // --- rewriteHlsPlaylist ----------------------------------------------------
@@ -265,7 +315,7 @@ test('looksLikePlaylist keys off the extension or the content type', () => {
 
 test('a signed target round-trips', () => {
     const { u, s, e } = encodeHlsTarget('http://cdn.test/a/seg1.ts?tok=9', CFG);
-    assert.strictEqual(decodeHlsTarget(u, s, e, CFG), 'http://cdn.test/a/seg1.ts?tok=9');
+    assert.strictEqual(decodeHlsTarget(u, s, e, CFG)?.url, 'http://cdn.test/a/seg1.ts?tok=9');
 });
 
 test('an unsigned or forged target is rejected', () => {
@@ -370,16 +420,96 @@ test('a Range header is not forwarded to a playlist request', async () => {
     assert.ok(body.includes('/proxy/hls?u='), 'still rewritten');
 });
 
-test('a partial playlist is refused rather than relayed unrewritten', async () => {
-    // The sub-resource route must forward Range for EXT-X-BYTERANGE segments,
-    // so a ranged request for a nested *playlist* would return 206 and bypass
-    // the rewrite. Relaying that fragment would leak the credentials it names.
+test('a Range on a nested playlist is withheld, not forwarded', async () => {
+    // The sub-resource route forwards Range for EXT-X-BYTERANGE segments, and a
+    // ranged request for a nested *playlist* used to come back 206 and bypass
+    // the rewrite. The route now knows a playlist is coming before it asks, so
+    // it withholds the Range and gets a whole body it can rewrite. The fake
+    // provider answers 206 whenever it sees a Range, so a 200 here is the proof.
     const { u, s, e } = encodeHlsTarget(`${providerBase}/hls/${USERNAME}/${PASSWORD}/variant.m3u8`, CFG);
     const res = await realFetch(`${base}/${CFG}/proxy/hls?u=${u}&s=${s}&e=${e}`, {
         headers: { Range: 'bytes=0-11' }
     });
+    const body = await res.text();
+
+    assert.strictEqual(res.status, 200);
+    assert.ok(!body.includes(PASSWORD));
+    assert.ok(body.includes('/proxy/hls?u='), 'the segment inside was rewritten');
+});
+
+test('a partial playlist is refused rather than relayed unrewritten', async () => {
+    // A provider that answers 206 unasked. The fragment cannot be parsed or
+    // rewritten, and relaying it would leak the credentials it names.
+    const { u, s, e } = encodeHlsTarget(`${providerBase}/hls/${USERNAME}/${PASSWORD}/rogue206.m3u8`, CFG);
+    const res = await realFetch(`${base}/${CFG}/proxy/hls?u=${u}&s=${s}&e=${e}`);
+
     assert.strictEqual(res.status, 502);
     assert.ok(!(await res.text()).includes(PASSWORD));
+});
+
+// --- C5: a nested playlist the provider labelled as anything else -----------
+
+test('a variant playlist with no extension and a text/plain type is rewritten', async () => {
+    // The finding. Detection rested on the response's content type alone, and
+    // this variant has neither an .m3u8 path nor an HLS content type — so the
+    // body was relayed exactly as the provider wrote it, with the segment URLs
+    // that carry the account credentials still in it. What settles it now is the
+    // master playlist: a URI on an EXT-X-STREAM-INF line can only be a playlist,
+    // and the link minted for it says so.
+    const master = await (await get('/proxy/live/11.m3u8')).text();
+    const variantLink = master.split('\n').find(l => l.includes('/proxy/hls?u='));
+    assert.ok(variantLink, 'the variant was rewritten in the master');
+
+    const res = await realFetch(variantLink);
+    const body = await res.text();
+
+    assert.strictEqual(res.status, 200);
+    assert.ok(!body.includes(PASSWORD), 'no credentials reach the player');
+    assert.ok(!body.includes(USERNAME));
+    assert.ok(body.includes('/proxy/hls?u='), 'its segment was rewritten in turn');
+});
+
+test('the kind a link carries is the playlist structure, not a guess', async () => {
+    const master = await (await get('/proxy/live/11.m3u8')).text();
+    const variantLink = master.split('\n').find(l => l.includes('/proxy/hls?u='));
+
+    const media = await (await get('/proxy/live/5.m3u8')).text();
+    const segmentLink = media.split('\n').find(l => l.startsWith(base) && !l.startsWith('#'));
+    const keyLine = media.split('\n').find(l => l.startsWith('#EXT-X-KEY'));
+    const keyLink = keyLine.replace(/^#.*URI="/, '').replace(/"$/, '');
+
+    const kindOf = (link) => {
+        const q = new URL(link).searchParams;
+        return decodeHlsTarget(q.get('u'), q.get('s'), q.get('e'), CFG).playlist;
+    };
+
+    assert.strictEqual(kindOf(variantLink), true, 'a variant stream URI');
+    assert.strictEqual(kindOf(segmentLink), false, 'a segment line keeps its Range support');
+    assert.strictEqual(kindOf(keyLink), false, 'an EXT-X-KEY URI is a key, not a playlist');
+});
+
+test('a .m3u8 path is enough on its own, whatever the content type says', async () => {
+    // The other half of the detection: a target this server did not mint from a
+    // tag context still identifies itself by its path. Served as
+    // application/octet-stream, so the content type contributes nothing.
+    const { u, s, e } = encodeHlsTarget(`${providerBase}/hls/${USERNAME}/${PASSWORD}/plain.m3u8`, CFG);
+    const res = await realFetch(`${base}/${CFG}/proxy/hls?u=${u}&s=${s}&e=${e}`);
+    const body = await res.text();
+
+    assert.strictEqual(res.status, 200);
+    assert.ok(!body.includes(PASSWORD));
+    assert.ok(body.includes('/proxy/hls?u='));
+});
+
+test('a target that claims .m3u8 but sends a video body is refused, not mangled', async () => {
+    // Detection happens before any of the body arrives, so a mislabelled target
+    // reaches the rewrite. Parsing a transport stream as a playlist would hand
+    // the player a corrupted body; refusing says what actually happened.
+    const { u, s, e } = encodeHlsTarget(`${providerBase}/hls/${USERNAME}/${PASSWORD}/notreally.m3u8`, CFG);
+    const res = await realFetch(`${base}/${CFG}/proxy/hls?u=${u}&s=${s}&e=${e}`);
+
+    assert.strictEqual(res.status, 502);
+    assert.strictEqual(await res.text(), 'bad playlist');
 });
 
 test('a rewritten segment link fetches through the signed passthrough', async () => {

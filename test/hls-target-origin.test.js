@@ -53,7 +53,7 @@ test('the CDN the playlist actually came from is signable', async () => {
 
     const { searchParams } = new URL(signed);
     assert.equal(
-        decodeHlsTarget(searchParams.get('u'), searchParams.get('s'), searchParams.get('e'), 'CFG'),
+        decodeHlsTarget(searchParams.get('u'), searchParams.get('s'), searchParams.get('e'), 'CFG')?.url,
         `${CDN}/hls/abc/28939_5867.ts`
     );
 });

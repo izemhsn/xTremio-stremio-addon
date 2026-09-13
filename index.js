@@ -507,12 +507,22 @@ function hlsTargetAad(configToken, expiresAt) {
     return Buffer.from(`hls:${configToken}:${expiresAt}`, 'utf8');
 }
 
-function encodeHlsTarget(absoluteUrl, configToken = '', now = Date.now()) {
+// The plaintext is one kind byte and then the URL. The kind is what the
+// playlist said the target was — see HLS_PLAYLIST_URI_TAGS — and the proxy route
+// needs it before the body arrives: a nested playlist must be buffered and
+// rewritten in turn, while a segment must keep its Range support and stream.
+// It rides inside the ciphertext rather than beside it as another query field,
+// so it is covered by the GCM tag and the MAC with nothing further to sign.
+const HLS_KIND_PLAYLIST = 'p';
+const HLS_KIND_SEGMENT = 's';
+
+function encodeHlsTarget(absoluteUrl, configToken = '', now = Date.now(), playlist = false) {
     const expiresAt = now + HLS_SIGNATURE_TTL_MS;
     const iv = crypto.randomBytes(GCM_IV_BYTES);
     const cipher = crypto.createCipheriv('aes-256-gcm', HLS_ENC_KEY, iv);
     cipher.setAAD(hlsTargetAad(configToken, String(expiresAt)));
-    const ciphertext = Buffer.concat([cipher.update(absoluteUrl, 'utf8'), cipher.final()]);
+    const plaintext = (playlist ? HLS_KIND_PLAYLIST : HLS_KIND_SEGMENT) + absoluteUrl;
+    const ciphertext = Buffer.concat([cipher.update(plaintext, 'utf8'), cipher.final()]);
     // iv | tag | ciphertext in one field: the lengths are fixed, so the decrypt
     // side slices rather than splitting, and the payload stays a single
     // separator-free base64url string the way the signed string requires.
@@ -520,9 +530,9 @@ function encodeHlsTarget(absoluteUrl, configToken = '', now = Date.now()) {
     return { u: payload, s: signHlsTarget(payload, configToken, expiresAt), e: String(expiresAt) };
 }
 
-// Returns the URL only when the signature verifies for this config token and
-// the expiry has not lapsed, so a caller cannot point this server at a host of
-// their choosing even holding a valid config token of their own.
+// Returns `{ url, playlist }` only when the signature verifies for this config
+// token and the expiry has not lapsed, so a caller cannot point this server at a
+// host of their choosing even holding a valid config token of their own.
 function decodeHlsTarget(payload, signature, expiry, configToken = '', now = Date.now()) {
     if (typeof payload !== 'string' || typeof signature !== 'string') return null;
     if (payload.length > 4096) return null;
@@ -552,14 +562,17 @@ function decodeHlsTarget(payload, signature, expiry, configToken = '', now = Dat
         );
         decipher.setAuthTag(raw.subarray(GCM_IV_BYTES, GCM_IV_BYTES + GCM_TAG_BYTES));
         decipher.setAAD(hlsTargetAad(configToken, expiry));
-        const target = Buffer.concat([
+        const plaintext = Buffer.concat([
             decipher.update(raw.subarray(GCM_IV_BYTES + GCM_TAG_BYTES)),
             decipher.final()
         ]).toString('utf8');
 
-        const url = new URL(target);
+        const kind = plaintext[0];
+        if (kind !== HLS_KIND_PLAYLIST && kind !== HLS_KIND_SEGMENT) return null;
+
+        const url = new URL(plaintext.slice(1));
         if (!['http:', 'https:'].includes(url.protocol)) return null;
-        return url.toString();
+        return { url: url.toString(), playlist: kind === HLS_KIND_PLAYLIST };
     } catch {
         return null;
     }
@@ -569,11 +582,41 @@ const HLS_CONTENT_TYPES = /^(application\/(vnd\.apple\.mpegurl|x-mpegurl)|audio\
 
 // The extension is the hint that matters: providers commonly return
 // text/plain or octet-stream for a playlist, so content-type alone would miss
-// them. The body check is what keeps a mislabelled .m3u8 that is really a
-// video stream from being buffered and mangled.
+// them — and a missed playlist is relayed verbatim, with the provider's
+// credential-bearing URLs still in the body. `hlsTargetExt` is what supplies an
+// extension on the sub-resource route, where the request carries no file name.
+// A body that then turns out not to be a playlist is refused rather than
+// rewritten; see the EXTM3U check in relayUpstream.
 function looksLikePlaylist(ext, contentType) {
     if (String(ext || '').toLowerCase() === 'm3u8') return true;
     return HLS_CONTENT_TYPES.test(String(contentType || ''));
+}
+
+// What the sub-resource route should expect of a signed target, decided before
+// any of the body arrives — it has to be, because the streaming path forwards
+// Range and relays bytes through untouched.
+//
+// Two things say "playlist" ahead of the body. The capability itself, when the
+// URI sat on a tag that can only name one, is the reliable half: it comes from
+// the playlist's own structure rather than from anything the provider labelled.
+// A path ending in .m3u8 covers the rest — a playlist reached by a link this
+// server did not mint, or one whose tag context said nothing.
+//
+// Sniffing the body for #EXTM3U is deliberately not a third signal here. The
+// decision has to be made before reading anything, and the alternative to a
+// playlist on this route is a segment that may be gigabytes; buffering one to
+// find out is exactly what the streaming path exists to avoid.
+const PLAYLIST_PATH_EXT = /\.m3u8?$/i;
+
+// Every HLS playlist starts with this tag; the spec requires it on the first
+// line. A byte-order mark and leading blank lines are tolerated because real
+// panels emit both.
+const HLS_BODY_PREFIX = /^\uFEFF?\s*#EXTM3U/;
+
+function hlsTargetExt(target) {
+    if (target.playlist) return 'm3u8';
+    // Parsed by decodeHlsTarget already, so this cannot throw.
+    return PLAYLIST_PATH_EXT.test(new URL(target.url).pathname) ? 'm3u8' : null;
 }
 
 // Playlists are kilobytes; anything far larger is not one. Bounded because the
@@ -585,6 +628,19 @@ const MAX_PLAYLIST_BYTES = 4 * 1024 * 1024;
 // same credentials if left alone.
 const HLS_URI_ATTR = /URI="([^"]*)"/gi;
 
+// Which lines name a *playlist* rather than a segment or a key. The distinction
+// is carried into the signed link, because the route that later fetches the
+// target cannot recover it: a variant playlist need not end in .m3u8 and is
+// routinely served as text/plain, and one relayed as if it were a segment goes
+// to the player unrewritten, credentials and all.
+// HLS states it unambiguously here instead. EXT-X-MEDIA and EXT-X-RENDITION-
+// REPORT name Media Playlists, EXT-X-I-FRAME-STREAM-INF an I-frame playlist,
+// and the URI *line* following an EXT-X-STREAM-INF is a Variant Stream's
+// playlist. Every other URI — EXT-X-KEY, EXT-X-MAP, EXT-X-PART, a plain segment
+// line — is a segment or a key, and must keep its Range support.
+const HLS_PLAYLIST_URI_TAGS = /^#EXT-X-(MEDIA|I-FRAME-STREAM-INF|RENDITION-REPORT)[:\s]/i;
+const HLS_STREAM_INF_TAG = /^#EXT-X-STREAM-INF[:\s]/i;
+
 // `toProxyUrl` maps one absolute upstream URL to a URL on this server.
 // Anything that will not resolve, or is not http(s), is left untouched rather
 // than dropped: a malformed line is the provider's business, and removing it
@@ -592,7 +648,7 @@ const HLS_URI_ATTR = /URI="([^"]*)"/gi;
 // `toProxyUrl` may be async — the mapper used in production resolves DNS to
 // check the target before signing it — so this is async throughout.
 async function rewriteHlsPlaylist(text, baseUrl, toProxyUrl, { deadline = null } = {}) {
-    const mapUri = async (raw) => {
+    const mapUri = async (raw, playlist) => {
         // Checked here rather than around the whole pass because this is the only
         // point that awaits: a timer cannot interrupt an await chain, so the loop
         // has to look. Throwing rather than emitting a partly-rewritten playlist
@@ -612,7 +668,7 @@ async function rewriteHlsPlaylist(text, baseUrl, toProxyUrl, { deadline = null }
             return null;
         }
         if (!['http:', 'https:'].includes(absolute.protocol)) return null;
-        const mapped = await toProxyUrl(absolute.toString());
+        const mapped = await toProxyUrl(absolute.toString(), Boolean(playlist));
         if (mapped) return mapped;
         // The mapper refused this target, and leaving the line as the provider
         // wrote it is the disclosure this rewrite exists to prevent: an Xtream
@@ -631,13 +687,13 @@ async function rewriteHlsPlaylist(text, baseUrl, toProxyUrl, { deadline = null }
     // replace() cannot await, so URI attributes are walked by hand. The regex is
     // built per call rather than shared: awaiting mid-scan would otherwise let a
     // concurrent rewrite move lastIndex out from under this one.
-    const rewriteUriAttrs = async (body) => {
+    const rewriteUriAttrs = async (body, playlist) => {
         const scanner = new RegExp(HLS_URI_ATTR.source, HLS_URI_ATTR.flags);
         const parts = [];
         let cursor = 0;
         let match;
         while ((match = scanner.exec(body)) !== null) {
-            const mapped = await mapUri(match[1]);
+            const mapped = await mapUri(match[1], playlist);
             parts.push(body.slice(cursor, match.index), mapped ? `URI="${mapped}"` : match[0]);
             cursor = match.index + match[0].length;
         }
@@ -646,6 +702,14 @@ async function rewriteHlsPlaylist(text, baseUrl, toProxyUrl, { deadline = null }
     };
 
     const out = [];
+    // Set by an EXT-X-STREAM-INF and consumed by the next URI line, which is the
+    // one place a playlist's kind is stated by position rather than by the tag
+    // the URI sits on. Not cleared by the tags and comments that may sit in
+    // between: the spec says the URI line follows immediately, and erring toward
+    // "playlist" costs a buffered fetch, while erring the other way relays a
+    // playlist to the player with the provider's credentials still in it.
+    let nextUriIsPlaylist = false;
+
     for (const line of text.split('\n')) {
         // Preserve CRLF exactly: some players are strict about the line ending.
         const cr = line.endsWith('\r') ? '\r' : '';
@@ -656,11 +720,13 @@ async function rewriteHlsPlaylist(text, baseUrl, toProxyUrl, { deadline = null }
             continue;
         }
         if (body.startsWith('#')) {
-            out.push(await rewriteUriAttrs(body) + cr);
+            out.push(await rewriteUriAttrs(body, HLS_PLAYLIST_URI_TAGS.test(body)) + cr);
+            if (HLS_STREAM_INF_TAG.test(body)) nextUriIsPlaylist = true;
             continue;
         }
 
-        const mapped = await mapUri(body);
+        const mapped = await mapUri(body, nextUriIsPlaylist);
+        nextUriIsPlaylist = false;
         out.push(mapped ? mapped + cr : line);
     }
     return out.join('\n');
@@ -3109,6 +3175,22 @@ async function relayUpstream(req, res, { upstreamUrl, label, ext, rewriteFor }) 
         } finally {
             clearTimeout(bodyTimer);
         }
+
+        // The body settles what the headers could only suggest. Whether to take
+        // this branch has to be decided before a byte arrives — the alternative
+        // is a segment that must not be buffered — so a target that says .m3u8
+        // and is really a video stream gets this far, and parsing one as a
+        // playlist would hand the player a mangled body.
+        // Refused rather than relayed: if this *is* a playlist whose first line
+        // went missing, relaying it verbatim is the credential disclosure the
+        // rewrite exists to prevent, and a player rejects a playlist with no
+        // #EXTM3U either way.
+        if (!HLS_BODY_PREFIX.test(text)) {
+            console.warn(`[proxy] expected a playlist for ${label} but the body does not start with #EXTM3U; refusing`);
+            if (!res.headersSent) res.status(502).end('bad playlist');
+            return;
+        }
+
         // The two timers above are both cleared by now, so this phase carries its
         // own deadline. See PLAYLIST_REWRITE_TIMEOUT_MS.
         let rewritten;
@@ -3285,7 +3367,7 @@ function makeHlsProxyMapper(base, configToken, allowedOrigins) {
     const seen = new Set();
     let warned = false;
     let refusedOrigin = false;
-    return async (absolute) => {
+    return async (absolute, playlist = false) => {
         let url;
         try {
             url = new URL(absolute);
@@ -3328,7 +3410,7 @@ function makeHlsProxyMapper(base, configToken, allowedOrigins) {
 
         if (!await vetHlsOrigin(absolute, origin)) return null;
 
-        const { u, s, e } = encodeHlsTarget(absolute, configToken);
+        const { u, s, e } = encodeHlsTarget(absolute, configToken, Date.now(), playlist);
         return `${base}/${configToken}/proxy/hls?u=${u}&s=${s}&e=${e}`;
     };
 }
@@ -3468,19 +3550,27 @@ app.all('/:config/proxy/hls', async (req, res) => {
     if (!acquireProxySlot(cfg, res)) return rejectOverCap(res);
 
     // Bound to this config token: a signature minted for another account's
-    // playlist does not verify here, even though the MAC key is global.
-    const upstreamUrl = decodeHlsTarget(req.query.u, req.query.s, req.query.e, req.params.config);
-    if (!upstreamUrl) return res.status(400).end('bad target');
+    // playlist does not verify here, even though the keys are shared by every
+    // account on this instance.
+    const target = decodeHlsTarget(req.query.u, req.query.s, req.query.e, req.params.config);
+    if (!target) return res.status(400).end('bad target');
+
+    const upstreamUrl = target.url;
+    // What the playlist said this target was, or what its path says. Content
+    // type alone used to decide it here, which missed every variant playlist a
+    // provider labelled text/plain: the body was then relayed untouched, with
+    // the credential-bearing URIs the rewrite exists to remove still in it.
+    // Supplying the extension also withholds Range, so the response cannot come
+    // back a 206 that skips the rewrite.
+    const ext = hlsTargetExt(target);
 
     const base = getBaseUrl(req);
     await relayUpstream(req, res, {
         upstreamUrl,
         label: 'hls sub-resource',
-        // Unknown ahead of time — a segment must keep its Range support, so the
-        // decision rests on the response's content type alone.
-        ext: null,
+        ext,
         rewriteFor: (finalUrl, contentType) => {
-            if (!looksLikePlaylist(null, contentType)) return null;
+            if (!looksLikePlaylist(ext, contentType)) return null;
             // A nested playlist keeps the same rule. `upstreamUrl` is included as
             // well as `finalUrl` because a variant playlist that redirects may
             // still name its segments back on the host it was fetched from.

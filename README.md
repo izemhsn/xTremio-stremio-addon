@@ -165,6 +165,11 @@ are the norm. Both formats are still offered:
   because query strings end up in player logs, in Stremio's history and in reverse-proxy access
   logs. Upgrading to this version invalidates HLS links minted by an older one; a player simply
   reloads the playlist, which is re-minted on every fetch, so nothing needs reissuing.
+- Nested playlists — the variant playlists a master names — are rewritten in turn, and are
+  recognised from the master's own structure rather than from the content type the provider
+  returns, which is commonly `text/plain` for a playlist. A target expected to be a playlist
+  whose body turns out not to be one is answered `502` rather than relayed, since the lines that
+  would go out are the provider's own credential-bearing URLs.
 
 The practical consequence is that **all streaming bandwidth flows through your host**, live
 included, which drives both platform choice and cost. A single 1080p stream is roughly 5-10 Mbps

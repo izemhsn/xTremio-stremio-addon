@@ -39,7 +39,7 @@ test('a signature minted for one account does not verify for another', () => {
     // capability was minted for may use it.
     const { u, s, e } = encodeHlsTarget(TARGET, ALICE);
 
-    assert.equal(decodeHlsTarget(u, s, e, ALICE), TARGET, 'the owner can still use it');
+    assert.equal(decodeHlsTarget(u, s, e, ALICE)?.url, TARGET, 'the owner can still use it');
     assert.equal(decodeHlsTarget(u, s, e, BOB), null, 'another account must not');
 });
 
@@ -60,7 +60,7 @@ test('a lapsed signature is refused even though the MAC is correct', () => {
     const now = Date.now();
     const { u, s, e } = encodeHlsTarget(TARGET, ALICE, now);
 
-    assert.equal(decodeHlsTarget(u, s, e, ALICE, now + HLS_SIGNATURE_TTL_MS - 1000), TARGET);
+    assert.equal(decodeHlsTarget(u, s, e, ALICE, now + HLS_SIGNATURE_TTL_MS - 1000)?.url, TARGET);
     assert.equal(decodeHlsTarget(u, s, e, ALICE, now + HLS_SIGNATURE_TTL_MS), null, 'exactly at the expiry');
     assert.equal(decodeHlsTarget(u, s, e, ALICE, now + HLS_SIGNATURE_TTL_MS + 1000), null);
 });
@@ -114,7 +114,7 @@ test('the link does not carry the provider credentials it points at', () => {
     assert.ok(!decoded.includes('cdn.test'), 'the host it names is not readable either');
 
     // And it still works for the account it was minted for.
-    assert.equal(decodeHlsTarget(u, s, e, ALICE), TARGET);
+    assert.equal(decodeHlsTarget(u, s, e, ALICE)?.url, TARGET);
 });
 
 test('the ciphertext is bound to the token and the expiry, not only the MAC', () => {
