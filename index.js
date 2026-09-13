@@ -1082,6 +1082,20 @@ function toIsoDate(s) {
     return isNaN(d.getTime()) ? undefined : d.toISOString();
 }
 
+// A provider's title is not reliably a string. Panels that encode with PHP's
+// JSON_NUMERIC_CHECK send titles like 1917 and 300 as JSON *numbers*, and one of
+// those threw out of filterByName ('s.name.toLowerCase is not a function') —
+// which the catalog route's catch turned into an empty result for every search
+// on that account, not just the one title. Titles also reach Stremio, where the
+// SDK expects a string.
+// Only strings and numbers count: a provider that put an object or an array
+// there has sent no title at all, and "[object Object]" on a shelf is worse than
+// the fallback every caller already has.
+function titleOf(value) {
+    if (typeof value === 'string') return value;
+    return typeof value === 'number' && Number.isFinite(value) ? String(value) : '';
+}
+
 // Xtream providers return `cast`/`genre` as either a comma-separated string or an array.
 function splitList(value) {
     if (!value) return [];
@@ -1681,12 +1695,31 @@ function parseYear(s) {
 // rendered as `meta: null` for half an hour with no retry. Accepting less than
 // the caller needs is worse than a retry: it turns a flaky call into a
 // sticky one.
+// This is the predicate for *answering* with a payload, and it still mirrors
+// `hasContent` exactly. What may be cached for half an hour is the stricter
+// `hasSeriesEpisodes` below.
 function isUsableSeriesInfo(info) {
     if (!info || typeof info !== 'object') return false;
     const hasName = info.info && typeof info.info === 'object' && info.info.name;
+    return Boolean(hasName || hasSeriesEpisodes(info));
+}
+
+// What a payload needs before it is worth keeping for the full 30 minutes, and
+// it is a stricter test than the one above: episodes. A series with a name and
+// nothing to play is a page the user opens and leaves, and `get_series_info` is
+// flaky enough that an episodes-less answer is far more likely a bad call than a
+// real series with no episodes in it. Such a payload is still *returned* — the
+// meta route renders the name rather than nothing — but it is remembered under
+// SERIES_INFO_NEGATIVE_TTL, so the next request after a few minutes asks again
+// instead of being pinned to it for half an hour.
+// A season whose list is empty does not count. `{ episodes: { 1: [] } }` passed
+// the old key-count check while the meta route, which iterates only arrays,
+// built no videos from it at all — the same disagreement one level down.
+function hasSeriesEpisodes(info) {
+    if (!info || typeof info !== 'object') return false;
     const eps = info.episodes;
-    const hasEpisodes = eps && typeof eps === 'object' && Object.keys(eps).length > 0;
-    return Boolean(hasName || hasEpisodes);
+    if (!eps || typeof eps !== 'object') return false;
+    return Object.values(eps).some(list => Array.isArray(list) && list.length > 0);
 }
 
 const SERIES_INFO_MAX_ATTEMPTS = 3;
@@ -1798,12 +1831,13 @@ async function fetchSeriesInfo(cfg, seriesId) {
     for (let attempt = 1; attempt <= SERIES_INFO_MAX_ATTEMPTS; attempt++) {
         try {
             const info = await xtremioGet(cfg, 'get_series_info', { series_id: seriesId }, { timeoutMs: 8000 });
-            if (isUsableSeriesInfo(info)) {
+            if (hasSeriesEpisodes(info)) {
                 setCachedSeriesInfo(cfg, seriesId, info);
                 return info;
             }
             lastInfo = info;
-            console.warn(`[getSeriesInfo] attempt ${attempt}/${SERIES_INFO_MAX_ATTEMPTS} for series ${seriesId} returned unusable data`);
+            const shape = isUsableSeriesInfo(info) ? 'a series with no episodes' : 'unusable data';
+            console.warn(`[getSeriesInfo] attempt ${attempt}/${SERIES_INFO_MAX_ATTEMPTS} for series ${seriesId} returned ${shape}`);
         } catch (e) {
             lastError = e;
             const causeMsg = e.cause ? ` (cause: ${e.cause.code || e.cause.message || e.cause})` : '';
@@ -2492,14 +2526,16 @@ function catalogComparator(kind, variant, now = Date.now()) {
 function filterByName(items, search) {
     if (!search) return items;
     const q = search.toLowerCase();
-    return items.filter(s => s.name?.toLowerCase().includes(q));
+    return items.filter(s => titleOf(s.name).toLowerCase().includes(q));
 }
 
 function toCatalogMetas(items, kind) {
     return items.map(s => ({
         id: `${kind.idPrefix}${s[kind.idField]}`,
         type: kind.metaType,
-        name: s.name,
+        // `|| undefined` so an item with no title still omits the key rather
+        // than shipping an empty string, which is what it did before.
+        name: titleOf(s.name) || undefined,
         poster: s[kind.posterField] || undefined,
         posterShape: kind.posterShape
     }));
@@ -2722,11 +2758,11 @@ app.get('/:config/meta/:type/:id.json', async (req, res) => {
             const meta = {
                 id: `xtremio_live_${s.stream_id}`,
                 type: 'Live TV',
-                name: s.name,
+                name: titleOf(s.name) || undefined,
                 poster: s.stream_icon || undefined,
                 posterShape: 'square',
                 genres: s.category_name ? [s.category_name] : [],
-                description: s.name || undefined
+                description: titleOf(s.name) || undefined
             };
             return res.json({ meta, ...withCacheHints(res, 300) });
         }
@@ -2742,7 +2778,7 @@ app.get('/:config/meta/:type/:id.json', async (req, res) => {
             const meta = {
                 id: `xtremio_movie_${streamId}`,
                 type: 'XT-Movies',
-                name: movie.name || movie.o_name || info?.movie_data?.name || 'Unknown',
+                name: titleOf(movie.name || movie.o_name || info?.movie_data?.name) || 'Unknown',
                 poster: movie.cover_big || movie.movie_image || undefined,
                 posterShape: 'poster',
                 background: backdrop,
@@ -2800,7 +2836,7 @@ app.get('/:config/meta/:type/:id.json', async (req, res) => {
                         id: `xtremio_episode_${seriesId}:${seasonNum}:${ep.id}`,
                         // Built from the resolved number, so a missing episode_num
                         // reads "Episode 1" rather than "Episode undefined".
-                        title: ep.title || `Episode ${episodeNum}`,
+                        title: titleOf(ep.title) || `Episode ${episodeNum}`,
                         season: parseInt(seasonNum),
                         episode: episodeNum,
                         // Omitted rather than epoch-defaulted: Stremio renders a
@@ -2828,7 +2864,7 @@ app.get('/:config/meta/:type/:id.json', async (req, res) => {
             const meta = {
                 id: `xtremio_series_${seriesId}`,
                 type: 'series',
-                name: series.name || 'Unknown',
+                name: titleOf(series.name) || 'Unknown',
                 poster: series.cover || undefined,
                 posterShape: 'poster',
                 background: backdrop,
@@ -3920,6 +3956,7 @@ module.exports = {
     CATALOG_KINDS,
     catalogComparator,
     filterByName,
+    titleOf,
     toCatalogMetas,
     selectCatalogGenre,
     selectCatalogSource,

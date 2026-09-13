@@ -82,7 +82,7 @@ test('a provider that recovers is picked up once the negative entry expires', as
     stubFetch('throw');
     await assert.rejects(() => getSeriesInfo(cfg(), '4'));
 
-    const good = { info: { name: 'Fixed Show' }, episodes: { 1: [] } };
+    const good = { info: { name: 'Fixed Show' }, episodes: { 1: [{ id: '7' }] } };
     stubFetch('ok', good);
 
     // Still inside the negative window: the recovery is not yet visible.
@@ -130,6 +130,54 @@ test('a successful fetch is cached positively, on the long TTL', async () => {
 
     await getSeriesInfo(cfg(), '6');
     assert.strictEqual(calls, 1, 'served from cache');
+});
+
+// --- C8: a series with a name and nothing to play ---------------------------
+
+test('a series with a name but no episodes is not pinned for the positive TTL', async () => {
+    // It used to be cached as a success. The user opened a series page with
+    // nothing on it, and every request for the next half hour got that same
+    // payload back with no attempt to ask again — off one flaky call.
+    const nameOnly = { info: { name: 'Nothing To Play' } };
+    stubFetch('ok', nameOnly);
+
+    assert.deepStrictEqual(
+        await getSeriesInfo(cfg(), '10'),
+        nameOnly,
+        'still answered with, so the meta route can render the name'
+    );
+
+    const entry = readSeriesInfoEntry(cfg(), '10');
+    assert.strictEqual(entry.negative, true);
+    assert.strictEqual(entry.ttl, SERIES_INFO_NEGATIVE_TTL, 'remembered for minutes, not half an hour');
+});
+
+test('a season holding no episodes is not content either', async () => {
+    // `{ 1: [] }` is one season by key count and no episodes by any measure the
+    // meta route applies.
+    const emptySeason = { info: { name: 'Season Zero' }, episodes: { 1: [] } };
+    stubFetch('ok', emptySeason);
+
+    await getSeriesInfo(cfg(), '11');
+
+    assert.strictEqual(readSeriesInfoEntry(cfg(), '11').ttl, SERIES_INFO_NEGATIVE_TTL);
+});
+
+test('an episodes-less series is asked again once the short entry lapses', async () => {
+    stubFetch('ok', { info: { name: 'Nothing To Play' } });
+    await getSeriesInfo(cfg(), '12');
+    const spent = calls;
+    assert.strictEqual(spent, SERIES_INFO_MAX_ATTEMPTS, 'the retries ran, as for any unusable answer');
+
+    await getSeriesInfo(cfg(), '12');
+    assert.strictEqual(calls, spent, 'inside the window the replay costs nothing upstream');
+
+    ageCache(SERIES_INFO_NEGATIVE_TTL + 1);
+    const withEpisodes = { info: { name: 'Nothing To Play' }, episodes: { 1: [{ id: '3' }] } };
+    stubFetch('ok', withEpisodes);
+
+    assert.deepStrictEqual(await getSeriesInfo(cfg(), '12'), withEpisodes, 'the episodes are picked up');
+    assert.strictEqual(readSeriesInfoEntry(cfg(), '12').ttl, CACHE_TTL, 'and now held for the long TTL');
 });
 
 test('negative entries live in the same bounded cache, so they cannot pile up', async () => {

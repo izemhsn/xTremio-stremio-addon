@@ -253,9 +253,14 @@ test('a series payload carrying only a cover is not usable', () => {
 test('a name or any episode is still usable', () => {
     assert.equal(isUsableSeriesInfo({ info: { name: 'Show' } }), true);
     assert.equal(isUsableSeriesInfo({ episodes: { 1: [{ id: '5' }] } }), true);
-    // Partial-but-usable is the whole point of the retry loop: a payload with
-    // episodes and no info block must keep working.
-    assert.equal(isUsableSeriesInfo({ episodes: { 1: [] } }), true);
+    // This used to assert `true`, on a key count: `{ 1: [] }` is one season, so
+    // the payload "had episodes". It has none — the meta route iterates the
+    // arrays and builds no videos at all, so `hasContent` said false and the
+    // series rendered as `meta: null` from a payload this call had just declared
+    // usable. That disagreement is the one this predicate exists to avoid, so an
+    // empty season now counts for nothing. A payload with episodes and no info
+    // block still works, which is what the line above holds.
+    assert.equal(isUsableSeriesInfo({ episodes: { 1: [] } }), false);
 });
 
 test('the rejects stay rejected', () => {
