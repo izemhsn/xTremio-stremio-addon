@@ -1116,19 +1116,37 @@ const PINNED_DISPATCHER = ALLOW_PRIVATE_NETWORKS
     ? null
     : new UndiciAgent({ connect: { lookup: pinnedLookup } });
 
-// A dispatcher is only usable by a fetch() from the same undici major — the
-// handler interface changed between v7 and v8, and a mismatch fails every
-// outbound request outright rather than quietly going unpinned. The dependency
-// therefore tracks the undici that Node bundles; this says so at boot instead
-// of leaving someone to decode "invalid onRequestStart method".
-function warnOnUndiciMismatch(log = console) {
-    if (!PINNED_DISPATCHER) return true;
-    const bundled = String(process.versions.undici || '').split('.')[0];
-    const dependency = String(require('undici/package.json').version).split('.')[0];
-    if (!bundled || bundled === dependency) return true;
+// The pinned dispatcher comes from the undici dependency while fetch() comes from the
+// undici Node bundles, so the two can differ, and not every pairing works. Measured
+// with this app's own pattern — a custom connect.lookup, a redirect, a streamed body
+// and an abort — dispatchers from undici 6 and 7 work with the fetch bundled in Node
+// 20.18.1 (undici 6.20), 22 (6.28) and 24 (7.25), in both directions, and the full
+// suite passes on all three. An undici 8 dispatcher fails every request against the
+// fetch in Node 22 and 24 with "invalid onRequestStart method", its handler interface
+// having changed, and does not load on Node 20 at all.
+// This used to compare majors and warn on any difference, so on the documented Node
+// 20.18.1 floor it told the operator that every outbound request would fail, where
+// every one succeeds (audit D2). It now warns only for a pairing outside the measured
+// set, and says the pairing is unverified rather than broken, since only the undici 8
+// direction has actually been seen to fail. The versions are parameters so the rule
+// can be tested without the runtime that would exercise each branch.
+const UNDICI_INTEROPERABLE_MAJORS = new Set(['6', '7']);
+
+function warnOnUndiciMismatch(log = console, {
+    pinned = Boolean(PINNED_DISPATCHER),
+    bundled = process.versions.undici,
+    dependency = require('undici/package.json').version
+} = {}) {
+    if (!pinned) return true;
+    const bundledMajor = String(bundled || '').split('.')[0];
+    const dependencyMajor = String(dependency || '').split('.')[0];
+    if (!bundledMajor || bundledMajor === dependencyMajor) return true;
+    if (UNDICI_INTEROPERABLE_MAJORS.has(bundledMajor) && UNDICI_INTEROPERABLE_MAJORS.has(dependencyMajor)) return true;
     log.warn(
-        `Node bundles undici ${process.versions.undici} but this app depends on undici ${dependency}.x. ` +
-        'Outbound requests will fail until the dependency is aligned with the runtime.'
+        `Node bundles undici ${bundled} but this app's connection agent comes from undici ${dependency}. ` +
+        'That pairing has not been verified and outbound requests may fail — an undici 8 agent used with an ' +
+        'older fetch fails every request with "invalid onRequestStart method". Align the undici dependency ' +
+        'with the runtime.'
     );
     return false;
 }
@@ -4093,7 +4111,10 @@ function hlsTargetOrigins(...candidates) {
 
 // `allowedOrigins` is required and there is deliberately no permissive default:
 // a caller that forgets it signs nothing, which fails closed and shows up
-// immediately, rather than quietly restoring the open relay this closes.
+// immediately, rather than quietly restoring the playlist relay this closes.
+// Closes it for playlists from an honest panel, that is (audit D1): a malicious
+// panel's own origin and final URL are in the set by construction. That case is
+// S3, closed by ALLOWED_PANEL_HOSTS and otherwise bounded by the relay caps.
 function makeHlsProxyMapper(base, configToken, allowedOrigins) {
     // Playlists name hundreds of segments on one host, so vetting is per origin —
     // one DNS resolution rather than hundreds, and now shared across passes via
@@ -4118,8 +4139,10 @@ function makeHlsProxyMapper(base, configToken, allowedOrigins) {
         // Checked before the cap and before any DNS work, so a playlist naming
         // hosts this account has no business fetching costs nothing at all.
         // assertSafeOutboundUrl below only refuses *private* targets, which left
-        // every public URL a panel cared to name signable — and therefore
-        // fetchable and relayable from the operator's address.
+        // every public host a playlist named signable — and therefore fetchable and
+        // relayable from the operator's address. This bounds what a compromised or
+        // misbehaving playlist can reach; it cannot bound a panel that is itself
+        // hostile, whose own hosts are the allowed ones (audit D1, and see S3).
         if (!(allowedOrigins && allowedOrigins.has(origin))
             && !HLS_TARGET_ALLOWED_HOSTS.has(url.hostname.toLowerCase())) {
             if (!refusedOrigin) {
