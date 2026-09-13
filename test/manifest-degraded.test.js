@@ -105,14 +105,14 @@ test('no catalog ever declares a required genre with nothing to choose', () => {
         for (const working of [[], ['vod'], ['live', 'series'], ['live', 'vod', 'series']]) {
             clearCaches();
             stubProvider({ working });
-            check(await getManifest('http://addon.test', CFG_ARGS), `working=[${working}]`);
+            check(await getManifest(CFG_ARGS), `working=[${working}]`);
         }
     })();
 });
 
 test('total category failure still advertises all nine catalogs, without genres', async () => {
     stubProvider({ working: [] });
-    const manifest = await getManifest('http://addon.test', CFG_ARGS);
+    const manifest = await getManifest(CFG_ARGS);
 
     assert.equal(manifest.catalogs.length, 9, 'the catalogs themselves must not disappear');
     for (const id of GENRE_CATALOGS) {
@@ -129,7 +129,7 @@ test('the two search catalogs are unaffected either way', async () => {
     for (const working of [[], ['live', 'vod', 'series']]) {
         clearCaches();
         stubProvider({ working });
-        const manifest = await getManifest('http://addon.test', CFG_ARGS);
+        const manifest = await getManifest(CFG_ARGS);
 
         for (const id of ['xtremio_search_movies', 'xtremio_search_series']) {
             const catalog = manifest.catalogs.find(c => c.id === id);
@@ -145,7 +145,7 @@ test('the two search catalogs are unaffected either way', async () => {
 test('a partial failure degrades only the kinds that failed', async () => {
     // The case the old all-or-nothing catch could not express at all.
     stubProvider({ working: ['vod'] });
-    const manifest = await getManifest('http://addon.test', CFG_ARGS);
+    const manifest = await getManifest(CFG_ARGS);
 
     for (const id of ['xtremio_movies_popular', 'xtremio_movies_new', 'xtremio_movies_featured']) {
         assert.deepEqual(genreOf(manifest.catalogs.find(c => c.id === id))?.options, ['Action'], id);
@@ -157,7 +157,7 @@ test('a partial failure degrades only the kinds that failed', async () => {
 
 test('a healthy provider is unchanged', async () => {
     stubProvider();
-    const manifest = await getManifest('http://addon.test', CFG_ARGS);
+    const manifest = await getManifest(CFG_ARGS);
 
     assert.equal(manifest.catalogs.length, 9);
     assert.deepEqual(genreOf(manifest.catalogs.find(c => c.id === 'xtremio_live')), {
@@ -173,7 +173,7 @@ test('the manifest keeps its catalog order', async () => {
     // Stremio renders shelves in this order, so a refactor that reshuffles them
     // silently rearranges the user's home screen.
     stubProvider();
-    const manifest = await getManifest('http://addon.test', CFG_ARGS);
+    const manifest = await getManifest(CFG_ARGS);
     assert.deepEqual(manifest.catalogs.map(c => c.id), [
         ...GENRE_CATALOGS, 'xtremio_search_movies', 'xtremio_search_series'
     ]);

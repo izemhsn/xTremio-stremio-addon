@@ -1,0 +1,30 @@
+name: test
+
+on:
+  push:
+    branches: [main, dev]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    strategy:
+      # Every version is reported even when one fails: a failure on only the
+      # 20.18.1 floor or only on 24 is the signal this matrix exists for.
+      fail-fast: false
+      matrix:
+        # The README's supported set. 20.18.1 is the engines floor, pinned exactly,
+        # and the undici pairing is only verified against these bundled fetches.
+        node: ['20.18.1', '22', '24']
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: ${{ matrix.node }}
+          cache: npm
+      - run: npm ci
+      - run: npm test

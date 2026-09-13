@@ -125,7 +125,7 @@ test('parseCatalogId routes every catalog the manifest declares', () => {
 test('every catalog the manifest declares is routable, and vice versa', async () => {
     // The table and the manifest are separate declarations of the same set; this
     // is what stops one drifting from the other.
-    const manifest = await getManifest('http://x', { ...CFG_ARGS });
+    const manifest = await getManifest({ ...CFG_ARGS });
     const declared = manifest.catalogs.map(c => c.id);
     assert.ok(declared.length >= 9, `expected the full catalog list, got ${declared.length}`);
     for (const id of declared) {
@@ -136,11 +136,17 @@ test('every catalog the manifest declares is routable, and vice versa', async ()
 });
 
 test('each kind agrees with the manifest on its id prefix and meta type', async () => {
-    const manifest = await getManifest('http://x', null);
+    const manifest = await getManifest(null);
     for (const [name, kind] of Object.entries(CATALOG_KINDS)) {
         assert.ok(manifest.idPrefixes.includes(kind.idPrefix), `${name}: ${kind.idPrefix} missing from idPrefixes`);
         assert.ok(manifest.types.includes(kind.metaType), `${name}: ${kind.metaType} missing from types`);
     }
+});
+
+test('the manifest version is the package version', async () => {
+    // It used to be a second hand-maintained copy of the same string.
+    const manifest = await getManifest(null);
+    assert.equal(manifest.version, require('../package.json').version);
 });
 
 test('toCatalogMetas maps each kind onto its own fields', () => {

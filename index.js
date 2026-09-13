@@ -347,7 +347,7 @@ function decodeConfig(encoded) {
     }
 }
 
-async function getManifest(baseUrl = `http://localhost:${PORT}`, cfg = null) {
+async function getManifest(cfg = null) {
     const catalogs = [];
 
     if (cfg) {
@@ -430,7 +430,8 @@ async function getManifest(baseUrl = `http://localhost:${PORT}`, cfg = null) {
 
     return {
         id: ADDON_ID,
-        version: '1.0.2',
+        // Read rather than restated, so a release cannot bump one and not the other.
+        version: require('./package.json').version,
         name: 'xTremio',
         description: 'xTremio addon for Stremio',
         resources: ['catalog', 'meta', 'stream'],
@@ -451,12 +452,12 @@ async function getManifest(baseUrl = `http://localhost:${PORT}`, cfg = null) {
 }
 
 app.get('/manifest.json', async (req, res) => {
-    res.json(await getManifest(getBaseUrl(req), null));
+    res.json(await getManifest(null));
 });
 
 app.get('/:config/manifest.json', async (req, res) => {
     const cfg = decodeConfig(req.params.config);
-    res.json(await getManifest(getBaseUrl(req), cfg));
+    res.json(await getManifest(cfg));
 });
 
 // Query and body values arrive as string, array, object or undefined depending
@@ -1488,6 +1489,15 @@ function toIsoDate(s) {
 function titleOf(value) {
     if (typeof value === 'string') return value;
     return typeof value === 'number' && Number.isFinite(value) ? String(value) : '';
+}
+
+// Xtream sends `rating: "0"` — or 0, or "" — for a title nobody has rated, and
+// the string "0" is truthy, so Stremio showed a rating of 0 rather than none.
+// Anything that is not a positive number is no rating at all.
+function ratingOf(value) {
+    if (typeof value !== 'string' && typeof value !== 'number') return undefined;
+    const n = Number(value);
+    return Number.isFinite(n) && n > 0 ? String(n) : undefined;
 }
 
 // Xtream providers return `cast`/`genre` as either a comma-separated string or an array.
@@ -3518,7 +3528,7 @@ app.get('/:config/meta/:type/:id.json', async (req, res) => {
                 runtime: movie.duration ? String(movie.duration) + ' min' : (movie.episode_run_time ? String(movie.episode_run_time) + ' min' : undefined),
                 director: movie.director || undefined,
                 cast,
-                imdbRating: movie.rating ? String(movie.rating) : undefined,
+                imdbRating: ratingOf(movie.rating),
                 year: parseYear(movie.releasedate),
                 country: movie.country || undefined,
                 trailer: movie.youtube_trailer || undefined
@@ -3604,7 +3614,7 @@ app.get('/:config/meta/:type/:id.json', async (req, res) => {
                 runtime: series.episode_run_time ? String(series.episode_run_time) + ' min' : undefined,
                 director: series.director || undefined,
                 cast,
-                imdbRating: series.rating ? String(series.rating) : undefined,
+                imdbRating: ratingOf(series.rating),
                 year: parseYear(series.releaseDate),
                 videos
             };
@@ -4332,8 +4342,6 @@ app.all('/:config/proxy/:kind/:file', async (req, res) => {
     }
     const cfg = decodeConfig(req.params.config);
     if (!cfg) return res.status(401).end('unauthorized');
-    const refused = acquireProxySlot(cfg, req, res);
-    if (refused) return rejectOverCap(res, refused);
 
     const { kind, file } = req.params;
     if (!['movie', 'series', 'live'].includes(kind)) {
@@ -4361,6 +4369,11 @@ app.all('/:config/proxy/:kind/:file', async (req, res) => {
         return res.status(502).end('bad upstream');
     }
 
+    // Taken only once the request is known to be a relay, so a malformed one is
+    // answered for what it is rather than 429'd by an account at its cap.
+    const refused = acquireProxySlot(cfg, req, res);
+    if (refused) return rejectOverCap(res, refused);
+
     const base = getBaseUrl(req);
     await relayUpstream(req, res, {
         upstreamUrl,
@@ -4387,14 +4400,15 @@ app.all('/:config/proxy/hls', async (req, res) => {
     }
     const cfg = decodeConfig(req.params.config);
     if (!cfg) return res.status(401).end('unauthorized');
-    const refused = acquireProxySlot(cfg, req, res);
-    if (refused) return rejectOverCap(res, refused);
 
     // Bound to this config token: a signature minted for another account's
     // playlist does not verify here, even though the keys are shared by every
     // account on this instance.
     const target = decodeHlsTarget(req.query.u, req.query.s, req.query.e, req.params.config);
     if (!target) return res.status(400).end('bad target');
+
+    const refused = acquireProxySlot(cfg, req, res);
+    if (refused) return rejectOverCap(res, refused);
 
     const upstreamUrl = target.url;
     // What the playlist said this target was, or what its path says. Content
@@ -4734,6 +4748,7 @@ if (require.main === module) {
 module.exports = {
     app,
     getManifest,
+    ratingOf,
     encodeConfig,
     decodeConfig,
     xtremioGet,

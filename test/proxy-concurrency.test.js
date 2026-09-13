@@ -216,6 +216,24 @@ test('an unauthorized request is refused before it can take a slot', async () =>
     assert.equal(proxyInFlight.size, 0);
 });
 
+test('a malformed request is answered as one, not refused by the cap', async () => {
+    // The slot used to be taken before the request was validated, so an account at
+    // its cap got 429 — "come back later" — for a request that could never work.
+    const relays = Array.from({ length: CAP }, () => startRelay());
+    await Promise.all(relays.map(r => r.done));
+    await whenHeld(CAP);
+
+    const badFile = await fetch(`${base}/${CFG}/proxy/movie/not-a-number.mp4`);
+    assert.equal(badFile.status, 400);
+    await badFile.text();
+
+    const badTarget = await fetch(`${base}/${CFG}/proxy/hls?u=forged&s=forged&e=1`);
+    assert.equal(badTarget.status, 400);
+    await badTarget.text();
+
+    for (const r of relays) r.controller.abort();
+});
+
 test('the limit can be turned off', async () => {
     // Loaded in a second module instance, because the value is read at import.
     // An operator behind their own rate limiting has a legitimate reason to want
