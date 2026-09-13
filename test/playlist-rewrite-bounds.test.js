@@ -19,25 +19,40 @@ process.env.PLAYLIST_REWRITE_TIMEOUT_MS = '1000';
 const test = require('node:test');
 const assert = require('node:assert');
 
-// index.js holds `require('dns').promises` and calls `dns.lookup(...)`, so the
-// property is read at call time and patching it here is seen.
-const dnsPromises = require('dns').promises;
-const realLookup = dnsPromises.lookup;
+// index.js resolves through `new (require('dns').promises.Resolver)()`, one resolver
+// per lookup, so patching the prototype here is seen by every one of them. It used to
+// call dns.lookup, which is what this stub replaced, until audit S6 moved resolution
+// off the thread pool.
+const net = require('node:net');
+const { Resolver } = require('dns').promises;
+const realResolve4 = Resolver.prototype.resolve4;
+const realResolve6 = Resolver.prototype.resolve6;
 
 let lookups = [];
 let lookupDelayMs = 0;
 // A public address, so vetting passes and the URI is signed. A test that needs a
-// different answer sets these rather than replacing the function, so it cannot
+// different answer sets these rather than replacing the functions, so it cannot
 // leave the resolver pointing somewhere else for the rest of the file.
 const PUBLIC_ANSWER = [{ address: '93.184.216.34', family: 4 }];
 let lookupAddresses = PUBLIC_ANSWER;
 let lookupError = null;
-dnsPromises.lookup = async (hostname) => {
-    lookups.push(hostname);
-    if (lookupDelayMs) await new Promise(r => setTimeout(r, lookupDelayMs));
-    if (lookupError) throw lookupError;
-    return lookupAddresses;
-};
+
+// A lookup asks for both families at once. It is counted once, on the A query, so
+// `lookups` still means one entry per host resolved.
+function answerFamily(family) {
+    return async function (hostname) {
+        if (family === 4) lookups.push(hostname);
+        if (lookupDelayMs) await new Promise(r => setTimeout(r, lookupDelayMs));
+        if (lookupError) throw lookupError;
+        const matching = lookupAddresses
+            .filter(a => (a.family || net.isIP(a.address)) === family)
+            .map(a => a.address);
+        if (!matching.length) throw Object.assign(new Error('no records of this family'), { code: 'ENODATA' });
+        return matching;
+    };
+}
+Resolver.prototype.resolve4 = answerFamily(4);
+Resolver.prototype.resolve6 = answerFamily(6);
 
 const {
     encodeConfig,
@@ -77,7 +92,11 @@ function reset() {
 }
 
 test.beforeEach(reset);
-test.after(() => { dnsPromises.lookup = realLookup; global.fetch = realFetch; });
+test.after(() => {
+    Resolver.prototype.resolve4 = realResolve4;
+    Resolver.prototype.resolve6 = realResolve6;
+    global.fetch = realFetch;
+});
 
 test('the bounds are configurable', () => {
     assert.equal(MAX_PLAYLIST_ORIGINS, 4);

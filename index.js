@@ -62,12 +62,50 @@ const IS_PRODUCTION = process.env.NODE_ENV === 'production';
 // per-purpose labels stand in for: they keep the derived keys independent.
 const SCRYPT_PARAMS = { N: 32768, r: 8, p: 1, maxmem: 96 * 1024 * 1024 };
 
-function deriveConfigKey(label, bytes = 32) {
-    return crypto.scryptSync(CONFIG_SECRET, `xtremio-${label}-${CONFIG_TOKEN_VERSION}`, bytes, SCRYPT_PARAMS);
+function deriveConfigKey(label, bytes = 32, secret = CONFIG_SECRET) {
+    return crypto.scryptSync(secret, `xtremio-${label}-${CONFIG_TOKEN_VERSION}`, bytes, SCRYPT_PARAMS);
 }
 
 const CONFIG_ENC_KEY = deriveConfigKey('config-enc');
 const CONFIG_MAC_KEY = deriveConfigKey('config-mac');
+const CURRENT_CONFIG_KEYS = { enc: CONFIG_ENC_KEY, mac: CONFIG_MAC_KEY };
+
+function deriveConfigKeys(secret) {
+    const material = Buffer.from(String(secret), 'utf8');
+    return {
+        enc: deriveConfigKey('config-enc', 32, material),
+        mac: deriveConfigKey('config-mac', 32, material)
+    };
+}
+
+// Rotation (audit S11). Every install URL is sealed under CONFIG_SECRET, so changing
+// it used to break every install at once — which kept a secret that had leaked, or had
+// only ever been a placeholder, in service because replacing it was worse. With the old
+// secret here, install URLs sealed under it keep decoding while users reinstall at
+// their own pace, and every new one is sealed under the current secret.
+// Only the config-token keys are derived for it: an HLS link lives an hour at most and
+// every playlist fetch mints fresh ones, so a rotation costs a live channel one reload.
+// Remove it once the note below stops appearing for as long as your users take to
+// reinstall.
+const RAW_CONFIG_SECRET_PREVIOUS = process.env.CONFIG_SECRET_PREVIOUS || '';
+const PREVIOUS_CONFIG_KEYS = RAW_CONFIG_SECRET_PREVIOUS && RAW_CONFIG_SECRET_PREVIOUS !== RAW_CONFIG_SECRET
+    ? deriveConfigKeys(RAW_CONFIG_SECRET_PREVIOUS)
+    : null;
+if (RAW_CONFIG_SECRET_PREVIOUS && !PREVIOUS_CONFIG_KEYS) {
+    console.warn('[security] CONFIG_SECRET_PREVIOUS is the same as CONFIG_SECRET, so it has no effect');
+}
+
+// Once per process: enough to say CONFIG_SECRET_PREVIOUS is still load-bearing, and a
+// line an operator can watch for across restarts before removing it.
+let previousSecretUseNoted = false;
+function notePreviousSecretUse() {
+    if (previousSecretUseNoted) return;
+    previousSecretUseNoted = true;
+    console.warn(
+        '[security] an install URL sealed under CONFIG_SECRET_PREVIOUS was used; ' +
+        'keep it set until this stops appearing after restarts'
+    );
+}
 
 // The keys protecting HLS sub-resource links are separate from the config-token
 // pair. Those two purposes were domain-separated only by the `hls:` prefix
@@ -130,15 +168,43 @@ function enforceConfigSecretPolicy({ raw = RAW_CONFIG_SECRET, production = IS_PR
 // Accept only a plain host[:port] (or bracketed IPv6); set PUBLIC_URL to pin it.
 const SAFE_HOST = /^[A-Za-z0-9._~[\]:-]+$/;
 
-// Proxies may append to these headers ("https,http"); the first value is ours.
-function firstHeaderValue(value) {
-    return String(value || '').split(',')[0].trim();
+// How many reverse proxies in front of this server are trusted to report on the
+// client (TRUST_PROXY): `true` means one, a positive integer means that many, and
+// anything else means none — in which case the forwarded headers are ignored
+// entirely, because with no proxy in front every one of them was written by the
+// client.
+const TRUST_PROXY_HOPS = (() => {
+    const raw = String(process.env.TRUST_PROXY || '').trim().toLowerCase();
+    if (raw === 'true') return 1;
+    const n = Number(raw);
+    return Number.isInteger(n) && n > 0 ? n : 0;
+})();
+
+// The value a trusted proxy recorded in a forwarded header, or ''. Proxies
+// *append* to X-Forwarded-For, so everything left of what they added came from the
+// client: behind one proxy, the client wrote every entry but the last. The leftmost
+// entry used to be taken, so `X-Forwarded-For: <anything>` chose the rate limiter's
+// key and every request could be a fresh bucket (audit S5). Counting in from the
+// right by the number of trusted hops takes the entry the outermost trusted proxy
+// wrote. The same rule reads X-Forwarded-Proto and -Host: a proxy that overwrites
+// them rather than appending leaves a single value, which is also the last.
+// Every proxy that appends has to be counted — behind a CDN and nginx that both
+// append, TRUST_PROXY=true reads nginx's entry, which names the CDN.
+function forwardedValue(req, header) {
+    if (!TRUST_PROXY_HOPS) return '';
+    const entries = String(req.headers?.[header] || '').split(',').map(v => v.trim()).filter(Boolean);
+    if (!entries.length) return '';
+    return entries[Math.max(0, entries.length - TRUST_PROXY_HOPS)];
 }
 
 function getBaseUrl(req) {
     if (PUBLIC_URL) return PUBLIC_URL;
-    const proto = firstHeaderValue(req.headers['x-forwarded-proto']) || req.protocol || 'http';
-    const host = firstHeaderValue(req.headers['x-forwarded-host']) || req.headers.host || '';
+    // Only a trusted proxy's word counts (audit D4). These headers used to be
+    // honoured whether or not TRUST_PROXY was on — while the rate limiter, reading
+    // the same kind of header, required it — so the host an install link was minted
+    // for was whatever the request claimed.
+    const proto = forwardedValue(req, 'x-forwarded-proto') || req.protocol || 'http';
+    const host = forwardedValue(req, 'x-forwarded-host') || req.headers.host || '';
     const safeProto = /^https?$/.test(proto) ? proto : 'http';
     const safeHost = SAFE_HOST.test(host) ? host : `localhost:${PORT}`;
     return `${safeProto}://${safeHost}`;
@@ -159,8 +225,8 @@ function validateConfig(cfg) {
     return { serverUrl, username, password };
 }
 
-function signTokenBody(body) {
-    return crypto.createHmac('sha256', CONFIG_MAC_KEY).update(body).digest('base64url');
+function signTokenBody(body, key = CONFIG_MAC_KEY) {
+    return crypto.createHmac('sha256', key).update(body).digest('base64url');
 }
 
 function timingSafeEqualString(a, b) {
@@ -170,11 +236,17 @@ function timingSafeEqualString(a, b) {
 }
 
 function encodeConfig(cfg) {
+    return sealConfig(cfg, CURRENT_CONFIG_KEYS);
+}
+
+// Seals under an explicit key set. encodeConfig passes the current one; nothing in
+// production seals under the previous one, which is only ever used to open.
+function sealConfig(cfg, keys) {
     const clean = validateConfig(cfg);
     if (!clean) throw new Error('Invalid config');
 
     const iv = crypto.randomBytes(GCM_IV_BYTES);
-    const cipher = crypto.createCipheriv('aes-256-gcm', CONFIG_ENC_KEY, iv);
+    const cipher = crypto.createCipheriv('aes-256-gcm', keys.enc, iv);
     const ciphertext = Buffer.concat([
         cipher.update(JSON.stringify(clean), 'utf8'),
         cipher.final()
@@ -186,7 +258,7 @@ function encodeConfig(cfg) {
         tag.toString('base64url'),
         ciphertext.toString('base64url')
     ].join('.');
-    return `${body}.${signTokenBody(body)}`;
+    return `${body}.${signTokenBody(body, keys.mac)}`;
 }
 
 function decodeConfig(encoded) {
@@ -197,19 +269,38 @@ function decodeConfig(encoded) {
         if (parts.length !== 5 || parts[0] !== CONFIG_TOKEN_VERSION) return null;
         const [version, ivPart, tagPart, ciphertextPart, macPart] = parts;
         const body = [version, ivPart, tagPart, ciphertextPart].join('.');
-        if (!timingSafeEqualString(signTokenBody(body), macPart)) return null;
+        // The current secret first, and the previous one only when that fails, so a
+        // rotation costs old install URLs one extra MAC and new ones nothing. The MAC
+        // that verifies decides the decryption key: a MAC from one secret over a
+        // ciphertext from the other does not open.
+        const keys = timingSafeEqualString(signTokenBody(body), macPart)
+            ? CURRENT_CONFIG_KEYS
+            : (PREVIOUS_CONFIG_KEYS && timingSafeEqualString(signTokenBody(body, PREVIOUS_CONFIG_KEYS.mac), macPart)
+                ? PREVIOUS_CONFIG_KEYS
+                : null);
+        if (!keys) return null;
 
         // authTagLength is explicit: without it setAuthTag accepts a truncated
         // tag, and a short tag is proportionally easier to forge. Unreachable
         // today because the MAC over the same bytes is checked first, which is
         // why this is defence in depth rather than a fix.
-        const decipher = crypto.createDecipheriv('aes-256-gcm', CONFIG_ENC_KEY, Buffer.from(ivPart, 'base64url'), { authTagLength: GCM_TAG_BYTES });
+        const decipher = crypto.createDecipheriv('aes-256-gcm', keys.enc, Buffer.from(ivPart, 'base64url'), { authTagLength: GCM_TAG_BYTES });
         decipher.setAuthTag(Buffer.from(tagPart, 'base64url'));
         const plaintext = Buffer.concat([
             decipher.update(Buffer.from(ciphertextPart, 'base64url')),
             decipher.final()
         ]).toString('utf8');
-        return validateConfig(JSON.parse(plaintext));
+        const cfg = validateConfig(JSON.parse(plaintext));
+        if (cfg && keys === PREVIOUS_CONFIG_KEYS) notePreviousSecretUse();
+        // Policy rather than crypto, but checked here so that no route can decode a
+        // token without it. A token for an unlisted panel still decrypts — one
+        // minted before ALLOWED_PANEL_HOSTS was set, or while it was empty — and a
+        // route that honoured it would relay for a panel the operator never allowed.
+        if (cfg && !panelHostAllowed(cfg.serverUrl)) {
+            noteRefusedPanel(cfg.serverUrl);
+            return null;
+        }
+        return cfg;
     } catch {
         return null;
     }
@@ -339,6 +430,85 @@ function normalizeUrl(url) {
     if (!url) throw new Error('serverUrl is required');
     if (!/^https?:\/\//.test(url)) url = 'http://' + url;
     return url;
+}
+
+// The hostname a host-list entry or a server URL names, or null. Forgiving about
+// spelling, because an operator pastes what they have: a bare hostname, `host:port`
+// and a whole URL all name the same host. A bare IPv6 address is bracketed the way
+// URL writes a hostname, and URL does the lowercasing, so this compares equal to
+// `new URL(x).hostname` for the same host.
+function hostnameOf(value) {
+    const raw = String(value || '').trim();
+    if (!raw) return null;
+    const bareIpv6 = /^[0-9a-f:]+$/i.test(raw) && raw.split(':').length > 2;
+    const candidate = bareIpv6 ? `[${raw}]` : raw;
+    let hostname;
+    try {
+        hostname = new URL(/^[a-z][a-z0-9+.-]*:\/\//i.test(candidate) ? candidate : `http://${candidate}`).hostname;
+    } catch {
+        return null;
+    }
+    // URL accepts characters no real host has — `new URL('http://*.x.test')` parses,
+    // with `*.x.test` as its hostname. Kept, a `*.provider.com` entry would look like
+    // it covered every subdomain while matching nothing, which is the silent failure
+    // parseHostList exists to refuse. URL has already lowercased the name and turned
+    // an internationalized one into its xn-- form, so this is the whole alphabet.
+    if (/^\[[0-9a-f:.]+\]$/.test(hostname) || /^[a-z0-9._-]+$/.test(hostname)) return hostname;
+    return null;
+}
+
+// A comma-separated host list from the environment. An entry that names no host —
+// a `*.` wildcard, say — is dropped and said so at boot, rather than quietly
+// allowing nothing while looking like it allows something.
+function parseHostList(value, name) {
+    const hosts = new Set();
+    for (const entry of String(value || '').split(',')) {
+        if (!entry.trim()) continue;
+        const host = hostnameOf(entry);
+        if (host) hosts.add(host);
+        else console.warn(`[config] ${name}: ignoring ${JSON.stringify(entry.trim())}, which names no single host`);
+    }
+    return hosts;
+}
+
+// Which Xtream panels this instance will serve (audit S3). Empty, the default,
+// means any — the only workable setting when users bring their own providers, and
+// one that leaves this server usable as a relay: anyone who can reach /configure
+// can stand up a ten-line fake panel that passes the credential check, get an
+// install URL for it, and have the proxy fetch and relay whatever public URL that
+// panel redirects to, from this server's address. The per-account relay cap does
+// not bound it, since every made-up username is a new account, and nothing
+// stateless can tell such a panel from a real one. A list of the real ones can.
+//
+// Set, it is enforced everywhere a panel is chosen or used, because any one point
+// alone leaves a way round. /configure refuses an unlisted host before making any
+// request to it; a listed panel whose server_info names an unlisted origin keeps
+// the URL that connected; and decodeConfig refuses a token for an unlisted host,
+// so an install URL minted before the list was set — or while it was empty, which
+// is exactly when a fake panel could get one — stops working.
+// Matched by exact hostname, like HLS_TARGET_ALLOWED_HOSTS: one entry covers both
+// schemes and any port, and a subdomain needs an entry of its own. A listed panel
+// is trusted, including wherever it redirects.
+const ALLOWED_PANEL_HOSTS = parseHostList(process.env.ALLOWED_PANEL_HOSTS, 'ALLOWED_PANEL_HOSTS');
+
+function panelHostAllowed(serverUrl) {
+    if (!ALLOWED_PANEL_HOSTS.size) return true;
+    const host = hostnameOf(serverUrl);
+    return host !== null && ALLOWED_PANEL_HOSTS.has(host);
+}
+
+// A refused token is logged once per host rather than once per request. An install
+// URL that stopped working when the list was set fires every catalog, meta and
+// stream request Stremio makes, and one line per host is enough to say why. Bounded,
+// because the hosts come from tokens rather than from this server's configuration.
+const refusedPanelHostsLogged = new Set();
+const REFUSED_PANEL_LOG_MAX = 1000;
+
+function noteRefusedPanel(serverUrl) {
+    const host = hostnameOf(serverUrl) || '(unparseable)';
+    if (refusedPanelHostsLogged.has(host) || refusedPanelHostsLogged.size >= REFUSED_PANEL_LOG_MAX) return;
+    refusedPanelHostsLogged.add(host);
+    console.warn(`[config] refusing an install URL for ${JSON.stringify(host)}, which is not in ALLOWED_PANEL_HOSTS`);
 }
 
 function buildUrl(base, pathname, params = {}) {
@@ -933,7 +1103,54 @@ function blockedOutbound(message) {
     return Object.assign(new Error(message), { code: 'OUTBOUND_BLOCKED' });
 }
 
-async function assertSafeOutboundUrl(inputUrl) {
+// DNS resolution for the SSRF check, with a deadline (audit S6). dns.lookup runs
+// getaddrinfo on libuv's thread pool — four threads by default, uncancellable, and
+// deaf to the fetch's abort signal — so a panel on a domain whose nameserver never
+// answers held a pool thread for the resolver's whole timeout. Four such lookups,
+// two per /configure attempt, and every proxied range request on the instance
+// queued behind them: one caller's dead domain stalled everyone's playback.
+// c-ares (dns.Resolver) runs off the pool and can be cancelled, and each lookup
+// gets a resolver of its own, so cancelling one abandons nothing else. It does not
+// read /etc/hosts, which is why localhost names are refused by name in
+// assertSafeOutboundUrl rather than left to fail as unresolvable.
+const DNS_TIMEOUT_MS = Math.max(500, Number(process.env.DNS_TIMEOUT_MS) || 5000);
+
+async function resolveHostAddresses(hostname, {
+    timeoutMs = DNS_TIMEOUT_MS,
+    makeResolver = () => new dns.Resolver({ timeout: timeoutMs, tries: 2 })
+} = {}) {
+    const resolver = makeResolver();
+    let timer;
+    const deadline = new Promise((_, reject) => {
+        timer = setTimeout(() => {
+            try { resolver.cancel(); } catch {}
+            reject(Object.assign(
+                new Error(`DNS lookup for ${hostname} timed out after ${timeoutMs}ms`),
+                { code: 'ETIMEOUT', hostname }
+            ));
+        }, timeoutMs);
+    });
+    // allSettled attaches a handler to both, so the one still pending when the
+    // deadline wins cannot surface later as an unhandled rejection.
+    const families = Promise.allSettled([
+        resolver.resolve4(hostname).then(list => list.map(address => ({ address, family: 4 }))),
+        resolver.resolve6(hostname).then(list => list.map(address => ({ address, family: 6 })))
+    ]);
+    try {
+        const results = await Promise.race([families, deadline]);
+        const addresses = results.flatMap(r => (r.status === 'fulfilled' ? r.value : []));
+        if (addresses.length) return addresses;
+        // Neither family answered. A host with no record of one family (ENODATA) is
+        // ordinary, so the other family's error is the one that says why.
+        const errors = results.map(r => r.reason).filter(Boolean);
+        throw errors.find(e => e.code !== 'ENODATA') || errors[0]
+            || Object.assign(new Error(`No addresses for ${hostname}`), { code: 'ENOTFOUND', hostname });
+    } finally {
+        clearTimeout(timer);
+    }
+}
+
+async function assertSafeOutboundUrl(inputUrl, { resolve = resolveHostAddresses } = {}) {
     const url = new URL(inputUrl);
     if (!['http:', 'https:'].includes(url.protocol)) {
         throw blockedOutbound(`Blocked unsupported outbound protocol: ${url.protocol}`);
@@ -941,8 +1158,22 @@ async function assertSafeOutboundUrl(inputUrl) {
     if (ALLOW_PRIVATE_NETWORKS) return url;
 
     const hostname = url.hostname.replace(/^\[|\]$/g, '');
+    // RFC 6761 reserves these names for loopback. The resolver above would not answer
+    // for them at all, so without this they would fail as unresolvable instead of
+    // being refused as what they are.
+    if (/(^|\.)localhost\.?$/i.test(hostname)) {
+        throw blockedOutbound(`Blocked private outbound address for ${hostname}`);
+    }
     const directIp = net.isIP(hostname) ? [{ address: hostname }] : null;
-    const addresses = directIp || await dns.lookup(hostname, { all: true, verbatim: true });
+    // A host vetted within the pin window is not resolved again (audit P4). Every
+    // range request of a movie used to pay a fresh lookup for addresses the connector
+    // was going to be held to anyway, and that reuse is what keeps the resolver off
+    // the hot path S6 is about. Only vetted addresses are ever pinned, so nothing is
+    // skipped but the lookup. Reuse does not extend the pin: its expiry still says
+    // when the addresses were last actually looked up.
+    const pinned = directIp ? null : dnsPins.get(hostname);
+    if (pinned && pinned.expiresAt > Date.now()) return url;
+    const addresses = directIp || await resolve(hostname);
     if (!addresses.length) throw new Error(`Could not resolve outbound host: ${hostname}`);
 
     for (const { address } of addresses) {
@@ -2162,7 +2393,14 @@ function serverInfoOrigin(si) {
 
 async function validateXtremioCredentials(serverUrl, username, password) {
     const base = normalizeUrl(serverUrl);
-    const urls = [base, base.replace(/^https?/, m => m === 'https' ? 'http' : 'https')];
+    // Someone who typed https:// asked for https and is never moved off it
+    // automatically (audit S7). Any failure of the https attempt — a TLS reset, a
+    // non-JSON 5xx page, a reset on port 443 from someone on the path — used to
+    // trigger an http retry that sent the password in cleartext before the page could
+    // warn anyone. Without a scheme, or with http://, the fallback only ever tries
+    // https, which costs nothing.
+    const askedForHttps = schemeOf(base) === 'https';
+    const urls = askedForHttps ? [base] : [base, base.replace(/^http:/, 'https:')];
 
     for (const url of urls) {
         const controller = new AbortController();
@@ -2184,9 +2422,30 @@ async function validateXtremioCredentials(serverUrl, username, password) {
             }
 
             const si = json.server_info;
-            const named = serverInfoOrigin(si);
+            let named = serverInfoOrigin(si);
             if (si && si.url && !named) {
                 console.warn('[configure] provider server_info does not form a usable URL; keeping the one that connected');
+            }
+            // A listed panel does not get to move the install URL to a host that is
+            // not listed. server_info is provider data, and adopting an unlisted
+            // origin would bake it into the token — which decodeConfig then refuses,
+            // leaving a "Connected!" page whose install link never works.
+            if (named && !panelHostAllowed(named)) {
+                console.warn(
+                    `[configure] provider server_info names ${JSON.stringify(hostnameOf(named))}, ` +
+                    'which is not in ALLOWED_PANEL_HOSTS; keeping the one that connected'
+                );
+                named = null;
+            }
+            // Nor does the panel's own configuration move someone who asked for https
+            // onto http. server_info routinely names http, and following it baked
+            // cleartext into the install URL for a user who had typed https.
+            if (named && askedForHttps && schemeOf(named) === 'http') {
+                console.warn(
+                    `[configure] provider server_info names http for ${JSON.stringify(hostnameOf(named))}; ` +
+                    'keeping the https URL that connected'
+                );
+                named = null;
             }
             const finalUrl = named || url;
             // Attribute the downgrade to whichever step actually caused it: the
@@ -2210,7 +2469,12 @@ async function validateXtremioCredentials(serverUrl, username, password) {
             // reply says whether an arbitrary host:port is closed, nonexistent,
             // or filtered. The operator still gets the detail in the log.
             console.warn(`[configure] connection to ${new URL(url).host} failed: ${e.name === 'AbortError' ? 'timeout' : e.cause?.code || e.message}`);
-            return { valid: false, error: 'Cannot reach that server — check the URL and port.' };
+            return {
+                valid: false,
+                error: askedForHttps
+                    ? 'Cannot reach that server over https — check the URL and port. If your provider only supports http, enter the address starting with http:// instead.'
+                    : 'Cannot reach that server — check the URL and port.'
+            };
         } finally {
             clearTimeout(timer);
         }
@@ -2481,22 +2745,41 @@ function setPrivateHeaders(res) {
 // configuring an addon needs.
 const CONFIGURE_RATE_LIMIT = Math.max(1, Number(process.env.CONFIGURE_RATE_LIMIT) || 10);
 const CONFIGURE_RATE_WINDOW_MS = Math.max(1000, Number(process.env.CONFIGURE_RATE_WINDOW_MS) || 60 * 1000);
-// Bound the map so the limiter cannot itself become a memory-exhaustion vector;
-// once full, new clients are let through rather than locking out the instance.
+// Bound the map so the limiter cannot itself become a memory-exhaustion vector.
+// Once full, the oldest bucket makes room for the new one. It used to let every
+// new client through instead, which meant that 10,000 addresses in one window —
+// cheap in IPv6 before /64 bucketing — switched the limiter off for everyone.
 const CONFIGURE_RATE_MAX_CLIENTS = 10000;
 const configureAttempts = new Map();
 
-// X-Forwarded-For is client-suppliable, so honoring it without a proxy in front
-// would let anyone reset their own bucket by varying the header. Off by default;
-// behind a proxy every request otherwise shares the proxy's bucket.
-const TRUST_PROXY = process.env.TRUST_PROXY === 'true';
-
+// The key a client is limited by — for /configure attempts and for concurrent
+// relays alike. Its address, or the one a trusted proxy reported for it (see
+// forwardedValue); a forwarded value that is not an address falls back to the
+// socket, since a garbage key is a free bucket.
 function clientKey(req) {
-    if (TRUST_PROXY) {
-        const fwd = firstHeaderValue(req.headers['x-forwarded-for']);
-        if (fwd) return fwd;
+    const forwarded = forwardedValue(req, 'x-forwarded-for');
+    const address = net.isIP(forwarded) ? forwarded : (req.socket?.remoteAddress || '');
+    return addressBucket(address) || 'unknown';
+}
+
+// An IPv6 client is keyed by its /64. One home or mobile connection is routinely
+// assigned a whole /64, so keying by the full address handed each subscriber 2^64
+// fresh buckets. A v4-mapped address — how a dual-stack socket reports an IPv4
+// client — is keyed as the IPv4 address it is, so the same client is one bucket
+// whichever way it arrived.
+function addressBucket(address) {
+    const family = net.isIP(address);
+    if (family === 4) return address;
+    if (family !== 6) return '';
+    const bytes = ipv6ToBytes(address);
+    if (!bytes) return '';
+    const mapped = IPV6_EMBEDDED_IPV4[0];
+    if (ipv6MatchesPrefix(bytes, mapped.bytes, mapped.bits)) {
+        return Array.from(bytes.subarray(mapped.offset, mapped.offset + 4)).join('.');
     }
-    return req.socket?.remoteAddress || 'unknown';
+    const hextets = [];
+    for (let i = 0; i < 8; i += 2) hextets.push(((bytes[i] << 8) | bytes[i + 1]).toString(16));
+    return `${hextets.join(':')}::/64`;
 }
 
 // Fixed window: on the first hit of a window the count resets. Sweeping expired
@@ -2510,7 +2793,9 @@ function rateLimitConfigure(req) {
     const key = clientKey(req);
     const entry = configureAttempts.get(key);
     if (!entry) {
-        if (configureAttempts.size >= CONFIGURE_RATE_MAX_CLIENTS) return { allowed: true, retryAfter: 0 };
+        while (configureAttempts.size >= CONFIGURE_RATE_MAX_CLIENTS) {
+            configureAttempts.delete(configureAttempts.keys().next().value);
+        }
         configureAttempts.set(key, { count: 1, resetAt: now + CONFIGURE_RATE_WINDOW_MS });
         return { allowed: true, retryAfter: 0 };
     }
@@ -2598,6 +2883,24 @@ app.post('/configure', async (req, res) => {
             username,
             password,
             status: { valid: false, error: `Please enter your ${named}.` },
+            baseUrl: getBaseUrl(req),
+            nonce
+        }));
+    }
+
+    // Before any request is made to the host: the credential check is itself an
+    // outbound fetch to a URL the caller chose. The reply does not list the hosts
+    // that are allowed — whether to publish that is the operator's decision.
+    if (!panelHostAllowed(rawServerUrl)) {
+        console.warn(
+            `[configure] refused ${JSON.stringify(hostnameOf(rawServerUrl) || rawServerUrl.slice(0, 100))}: ` +
+            'not in ALLOWED_PANEL_HOSTS'
+        );
+        return res.send(renderConfigPage({
+            serverUrl: rawServerUrl,
+            username,
+            password,
+            status: { valid: false, error: 'This instance only accepts accounts from specific providers, and that server is not one of them.' },
             baseUrl: getBaseUrl(req),
             nonce
         }));
@@ -3584,12 +3887,9 @@ async function relayUpstream(req, res, { upstreamUrl, label, ext, rewriteFor }) 
 // serving the playlist over http and its segments over https needs one entry, not
 // two. Empty by default — the two derived origins cover every real provider seen
 // so far, and every entry here is a host this server will fetch from on request.
-const HLS_TARGET_ALLOWED_HOSTS = new Set(
-    String(process.env.HLS_TARGET_ALLOWED_HOSTS || '')
-        .split(',')
-        .map(h => h.trim().toLowerCase())
-        .filter(Boolean)
-);
+// Parsed by the same parseHostList as ALLOWED_PANEL_HOSTS, so an entry written as
+// `host:port` or as a URL names its host here too, rather than never matching.
+const HLS_TARGET_ALLOWED_HOSTS = parseHostList(process.env.HLS_TARGET_ALLOWED_HOSTS, 'HLS_TARGET_ALLOWED_HOSTS');
 
 // The origins a playlist is allowed to name. The account's own panel is not
 // enough on its own: real providers 302 the playlist to a CDN on a different
@@ -3705,50 +4005,109 @@ function makeHlsProxyMapper(base, configToken, allowedOrigins) {
 // use, because 0 is a *meaningful* value here and that idiom would quietly turn
 // the documented way to disable the limit into the default. An empty or
 // unparseable setting is treated as unset.
-const PROXY_MAX_CONCURRENT_PER_TOKEN = (() => {
-    const raw = process.env.PROXY_MAX_CONCURRENT_PER_TOKEN;
-    if (typeof raw !== 'string' || !raw.trim()) return 16;
+function relayLimitFromEnv(name, fallback) {
+    const raw = process.env[name];
+    if (typeof raw !== 'string' || !raw.trim()) return fallback;
     const n = Number(raw);
-    return Number.isFinite(n) && n >= 0 ? Math.floor(n) : 16;
-})();
+    return Number.isFinite(n) && n >= 0 ? Math.floor(n) : fallback;
+}
 
-const proxyInFlight = new Map();
+const PROXY_MAX_CONCURRENT_PER_TOKEN = relayLimitFromEnv('PROXY_MAX_CONCURRENT_PER_TOKEN', 16);
 
-// Takes a slot for the life of this response, or answers 429 and returns false.
+// Two more budgets over the same relays, because the one above is keyed by account
+// and an account is free. /configure mints one for any panel that passes the
+// credential check, so a caller with a panel of their own — or many made-up
+// usernames on one — gets a fresh per-account allowance each time (audit S3). On
+// an instance where anyone may bring any provider, nothing about the account can be
+// relied on to bound the traffic.
+//
+// Per client, because addresses are not free: keyed by clientKey, so an IPv6 client
+// counts by its /64 and a proxied one by the address TRUST_PROXY vouches for. The
+// default sits well above a household — several players at two or three relays
+// each — and is generous on purpose, since carrier NAT puts many unrelated users
+// behind one address.
+// And in total, because a caller with many addresses is still bounded by the
+// server's own capacity. That one is the operator's to size to their bandwidth; the
+// default is a ceiling a small host should lower, not a recommendation.
+// Both are parsed like the per-token limit, where 0 disables.
+const PROXY_MAX_CONCURRENT_PER_CLIENT = relayLimitFromEnv('PROXY_MAX_CONCURRENT_PER_CLIENT', 32);
+const PROXY_MAX_CONCURRENT_TOTAL = relayLimitFromEnv('PROXY_MAX_CONCURRENT_TOTAL', 256);
+
+const proxyInFlight = new Map();          // relays per account
+const proxyInFlightByClient = new Map();  // relays per client bucket
+const proxyRelays = { total: 0 };         // an object, so an importer sees it change
+
+function releaseCount(map, key) {
+    const left = (map.get(key) || 1) - 1;
+    // Delete at zero: the key space is every account and address that ever
+    // streamed, and an idle one must not cost an entry.
+    if (left > 0) map.set(key, left);
+    else map.delete(key);
+}
+
+// Takes a slot for the life of this response, or returns the limit that refused it
+// ({ scope }) for rejectOverCap. Null means the relay may go ahead. All three limits
+// are checked before any is counted, so a refused request holds nothing.
 // The release is bound to the response's `close` event rather than to the end of
 // the handler: `relayUpstream` returns as soon as the body is piped, while the
 // relay it started may run for hours. `close` fires exactly once, on a finished
-// response and on a dropped connection alike, which is what keeps the count from
-// drifting upward until the cap locks an account out permanently.
-function acquireProxySlot(cfg, res) {
-    if (!PROXY_MAX_CONCURRENT_PER_TOKEN) return true;
-    const key = accountCacheKey(cfg);
-    const current = proxyInFlight.get(key) || 0;
-    if (current >= PROXY_MAX_CONCURRENT_PER_TOKEN) {
+// response and on a dropped connection alike, which is what keeps the counts from
+// drifting upward until a cap locks a caller out permanently.
+function acquireProxySlot(cfg, req, res) {
+    if (!PROXY_MAX_CONCURRENT_PER_TOKEN && !PROXY_MAX_CONCURRENT_PER_CLIENT && !PROXY_MAX_CONCURRENT_TOTAL) {
+        return null;
+    }
+    const account = accountCacheKey(cfg);
+    const client = clientKey(req);
+    const byAccount = proxyInFlight.get(account) || 0;
+    const byClient = proxyInFlightByClient.get(client) || 0;
+
+    if (PROXY_MAX_CONCURRENT_PER_TOKEN && byAccount >= PROXY_MAX_CONCURRENT_PER_TOKEN) {
         console.warn(
-            `[proxy] concurrency cap reached (${current}/${PROXY_MAX_CONCURRENT_PER_TOKEN}); ` +
+            `[proxy] per-account concurrency cap reached (${byAccount}/${PROXY_MAX_CONCURRENT_PER_TOKEN}); ` +
             'raise PROXY_MAX_CONCURRENT_PER_TOKEN if this is legitimate traffic'
         );
-        return false;
+        return { scope: 'account' };
     }
-    proxyInFlight.set(key, current + 1);
+    if (PROXY_MAX_CONCURRENT_PER_CLIENT && byClient >= PROXY_MAX_CONCURRENT_PER_CLIENT) {
+        console.warn(
+            `[proxy] per-client concurrency cap reached for ${client} (${byClient}/${PROXY_MAX_CONCURRENT_PER_CLIENT}); ` +
+            'raise PROXY_MAX_CONCURRENT_PER_CLIENT if this is legitimate traffic, or check TRUST_PROXY if every client shares one address'
+        );
+        return { scope: 'client' };
+    }
+    if (PROXY_MAX_CONCURRENT_TOTAL && proxyRelays.total >= PROXY_MAX_CONCURRENT_TOTAL) {
+        console.warn(
+            `[proxy] total concurrency cap reached (${proxyRelays.total}/${PROXY_MAX_CONCURRENT_TOTAL}); ` +
+            'raise PROXY_MAX_CONCURRENT_TOTAL if the host has the bandwidth'
+        );
+        return { scope: 'total' };
+    }
+
+    if (PROXY_MAX_CONCURRENT_PER_TOKEN) proxyInFlight.set(account, byAccount + 1);
+    if (PROXY_MAX_CONCURRENT_PER_CLIENT) proxyInFlightByClient.set(client, byClient + 1);
+    if (PROXY_MAX_CONCURRENT_TOTAL) proxyRelays.total += 1;
     let released = false;
     res.once('close', () => {
         if (released) return;
         released = true;
-        const left = (proxyInFlight.get(key) || 1) - 1;
-        // Delete at zero: the key space is every account that ever streamed, and
-        // an idle account must not cost an entry.
-        if (left > 0) proxyInFlight.set(key, left);
-        else proxyInFlight.delete(key);
+        if (PROXY_MAX_CONCURRENT_PER_TOKEN) releaseCount(proxyInFlight, account);
+        if (PROXY_MAX_CONCURRENT_PER_CLIENT) releaseCount(proxyInFlightByClient, client);
+        if (PROXY_MAX_CONCURRENT_TOTAL) proxyRelays.total = Math.max(0, proxyRelays.total - 1);
     });
-    return true;
+    return null;
 }
 
-// 429 rather than 503: the limit is a property of this caller's own usage, not
+// A caller over its own budget gets 429: the limit is a property of its usage, not
 // of the server's health, and Retry-After tells a player to come back for the
-// segment rather than treating it as the end of the stream.
-function rejectOverCap(res) {
+// segment rather than treating it as the end of the stream. The total limit is the
+// server's capacity, which is what 503 says, with a longer wait since a slot there
+// frees only when someone else's stream ends.
+function rejectOverCap(res, refused = { scope: 'account' }) {
+    if (refused.scope === 'total') {
+        res.setHeader('Retry-After', '5');
+        return res.status(503).end('server at stream capacity');
+    }
     res.setHeader('Retry-After', '1');
     return res.status(429).end('too many concurrent streams');
 }
@@ -3759,7 +4118,8 @@ app.all('/:config/proxy/:kind/:file', async (req, res) => {
     }
     const cfg = decodeConfig(req.params.config);
     if (!cfg) return res.status(401).end('unauthorized');
-    if (!acquireProxySlot(cfg, res)) return rejectOverCap(res);
+    const refused = acquireProxySlot(cfg, req, res);
+    if (refused) return rejectOverCap(res, refused);
 
     const { kind, file } = req.params;
     if (!['movie', 'series', 'live'].includes(kind)) {
@@ -3813,7 +4173,8 @@ app.all('/:config/proxy/hls', async (req, res) => {
     }
     const cfg = decodeConfig(req.params.config);
     if (!cfg) return res.status(401).end('unauthorized');
-    if (!acquireProxySlot(cfg, res)) return rejectOverCap(res);
+    const refused = acquireProxySlot(cfg, req, res);
+    if (refused) return rejectOverCap(res, refused);
 
     // Bound to this config token: a signature minted for another account's
     // playlist does not verify here, even though the keys are shared by every
@@ -4173,6 +4534,14 @@ module.exports = {
     escapeHtml,
     normalizeUrl,
     serverInfoOrigin,
+    hostnameOf,
+    sealConfig,
+    deriveConfigKeys,
+    resolveHostAddresses,
+    DNS_TIMEOUT_MS,
+    parseHostList,
+    panelHostAllowed,
+    ALLOWED_PANEL_HOSTS,
     terminalErrorHandler,
     buildUrl,
     buildXtremioApiUrl,
@@ -4219,6 +4588,10 @@ module.exports = {
     acquireProxySlot,
     proxyInFlight,
     PROXY_MAX_CONCURRENT_PER_TOKEN,
+    PROXY_MAX_CONCURRENT_PER_CLIENT,
+    PROXY_MAX_CONCURRENT_TOTAL,
+    proxyInFlightByClient,
+    proxyRelays,
     makeHlsProxyMapper,
     hlsTargetOrigins,
     HLS_TARGET_ALLOWED_HOSTS,
@@ -4286,6 +4659,9 @@ module.exports = {
     rateLimitConfigure,
     configureAttempts,
     clientKey,
+    addressBucket,
+    forwardedValue,
+    TRUST_PROXY_HOPS,
     CONFIGURE_RATE_LIMIT,
     CONFIGURE_RATE_WINDOW_MS,
     CONFIGURE_RATE_MAX_CLIENTS,

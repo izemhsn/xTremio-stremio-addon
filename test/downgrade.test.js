@@ -68,12 +68,28 @@ test('describeDowngrade only fires on a real https to http drop', () => {
 test('an https request that falls back to http is reported', async () => {
     const attempted = stubProvider({ works: ['http'] });
 
+    // Audit S7. This test used to be titled "an https request that falls back to
+    // http is reported" and asserted that the retry happened: the password went out
+    // over http, and the warning came afterwards. Anything that made the https
+    // attempt fail — a reset on port 443 from someone on the path included — chose
+    // cleartext on the user's behalf.
     const result = await validateXtremioCredentials('https://provider.test', 'u', 'p');
 
-    assert.strictEqual(result.valid, true, 'the fallback still connects — this is a warning, not a failure');
-    assert.deepStrictEqual(attempted, ['https', 'http'], 'https was tried first');
-    assert.deepStrictEqual(result.downgrade, { from: 'https', to: 'http', source: 'fallback' });
-    assert.match(result.resolvedUrl, /^http:/, 'and http is what gets baked into the token');
+    assert.strictEqual(result.valid, false, 'https that fails is never retried over http');
+    assert.deepStrictEqual(attempted, ['https'], 'no request went out over http');
+    assert.match(result.error, /over https/);
+    assert.match(result.error, /http:\/\//, 'and the user is told how to choose http themselves');
+});
+
+test('without a scheme the fallback only ever tries https', async () => {
+    const attempted = stubProvider({ works: ['https'] });
+
+    const result = await validateXtremioCredentials('provider.test', 'u', 'p');
+
+    assert.strictEqual(result.valid, true);
+    assert.deepStrictEqual(attempted, ['http', 'https']);
+    assert.match(result.resolvedUrl, /^https:/);
+    assert.strictEqual(result.downgrade, null);
 });
 
 test('https that works is never reported as downgraded', async () => {
@@ -96,13 +112,31 @@ test('a user who asked for http is not warned about getting http', async () => {
 
 // --- the provider-controlled route -----------------------------------------
 
-test('a provider downgrading a working https connection is reported', async () => {
+test('a provider cannot move someone who asked for https onto http', async () => {
+    // Audit S7. This used to assert that the provider's http was adopted and reported.
+    // Adopting it baked cleartext into the install URL on the strength of the panel's
+    // own configuration, for a user who had typed https.
     stubProvider({
         works: ['https'],
         serverInfo: { url: 'provider.test', server_protocol: 'http', port: '8080' }
     });
 
     const result = await validateXtremioCredentials('https://provider.test', 'u', 'p');
+
+    assert.strictEqual(result.valid, true);
+    assert.strictEqual(result.downgrade, null);
+    assert.match(result.resolvedUrl, /^https:\/\/provider\.test/, 'the https URL that connected is kept');
+});
+
+test('a provider downgrade is still reported where the user never asked for https', async () => {
+    // Typed without a scheme: http failed, https worked, and the panel names http. The
+    // user did not ask for https, so the panel is followed — and the banner says so.
+    stubProvider({
+        works: ['https'],
+        serverInfo: { url: 'provider.test', server_protocol: 'http', port: '8080' }
+    });
+
+    const result = await validateXtremioCredentials('provider.test', 'u', 'p');
 
     assert.deepStrictEqual(result.downgrade, { from: 'https', to: 'http', source: 'provider' },
         'attributed to the provider, not the fallback');

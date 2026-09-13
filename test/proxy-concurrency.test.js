@@ -220,19 +220,28 @@ test('the limit can be turned off', async () => {
     // Loaded in a second module instance, because the value is read at import.
     // An operator behind their own rate limiting has a legitimate reason to want
     // this off, and "0 disables" is documented, so it is worth pinning.
+    // All three relay limits are zeroed: each disables independently, and with any
+    // one of them still on, taking a slot is exactly what should happen.
+    const names = ['PROXY_MAX_CONCURRENT_PER_TOKEN', 'PROXY_MAX_CONCURRENT_PER_CLIENT', 'PROXY_MAX_CONCURRENT_TOTAL'];
     const path = require.resolve('../index.js');
-    const saved = process.env.PROXY_MAX_CONCURRENT_PER_TOKEN;
-    process.env.PROXY_MAX_CONCURRENT_PER_TOKEN = '0';
+    const saved = Object.fromEntries(names.map(name => [name, process.env[name]]));
+    for (const name of names) process.env[name] = '0';
     delete require.cache[path];
     try {
         const fresh = require('../index.js');
         assert.equal(fresh.PROXY_MAX_CONCURRENT_PER_TOKEN, 0);
         // Nothing is counted, so nothing can be refused.
-        assert.equal(fresh.acquireProxySlot({ serverUrl: 'x', username: 'y', password: 'z' },
-            { once() { throw new Error('must not register a release when disabled'); } }), true);
+        assert.equal(fresh.acquireProxySlot(
+            { serverUrl: 'x', username: 'y', password: 'z' },
+            { headers: {}, socket: { remoteAddress: '203.0.113.5' } },
+            { once() { throw new Error('must not register a release when disabled'); } }
+        ), null);
         assert.equal(fresh.proxyInFlight.size, 0);
     } finally {
-        process.env.PROXY_MAX_CONCURRENT_PER_TOKEN = saved;
+        for (const name of names) {
+            if (saved[name] === undefined) delete process.env[name];
+            else process.env[name] = saved[name];
+        }
         delete require.cache[path];
         require('../index.js');
     }
