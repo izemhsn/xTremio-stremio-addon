@@ -162,6 +162,18 @@ test('every data cache is charged to the one production budget', () => {
     }
 });
 
+test('many small accounts do not evict each other: bytes decide, not the account count', () => {
+    // Audit R3. Four accounts per kind was the default, so a fifth evicted a list that
+    // fitted the budget easily, and the refetch meant parsing it again on the thread
+    // that relays video.
+    vodStreamsCache.map.clear();
+    for (let i = 0; i < 12; i++) {
+        vodStreamsCache.set({ serverUrl: 'http://panel.test', username: `user${i}`, password: 'p' }, [{ stream_id: i, name: `M${i}` }]);
+    }
+    assert.equal(vodStreamsCache.map.size, 12);
+    vodStreamsCache.map.clear();
+});
+
 test('a live stream list evicted by the shared budget names the shared knob', () => {
     // Raising the per-kind budget does nothing when the shared one is the tight one.
     const logged = captureWarnings(() => {

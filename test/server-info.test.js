@@ -58,6 +58,19 @@ test('a well-formed server_info becomes its origin', () => {
     assert.equal(serverInfoOrigin({ url: 'line.example.com:8080' }), 'http://line.example.com:8080');
 });
 
+test('https server_info without an https_port uses the https default, not the http port', () => {
+    // Audit S8. It borrowed `port`, giving https://line.example.com:80 — TLS spoken to
+    // the http port, which never connects.
+    assert.equal(
+        serverInfoOrigin({ url: 'line.example.com', server_protocol: 'https', https_port: '', port: '80' }),
+        'https://line.example.com'
+    );
+    assert.equal(
+        serverInfoOrigin({ url: 'line.example.com', server_protocol: 'https', port: '8080' }),
+        'https://line.example.com'
+    );
+});
+
 test('server_info that does not form a bare http(s) origin is refused', () => {
     for (const [label, si] of [
         ['port in url and in port', { url: 'line.example.com:8080', port: '8080' }],
@@ -109,6 +122,83 @@ test('a usable server_info is still honoured', async () => {
     stubProvider({ url: 'cdn.provider.test', port: '25461' });
     const result = await validateXtremioCredentials('http://provider.test:8080', 'alice', SECRET);
     assert.equal(result.resolvedUrl, 'http://cdn.provider.test:25461');
+});
+
+// --- a named origin has to work before it is adopted (audit S8) ---------------
+//
+// The origin a panel names for itself used to replace the URL that connected with
+// no check at all. A panel reporting its internal address — a common
+// misconfiguration — got "Connected!" and an install link whose every catalog was
+// empty, because the SSRF guard then refused every request to it.
+
+// Answers the credential check per origin: `answers` maps an origin to the
+// user_info it returns, and any origin it does not list refuses the connection.
+function stubByOrigin(answers, serverInfo) {
+    const asked = [];
+    global.fetch = async (url) => {
+        const origin = new URL(url).origin;
+        asked.push(origin);
+        if (!(origin in answers)) {
+            throw Object.assign(new Error('connect refused'), { cause: { code: 'ECONNREFUSED' } });
+        }
+        return {
+            ok: true,
+            status: 200,
+            json: async () => ({ user_info: answers[origin], server_info: serverInfo })
+        };
+    };
+    return asked;
+}
+
+const ACTIVE = { username: 'alice', auth: 1, status: 'Active' };
+
+test('a named origin is adopted once the credentials have worked there too', async () => {
+    const asked = stubByOrigin(
+        { 'http://provider.test:8080': ACTIVE, 'http://cdn.provider.test:25461': ACTIVE },
+        { url: 'cdn.provider.test', port: '25461' }
+    );
+
+    const result = await validateXtremioCredentials('http://provider.test:8080', 'alice', SECRET);
+
+    assert.equal(result.resolvedUrl, 'http://cdn.provider.test:25461');
+    assert.deepEqual(asked, ['http://provider.test:8080', 'http://cdn.provider.test:25461']);
+});
+
+test('a named origin that cannot be reached is not adopted', async () => {
+    // The internal-address case. The guard refusing it and the host being down look
+    // the same from here, and both mean an install link that would never work.
+    const asked = stubByOrigin({ 'http://provider.test:8080': ACTIVE }, { url: '10.0.0.5', port: '8080' });
+
+    let result;
+    const logged = await captureConsole(async () => {
+        result = await validateXtremioCredentials('http://provider.test:8080', 'alice', SECRET);
+    });
+
+    assert.equal(result.valid, true, 'the account itself is fine');
+    assert.equal(result.resolvedUrl, 'http://provider.test:8080', 'kept the URL that connected');
+    assert.deepEqual(asked, ['http://provider.test:8080', 'http://10.0.0.5:8080'], 'the named origin was tried');
+    assert.match(logged, /server_info/, 'and the operator hears why it was not used');
+    assert.ok(!logged.includes(SECRET), `the password reached the log:\n${logged}`);
+});
+
+test('a named origin where the credentials do not work is not adopted', async () => {
+    stubByOrigin(
+        { 'http://provider.test:8080': ACTIVE, 'http://elsewhere.test': { auth: 0 } },
+        { url: 'elsewhere.test' }
+    );
+
+    const result = await validateXtremioCredentials('http://provider.test:8080', 'alice', SECRET);
+
+    assert.equal(result.resolvedUrl, 'http://provider.test:8080');
+});
+
+test('a server_info naming the origin that connected costs no second request', async () => {
+    const asked = stubByOrigin({ 'http://provider.test:8080': ACTIVE }, { url: 'provider.test', port: '8080' });
+
+    const result = await validateXtremioCredentials('http://provider.test:8080', 'alice', SECRET);
+
+    assert.equal(result.resolvedUrl, 'http://provider.test:8080');
+    assert.equal(asked.length, 1);
 });
 
 // --- a token that already holds a bad URL -----------------------------------

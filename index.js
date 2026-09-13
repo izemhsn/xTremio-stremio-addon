@@ -107,6 +107,36 @@ function notePreviousSecretUse() {
     );
 }
 
+// Install URLs shaped like this server's tokens that will not open (audit R6). The
+// routes degrade them quietly on purpose — Stremio shows raw errors to users — which
+// left the operator nothing: after a restart with a missing or changed CONFIG_SECRET,
+// every install on the instance became an unconfigured manifest, and not one line
+// said so. Reported in aggregate, at most once per interval, since one broken install
+// fires dozens of requests; and only well-formed tokens are counted, so paths probed
+// by scanners do not raise the alarm. A report is written when a refusal arrives and
+// the interval has passed, carrying everything counted since the last one.
+const UNDECODABLE_REPORT_INTERVAL_MS = 5 * 60 * 1000;
+const undecodableTokens = { secret: 0, version: 0, lastReportAt: 0 };
+
+function noteUndecodableToken(reason, now = Date.now()) {
+    undecodableTokens[reason] += 1;
+    if (now - undecodableTokens.lastReportAt < UNDECODABLE_REPORT_INTERVAL_MS) return;
+    const findings = [];
+    if (undecodableTokens.secret) {
+        findings.push(
+            `${undecodableTokens.secret} sealed under a secret this server does not have — ` +
+            'if this follows a restart, CONFIG_SECRET changed or was not set (see CONFIG_SECRET_PREVIOUS)'
+        );
+    }
+    if (undecodableTokens.version) {
+        findings.push(`${undecodableTokens.version} from an older token version, whose users must reinstall`);
+    }
+    console.warn(`[config] install URLs refused since the last report: ${findings.join('; ')}`);
+    undecodableTokens.secret = 0;
+    undecodableTokens.version = 0;
+    undecodableTokens.lastReportAt = now;
+}
+
 // The keys protecting HLS sub-resource links are separate from the config-token
 // pair. Those two purposes were domain-separated only by the `hls:` prefix
 // inside the signed string; a distinct key makes the separation structural, so
@@ -266,7 +296,11 @@ function decodeConfig(encoded) {
     if (typeof encoded !== 'string' || encoded.length > 4096) return null;
     try {
         const parts = encoded.split('.');
-        if (parts.length !== 5 || parts[0] !== CONFIG_TOKEN_VERSION) return null;
+        if (parts.length !== 5) return null;
+        if (parts[0] !== CONFIG_TOKEN_VERSION) {
+            if (/^v\d+$/.test(parts[0])) noteUndecodableToken('version');
+            return null;
+        }
         const [version, ivPart, tagPart, ciphertextPart, macPart] = parts;
         const body = [version, ivPart, tagPart, ciphertextPart].join('.');
         // The current secret first, and the previous one only when that fails, so a
@@ -278,7 +312,10 @@ function decodeConfig(encoded) {
             : (PREVIOUS_CONFIG_KEYS && timingSafeEqualString(signTokenBody(body, PREVIOUS_CONFIG_KEYS.mac), macPart)
                 ? PREVIOUS_CONFIG_KEYS
                 : null);
-        if (!keys) return null;
+        if (!keys) {
+            noteUndecodableToken('secret');
+            return null;
+        }
 
         // authTagLength is explicit: without it setAuthTag accepts a truncated
         // tag, and a short tag is proportionally easier to forge. Unreachable
@@ -1290,7 +1327,9 @@ const MAX_PARSED_TO_BODY_RATIO = 2;
 // an entry lives exactly as long as the value does.
 const parsedSizeEstimates = new WeakMap();
 
-async function readJsonCapped(res, label, maxBytes = MAX_UPSTREAM_BYTES) {
+// `onChunk` is called once per chunk read, which is how xtremioGet's idle deadline
+// knows the download is still moving.
+async function readJsonCapped(res, label, maxBytes = MAX_UPSTREAM_BYTES, { onChunk = null } = {}) {
     // Trust a declared length to reject early, before reading a single byte.
     const declared = Number(res.headers?.get?.('content-length'));
     if (Number.isFinite(declared) && declared > maxBytes) {
@@ -1336,6 +1375,7 @@ async function readJsonCapped(res, label, maxBytes = MAX_UPSTREAM_BYTES) {
             );
         }
         chunks.push(Buffer.from(value));
+        if (onChunk) onChunk();
         if (total >= nextYieldAt) {
             nextYieldAt = total + YIELD_EVERY_BYTES;
             await new Promise((resolve) => setImmediate(resolve));
@@ -1360,20 +1400,51 @@ async function readJsonCapped(res, label, maxBytes = MAX_UPSTREAM_BYTES) {
     return data;
 }
 
-async function xtremioGet(cfg, action, params = {}, { timeoutMs = 15000 } = {}) {
+// Three deadlines for one upstream call, because they bound three different failures
+// (audit R5). A single 15 s timeout used to cover the whole download, so a 25 MB list
+// from a panel slower than ~1.7 MB/s could never finish, and every retry started over
+// from nothing. Headers get a short deadline. The body gets an idle deadline that
+// every chunk resets, so a slow download that keeps moving completes. And the whole
+// call gets an overall deadline, since without one a panel sending a byte just inside
+// the idle window could hold the request open for as long as it liked.
+const UPSTREAM_HEADER_TIMEOUT_MS = Math.max(100, Number(process.env.UPSTREAM_HEADER_TIMEOUT_MS) || 15000);
+const UPSTREAM_IDLE_TIMEOUT_MS = Math.max(100, Number(process.env.UPSTREAM_IDLE_TIMEOUT_MS) || 15000);
+const UPSTREAM_BODY_TIMEOUT_MS = Math.max(100, Number(process.env.UPSTREAM_BODY_TIMEOUT_MS) || 5 * 60 * 1000);
+
+async function xtremioGet(cfg, action, params = {}, { timeoutMs = UPSTREAM_HEADER_TIMEOUT_MS } = {}) {
     const url = buildXtremioApiUrl(cfg, action, params);
     const controller = new AbortController();
-    const timer = setTimeout(() => controller.abort(), timeoutMs);
+    let expired = null;
+    const expire = (waitingFor, ms) => setTimeout(() => {
+        expired = { waitingFor, ms };
+        controller.abort();
+    }, ms);
+    let phaseTimer = expire('headers', timeoutMs);
+    const overallTimer = expire('the whole response', UPSTREAM_BODY_TIMEOUT_MS);
     try {
         const res = await safeFetch(url, { signal: controller.signal });
+        clearTimeout(phaseTimer);
         if (!res.ok) throw new Error(`xtremio ${action} failed: HTTP ${res.status}`);
-        const data = await readJsonCapped(res, `xtremio ${action}`);
+        const resetIdle = () => {
+            clearTimeout(phaseTimer);
+            phaseTimer = expire('the next chunk', UPSTREAM_IDLE_TIMEOUT_MS);
+        };
+        resetIdle();
+        const data = await readJsonCapped(res, `xtremio ${action}`, MAX_UPSTREAM_BYTES, { onChunk: resetIdle });
 
         console.log(`[xtremioGet] ${action} (${Array.isArray(data) ? data.length : '?'} items)`);
 
         return data;
+    } catch (e) {
+        // Name the deadline that fired: "aborted" alone does not tell a stalled panel
+        // from a slow one, and the fix for each is a different setting.
+        if (expired) {
+            throw new Error(`xtremio ${action} timed out waiting for ${expired.waitingFor} after ${expired.ms} ms`, { cause: e });
+        }
+        throw e;
     } finally {
-        clearTimeout(timer);
+        clearTimeout(phaseTimer);
+        clearTimeout(overallTimer);
     }
 }
 
@@ -1686,10 +1757,17 @@ function weighJson(text) {
 // account count, not bytes.
 const CACHE_MAX_ACCOUNTS = Math.max(1, Number(process.env.CACHE_MAX_ACCOUNTS) || 100);
 
-// Full stream lists run 10-50 MB *per account per kind*, so this bound is the
-// one that actually caps memory. Evicting costs one upstream refetch; keeping
-// too many costs the process.
-const CACHE_MAX_STREAM_ACCOUNTS = Math.max(1, Number(process.env.CACHE_MAX_STREAM_ACCOUNTS) || 4);
+// How many accounts' full stream lists to hold, per kind. This used to be the bound
+// that capped memory, at 4 — and it was a churn cliff (audit R3): a fifth active
+// account evicted a list that fitted the budget comfortably, and refetching it meant
+// parsing tens of MB again on the thread that relays every video. Memory is bounded
+// in bytes now (CACHE_MAX_STREAM_BYTES per kind, CACHE_MAX_BYTES across every cache),
+// so this only has to stop many tiny entries accumulating, and the byte budgets
+// decide what is evicted. Parsing in a worker thread was measured as the other way
+// out and is worse: a 20.7 MB list blocked the main thread 81-94 ms in JSON.parse,
+// and 111-153 ms when parsed in a worker, because the parsed graph comes back by
+// structured clone and deserializing it runs on the main thread anyway.
+const CACHE_MAX_STREAM_ACCOUNTS = Math.max(1, Number(process.env.CACHE_MAX_STREAM_ACCOUNTS) || 64);
 
 // Counting entries is not the same as bounding memory: four accounts' worth of
 // entries could be four megabytes or four hundred, and only the second one
@@ -2379,7 +2457,10 @@ function describeDowngrade(requested, finalUrl, source) {
 function serverInfoOrigin(si) {
     if (!si || !si.url) return null;
     const proto = si.server_protocol || 'http';
-    const port = (proto === 'https' ? si.https_port : si.port) || si.port;
+    // An https server_info names its port in https_port. Borrowing `port` when that
+    // is empty gave https://host:80 — TLS spoken to the http port, which never
+    // connects (audit S8). With no https_port, https means its default port.
+    const port = proto === 'https' ? si.https_port : si.port;
     let parsed;
     try {
         parsed = new URL(port ? `${proto}://${si.url}:${port}` : `${proto}://${si.url}`);
@@ -2389,6 +2470,23 @@ function serverInfoOrigin(si) {
     if (parsed.protocol !== 'http:' && parsed.protocol !== 'https:') return null;
     if (parsed.pathname !== '/' || parsed.search || parsed.hash || parsed.username || parsed.password) return null;
     return parsed.origin;
+}
+
+// Whether these credentials work at `origin`: the same player_api call the check
+// below makes, answered with auth=1. Never throws — any failure, a refusal by the
+// SSRF guard included, is simply "no".
+async function credentialsWorkAt(origin, username, password) {
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(), 15000);
+    try {
+        const res = await safeFetch(buildUrl(origin, '/player_api.php', { username, password }), { signal: controller.signal });
+        const json = await readJsonCapped(res, 'credential check', 1024 * 1024);
+        return json?.user_info?.auth === 1;
+    } catch {
+        return false;
+    } finally {
+        clearTimeout(timer);
+    }
 }
 
 async function validateXtremioCredentials(serverUrl, username, password) {
@@ -2444,6 +2542,21 @@ async function validateXtremioCredentials(serverUrl, username, password) {
                 console.warn(
                     `[configure] provider server_info names http for ${JSON.stringify(hostnameOf(named))}; ` +
                     'keeping the https URL that connected'
+                );
+                named = null;
+            }
+            // And whatever origin survives is adopted only once these credentials have
+            // worked there too (audit S8). It used to replace the URL that connected
+            // untested, so a panel reporting its internal address — a common
+            // misconfiguration — got "Connected!" and an install link whose every
+            // catalog was empty, because the SSRF guard refused every request to it.
+            // Checked last, so a host already refused above is never contacted, and
+            // skipped for the origin that just answered, which proves nothing new.
+            if (named && new URL(named).origin !== new URL(url).origin
+                && !await credentialsWorkAt(named, username, password)) {
+                console.warn(
+                    `[configure] provider server_info names ${JSON.stringify(hostnameOf(named))}, ` +
+                    'where these credentials did not work; keeping the one that connected'
                 );
                 named = null;
             }
@@ -2932,6 +3045,25 @@ app.post('/configure', async (req, res) => {
     }
 });
 
+// Route failures are answered quietly — an empty shelf, a null meta — because Stremio
+// shows raw errors to users, so the log is the only place one failure can be told
+// from another. It used to print e.message for everything, and a bug in this file read
+// exactly like a provider outage: C1's "s.name.toLowerCase is not a function" emptied
+// every search on an account and looked like a flaky panel (audit R6). An error this
+// code raised by mistake now keeps its stack; provider and network failures stay one
+// line, since they are expected and their stacks say nothing. Stacks rather than error
+// objects, for the reason terminalErrorHandler gives.
+function isProgrammingError(e) {
+    if (e instanceof ReferenceError || e instanceof RangeError) return true;
+    // fetch reports a network failure as TypeError('fetch failed') with a cause.
+    return e instanceof TypeError && !e.cause && e.message !== 'fetch failed';
+}
+
+function logRouteError(route, e) {
+    if (isProgrammingError(e)) console.error(`[${route}] unexpected error: ${e.stack}`);
+    else console.error(`[${route}] Error:`, e?.message);
+}
+
 // --- Catalogs ---
 // The three catalog kinds differ only in the fields below. Everything else —
 // genre resolution, the search filter, sorting, pagination and the meta shape —
@@ -3074,6 +3206,34 @@ function toCatalogMetas(items, kind) {
     }));
 }
 
+// Which categories an item is filed under. Xtream items carry a primary
+// `category_id`, and many panels list every category in `category_ids` as well. The
+// per-category upstream call returns an item for each of them, so matching the cached
+// full list on `category_id` alone kept a multi-category item off all but one shelf
+// once the list was warm, while the same shelf cold showed it (audit C4): what a
+// shelf held depended on whether a search had happened to fill the cache.
+function hasCategoryIds(item) {
+    return (item.category_id != null && item.category_id !== '')
+        || (Array.isArray(item.category_ids) && item.category_ids.length > 0);
+}
+
+function inCategories(item, ids) {
+    if (item.category_id != null && item.category_id !== '' && ids.has(String(item.category_id))) return true;
+    return Array.isArray(item.category_ids) && item.category_ids.some(id => ids.has(String(id)));
+}
+
+// Items merged from several category lists, each once, first occurrence kept: an
+// item filed under two categories of the same name is in both of their lists.
+function uniqueById(items, idField) {
+    const seen = new Set();
+    return items.filter((item) => {
+        const id = String(item?.[idField]);
+        if (seen.has(id)) return false;
+        seen.add(id);
+        return true;
+    });
+}
+
 // Resolves a genre to its items *and* to the cached array they were derived
 // from, or to null when the genre does not resolve to a category. The second half is what lets the sorted view be invalidated by
 // identity: a genre shelf is usually a fresh `.filter()` of the full list, so
@@ -3082,8 +3242,9 @@ function toCatalogMetas(items, kind) {
 // list cache holds, and that is replaced only by a refetch.
 //
 // `selection` names which subset of `source` the items are, as resolved here:
-// 'all', or the category. The sorted view is keyed on it rather than on the
-// genre the request carried, because the no-categories path ignores that genre.
+// 'all', or the categories — every one that shares the genre's name. The sorted
+// view is keyed on it rather than on the genre the request carried, because the
+// no-categories path ignores that genre.
 //
 // `selectCatalogGenre` below is the plain-items form, kept because it is the
 // exported surface and the shape the rest of the file describes.
@@ -3103,12 +3264,18 @@ async function selectCatalogSource(cfg, kind, genre) {
     // Stremio marks genre required, but a bare catalog request still falls back
     // to the first category rather than showing an empty shelf.
     const selectedGenre = genre || (categories[0] && categories[0].category_name);
-    const cat = categories.find(c => c.category_name === selectedGenre);
-    if (!cat) return null;
+    // Every category with that name, not the first (audit C3). The manifest offers
+    // each name once, so two "Action" categories are one genre to the user — but the
+    // shelf resolved the name to the first of them alone, and the second one's titles
+    // could not be reached from anywhere in the addon.
+    const ids = [...new Set(categories
+        .filter(c => c.category_name === selectedGenre)
+        .map(c => String(c.category_id)))];
+    if (!ids.length) return null;
+    const idSet = new Set(ids);
 
-    const catIdStr = String(cat.category_id);
-
-    const selection = `category:${catIdStr}`;
+    // Unambiguous for any ids, and exactly the old `category:<id>` for one numeric id.
+    const selection = `category:${ids.map(encodeURIComponent).sort().join(',')}`;
 
     // A full list is a shortcut for the per-category fetch, and either one can be
     // wrong: a real provider has answered the unscoped get_vod_streams with an
@@ -3121,10 +3288,11 @@ async function selectCatalogSource(cfg, kind, genre) {
     if (kind.matchCategoryName) {
         const genreLower = String(selectedGenre || '').toLowerCase();
         const all = await kind.loadAll(cfg);
-        const items = all.filter(s => {
-            if (s.category_id != null && s.category_id !== '') return String(s.category_id) === catIdStr;
-            return genreLower && String(s.category_name || '').toLowerCase() === genreLower;
-        });
+        // An item with any category id is matched by id; only one with none at all
+        // falls back to its category name.
+        const items = all.filter(s => (hasCategoryIds(s)
+            ? inCategories(s, idSet)
+            : Boolean(genreLower) && String(s.category_name || '').toLowerCase() === genreLower));
         // The name takes part in this filter, so it takes part in the selection.
         if (items.length) return { items, source: all, selection: `${selection}\n${genreLower}` };
     } else {
@@ -3132,14 +3300,19 @@ async function selectCatalogSource(cfg, kind, genre) {
         // fetch beats pulling 10-50 MB just to filter it down.
         const fullList = kind.listCache.get(cfg);
         if (fullList) {
-            const items = fullList.filter(s => String(s.category_id) === catIdStr);
+            const items = fullList.filter(s => inCategories(s, idSet));
             if (items.length) return { items, source: fullList, selection };
         }
     }
 
-    // The per-category list is itself cached, so it is its own identity token.
-    const catList = await getCategoryStreams(cfg, kind.categoryAction, catIdStr);
-    return { items: catList, source: catList, selection };
+    // The per-category lists are themselves cached, so one is its own identity token,
+    // as before. Several are merged into an array that is new on every request, so its
+    // sorted view is computed per request and collected with it — a sort paid only on
+    // the cold path, and only by an account whose provider duplicates a name.
+    const lists = await Promise.all(ids.map(id => getCategoryStreams(cfg, kind.categoryAction, id)));
+    if (lists.length === 1) return { items: lists[0], source: lists[0], selection };
+    const merged = uniqueById(lists.flat(), kind.idField);
+    return { items: merged, source: merged, selection };
 }
 
 async function selectCatalogGenre(cfg, kind, genre) {
@@ -3259,7 +3432,7 @@ app.get(['/:config/catalog/:type/:id.json', '/:config/catalog/:type/:id/:extra.j
         if (!metas.length) return res.json({ metas });
         return res.json({ metas, ...withCacheHints(res, 300, 600) });
     } catch (e) {
-        console.error('[catalog] Error:', e.message);
+        logRouteError('catalog', e);
         res.json({ metas: [] });
     }
 });
@@ -3416,7 +3589,7 @@ app.get('/:config/meta/:type/:id.json', async (req, res) => {
 
         res.json({ meta: null });
     } catch (e) {
-        console.error('[meta] Error:', e.message);
+        logRouteError('meta', e);
         res.json({ meta: null });
     }
 });
@@ -3540,7 +3713,7 @@ app.get('/:config/stream/:type/:id.json', async (req, res) => {
 
         res.json({ streams: [] });
     } catch (e) {
-        console.error('[stream] Error:', e.message);
+        logRouteError('stream', e);
         res.json({ streams: [] });
     }
 });
@@ -4522,6 +4695,14 @@ module.exports = {
     getManifest,
     encodeConfig,
     decodeConfig,
+    xtremioGet,
+    UPSTREAM_HEADER_TIMEOUT_MS,
+    UPSTREAM_IDLE_TIMEOUT_MS,
+    UPSTREAM_BODY_TIMEOUT_MS,
+    isProgrammingError,
+    noteUndecodableToken,
+    undecodableTokens,
+    UNDECODABLE_REPORT_INTERVAL_MS,
     validateConfig,
     configSecretProblems,
     enforceConfigSecretPolicy,

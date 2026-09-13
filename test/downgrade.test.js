@@ -129,12 +129,17 @@ test('a provider cannot move someone who asked for https onto http', async () =>
 });
 
 test('a provider downgrade is still reported where the user never asked for https', async () => {
-    // Typed without a scheme: http failed, https worked, and the panel names http. The
-    // user did not ask for https, so the panel is followed — and the banner says so.
-    stubProvider({
-        works: ['https'],
-        serverInfo: { url: 'provider.test', server_protocol: 'http', port: '8080' }
-    });
+    // Typed without a scheme: http failed, https worked, and the panel names http on
+    // another port. The user did not ask for https, so the panel is followed — and the
+    // banner says so. The named origin has to answer: since audit S8, one is adopted
+    // only once the credentials work there too.
+    const serverInfo = { url: 'provider.test', server_protocol: 'http', port: '8080' };
+    global.fetch = async (url) => {
+        if (new URL(url).origin === 'http://provider.test') {
+            throw Object.assign(new Error('connect refused'), { cause: { code: 'ECONNREFUSED' } });
+        }
+        return { ok: true, status: 200, json: async () => ({ user_info: OK_USER, server_info: serverInfo }) };
+    };
 
     const result = await validateXtremioCredentials('provider.test', 'u', 'p');
 
