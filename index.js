@@ -1175,9 +1175,23 @@ function blockedOutbound(message) {
 // assertSafeOutboundUrl rather than left to fail as unresolvable.
 const DNS_TIMEOUT_MS = Math.max(500, Number(process.env.DNS_TIMEOUT_MS) || 5000);
 
+// c-ares finds its nameservers by its own reading of the system configuration, and
+// that is not always what the OS uses. Measured on a Windows host whose resolver
+// worked: c-ares listed only 127.0.0.1, where nothing listened, so every query failed
+// at once with ECONNREFUSED and /configure answered "Cannot reach that server" for
+// every panel. These codes say the resolver itself is unusable — not that the name is
+// bad or its nameserver slow — so only they fall back to the OS resolver. A timeout
+// never does: that is the stall S6 removed. The fallback runs under the same deadline,
+// which bounds the wait though it cannot free the pool thread; on a host where the
+// alternative is that nothing resolves at all, that is the better trade.
+const DNS_RESOLVER_UNUSABLE = new Set(['ECONNREFUSED', 'ELOADIPHLPAPI', 'EADDRGETNETWORKPARAMS']);
+const dnsFallback = { warned: false };  // an object, so a test can reset it
+
 async function resolveHostAddresses(hostname, {
     timeoutMs = DNS_TIMEOUT_MS,
-    makeResolver = () => new dns.Resolver({ timeout: timeoutMs, tries: 2 })
+    makeResolver = () => new dns.Resolver({ timeout: timeoutMs, tries: 2 }),
+    lookup = (host) => dns.lookup(host, { all: true, verbatim: true }),
+    log = console
 } = {}) {
     const resolver = makeResolver();
     let timer;
@@ -1203,8 +1217,21 @@ async function resolveHostAddresses(hostname, {
         // Neither family answered. A host with no record of one family (ENODATA) is
         // ordinary, so the other family's error is the one that says why.
         const errors = results.map(r => r.reason).filter(Boolean);
-        throw errors.find(e => e.code !== 'ENODATA') || errors[0]
+        const failure = errors.find(e => e.code !== 'ENODATA') || errors[0]
             || Object.assign(new Error(`No addresses for ${hostname}`), { code: 'ENOTFOUND', hostname });
+        if (!DNS_RESOLVER_UNUSABLE.has(failure.code)) throw failure;
+
+        if (!dnsFallback.warned) {
+            dnsFallback.warned = true;
+            let servers = '';
+            try { servers = ` (it was configured with ${resolver.getServers().join(', ') || 'no servers'})`; } catch {}
+            log.warn(
+                `[dns] the built-in resolver cannot reach its nameservers: ${failure.code}${servers}. ` +
+                'Falling back to the operating system resolver, which works but cannot be cancelled, ' +
+                'so a slow nameserver can delay other requests. Fix the host DNS configuration to restore it.'
+            );
+        }
+        return await Promise.race([lookup(hostname), deadline]);
     } finally {
         clearTimeout(timer);
     }
@@ -2531,13 +2558,21 @@ async function validateXtremioCredentials(serverUrl, username, password) {
     // https, which costs nothing.
     const askedForHttps = schemeOf(base) === 'https';
     const urls = askedForHttps ? [base] : [base, base.replace(/^http:/, 'https:')];
+    // Whether any attempt got an HTTP response at all. A server that answers with
+    // an HTML page, a login screen or a 404 is reachable — the URL is wrong, not the
+    // network — and "Cannot reach that server" sent people chasing the wrong fault.
+    // Saying so discloses nothing the JSON-but-not-a-panel answer did not already.
+    let anyAnswered = false;
 
     for (const url of urls) {
         const controller = new AbortController();
         const timer = setTimeout(() => controller.abort(), 15000);
+        let answered = false;
         try {
             const apiUrl = buildUrl(url, '/player_api.php', { username, password });
             const res = await safeFetch(apiUrl, { signal: controller.signal });
+            answered = true;
+            anyAnswered = true;
             // Unauthenticated entry point against a user-supplied host: a small
             // cap here, since an auth response is tiny and anything large is abuse.
             const json = await readJsonCapped(res, 'credential check', 1024 * 1024);
@@ -2610,12 +2645,20 @@ async function validateXtremioCredentials(serverUrl, username, password) {
                 downgrade
             };
         } catch (e) {
-            if (url === urls[0] && urls.length > 1) continue;
             // Distinguishing ECONNREFUSED / ENOTFOUND / timeout back to an
             // unauthenticated caller turns this page into a port scanner: the
             // reply says whether an arbitrary host:port is closed, nonexistent,
-            // or filtered. The operator still gets the detail in the log.
-            console.warn(`[configure] connection to ${new URL(url).host} failed: ${e.name === 'AbortError' ? 'timeout' : e.cause?.code || e.message}`);
+            // or filtered. The operator still gets the detail in the log — for
+            // every attempt, since the http failure was the one that explained a
+            // failed check and it used to be skipped silently.
+            const reason = e.name === 'AbortError' ? 'timeout' : e.cause?.code || e.message;
+            const retrying = url === urls[0] && urls.length > 1;
+            console.warn(
+                `[configure] connection to ${new URL(url).origin} ${answered ? 'answered, but not as a panel' : 'failed'}: ` +
+                `${reason}${retrying ? '; trying https' : ''}`
+            );
+            if (retrying) continue;
+            if (anyAnswered) return { valid: false, error: 'Not a valid xTremio server' };
             return {
                 valid: false,
                 error: askedForHttps
@@ -4775,6 +4818,7 @@ module.exports = {
     sealConfig,
     deriveConfigKeys,
     resolveHostAddresses,
+    dnsFallback,
     DNS_TIMEOUT_MS,
     parseHostList,
     panelHostAllowed,

@@ -13,7 +13,7 @@ process.env.CONFIG_SECRET = 'test-secret-for-unit-tests';
 const test = require('node:test');
 const assert = require('node:assert');
 
-const { resolveHostAddresses, assertSafeOutboundUrl, dnsPins, DNS_TIMEOUT_MS } = require('../index.js');
+const { resolveHostAddresses, assertSafeOutboundUrl, dnsPins, dnsFallback, DNS_TIMEOUT_MS } = require('../index.js');
 
 // Stands in for dns.Resolver: answers per family, or never answers at all.
 function fakeResolver({ v4 = [], v6 = [], hang = false } = {}) {
@@ -76,6 +76,88 @@ test('a host with no addresses reports why, not just that one family was empty',
         () => resolveHostAddresses('gone.test', { makeResolver }),
         (e) => e.code === 'ENOTFOUND'
     );
+});
+
+// --- falling back when c-ares itself is unusable ----------------------------------
+//
+// Measured on a Windows host: c-ares was configured with 127.0.0.1 alone, nothing
+// listened there, and every query failed at once with ECONNREFUSED while the OS
+// resolver answered normally. /configure then called every panel unreachable.
+
+function countingLookup(answer) {
+    const calls = [];
+    return {
+        calls,
+        lookup: async (host) => {
+            calls.push(host);
+            if (answer === 'hang') return new Promise(() => {});
+            return answer;
+        }
+    };
+}
+
+function quietLog() {
+    const warnings = [];
+    return { warnings, log: { warn: (msg) => warnings.push(msg) } };
+}
+
+test('an unreachable nameserver falls back to the OS resolver, with one warning', async () => {
+    dnsFallback.warned = false;
+    const { makeResolver } = fakeResolver({ v4: failure('ECONNREFUSED'), v6: failure('ECONNREFUSED') });
+    const { calls, lookup } = countingLookup([{ address: '93.184.216.34', family: 4 }]);
+    const { warnings, log } = quietLog();
+
+    for (let i = 0; i < 2; i++) {
+        assert.deepEqual(
+            await resolveHostAddresses('panel.test', { makeResolver, lookup, log }),
+            [{ address: '93.184.216.34', family: 4 }]
+        );
+    }
+    assert.deepEqual(calls, ['panel.test', 'panel.test']);
+    assert.equal(warnings.length, 1, 'the operator hears it once, not on every lookup');
+    assert.match(warnings[0], /ECONNREFUSED/);
+});
+
+test('a bad name or a slow nameserver does not fall back', async () => {
+    // A timeout falling back would put getaddrinfo — uncancellable, on the shared
+    // pool — back in front of every relay: the S6 stall.
+    const { log } = quietLog();
+
+    const gone = countingLookup([{ address: '93.184.216.34', family: 4 }]);
+    await assert.rejects(
+        () => resolveHostAddresses('gone.test', {
+            makeResolver: fakeResolver({ v4: failure('ENOTFOUND'), v6: failure('ENODATA') }).makeResolver,
+            lookup: gone.lookup,
+            log
+        }),
+        (e) => e.code === 'ENOTFOUND'
+    );
+    assert.deepEqual(gone.calls, []);
+
+    const slow = countingLookup([{ address: '93.184.216.34', family: 4 }]);
+    await assert.rejects(
+        () => resolveHostAddresses('dead.test', {
+            timeoutMs: 100,
+            makeResolver: fakeResolver({ hang: true }).makeResolver,
+            lookup: slow.lookup,
+            log
+        }),
+        (e) => e.code === 'ETIMEOUT'
+    );
+    assert.deepEqual(slow.calls, []);
+});
+
+test('the fallback is held to the same deadline', async () => {
+    const { makeResolver } = fakeResolver({ v4: failure('ECONNREFUSED'), v6: failure('ECONNREFUSED') });
+    const { lookup } = countingLookup('hang');
+    const { log } = quietLog();
+    const started = Date.now();
+
+    await assert.rejects(
+        () => resolveHostAddresses('stuck.test', { timeoutMs: 100, makeResolver, lookup, log }),
+        (e) => e.code === 'ETIMEOUT'
+    );
+    assert.ok(Date.now() - started < 1000);
 });
 
 // --- the SSRF check that uses it --------------------------------------------------

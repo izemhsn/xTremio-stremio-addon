@@ -130,6 +130,58 @@ test('a panel answering a JSON null is not a valid server, not an unreachable on
     assert.equal(result.error, 'Not a valid xTremio server');
 });
 
+test('every failed attempt is logged, including the http one that is retried', async () => {
+    // Only the https retry's failure used to be logged. For a panel entered as
+    // http://, the http failure is the one that explains the refusal, and the page
+    // deliberately says nothing specific.
+    global.fetch = async () => {
+        throw Object.assign(new TypeError('fetch failed'), { cause: { code: 'ECONNREFUSED' } });
+    };
+    let result;
+    const logged = await captureConsole(async () => {
+        result = await validateXtremioCredentials('http://provider.test:8080', 'alice', SECRET);
+    });
+    assert.equal(result.valid, false);
+    assert.match(result.error, /^Cannot reach that server/, 'nothing answered, so it really is unreachable');
+    assert.match(logged, /http:\/\/provider\.test:8080 failed: ECONNREFUSED; trying https/);
+    assert.match(logged, /https:\/\/provider\.test:8080 failed: ECONNREFUSED/);
+    assert.ok(!logged.includes(SECRET), 'the log names the origin, never the credentials');
+});
+
+test('a server that answers with something other than a panel is not called unreachable', async () => {
+    // Measured against a real host: an HTML page came back in 250 ms and the page
+    // still said "Cannot reach that server". A wrong port or path on a working host
+    // looks exactly like this, and the message pointed at the network instead.
+    for (const [label, body, status] of [
+        ['an HTML page', '<!doctype html><title>Welcome</title>', 200],
+        ['an error page', '<html>Not Found</html>', 404],
+        ['an empty body', '', 200]
+    ]) {
+        global.fetch = async () => new Response(body, { status, headers: { 'Content-Type': 'text/html' } });
+        let result;
+        const logged = await captureConsole(async () => {
+            result = await validateXtremioCredentials('http://provider.test:8080', 'alice', SECRET);
+        });
+        assert.equal(result.valid, false, label);
+        assert.equal(result.error, 'Not a valid xTremio server', label);
+        assert.match(logged, /answered, but not as a panel/, label);
+    }
+});
+
+test('an http answer still counts when the https retry cannot connect', async () => {
+    global.fetch = async (url) => {
+        if (String(url).startsWith('https:')) {
+            throw Object.assign(new TypeError('fetch failed'), { cause: { code: 'ECONNREFUSED' } });
+        }
+        return new Response('<!doctype html>', { status: 200, headers: { 'Content-Type': 'text/html' } });
+    };
+    let result;
+    await captureConsole(async () => {
+        result = await validateXtremioCredentials('http://provider.test:8080', 'alice', SECRET);
+    });
+    assert.equal(result.error, 'Not a valid xTremio server');
+});
+
 test('a usable server_info is still honoured', async () => {
     stubProvider({ url: 'cdn.provider.test', port: '25461' });
     const result = await validateXtremioCredentials('http://provider.test:8080', 'alice', SECRET);
