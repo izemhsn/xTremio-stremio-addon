@@ -3,7 +3,7 @@
 //   get_vod_info was called once by the meta route and again by the stream
 //   route for the same movie, and re-opening that movie paid both calls again.
 //
-//   The per-category catalog fetch that selectCatalogGenre falls back to when
+//   The per-category catalog fetch that selectCatalogSource falls back to when
 //   the full list is cold was uncached, so paginating a genre re-pulled the
 //   whole category from upstream on every page — and a cold cache is exactly
 //   when Stremio's parallel catalog requests arrive.

@@ -45,6 +45,11 @@ app.use((req, res, next) => {
 const PORT = process.env.PORT || 3000;
 const HOST = process.env.HOST || '0.0.0.0';
 const ADDON_ID = 'org.xtremio.addon';
+// Read rather than restated, so a release cannot bump one and not the other.
+const ADDON_VERSION = require('./package.json').version;
+// Per-request and per-upstream-call lines. Off by default: on a busy instance they
+// are most of the log and say nothing a failure line does not.
+const LOG_REQUESTS = process.env.LOG_REQUESTS === 'true';
 // v3, not v2: the key derivation below changed, so tokens issued by an older
 // build no longer decode. That is a deliberate break — see the README.
 const CONFIG_TOKEN_VERSION = 'v3';
@@ -55,15 +60,10 @@ const CONFIG_SECRET = RAW_CONFIG_SECRET
 const CONFIG_SECRET_MIN_BYTES = 32;
 const IS_PRODUCTION = process.env.NODE_ENV === 'production';
 
-// scrypt rather than a bare SHA-256. Every install URL carries ciphertext and a
-// MAC, which is everything an attacker needs to test candidate secrets offline;
-// a single hash makes each guess essentially free, so a memorable passphrase
-// falls quickly. N=32768/r=8 costs ~80 ms and 32 MB per guess, and being
-// memory-hard it resists GPU parallelism too. Three derivations put ~200 ms on
-// startup, paid once.
-// The salts are fixed strings because the keys must be re-derivable at boot from
-// the secret alone — there is nowhere to persist a random salt. That is what the
-// per-purpose labels stand in for: they keep the derived keys independent.
+// scrypt rather than a bare hash: every install URL carries ciphertext and a MAC,
+// enough to test candidate secrets offline, and a single hash makes each guess
+// free. N=32768/r=8 costs ~80 ms and 32 MB per guess. The salts are fixed,
+// per-purpose labels because the keys must be re-derivable from the secret alone.
 const SCRYPT_PARAMS = { N: 32768, r: 8, p: 1, maxmem: 96 * 1024 * 1024 };
 
 function deriveConfigKey(label, bytes = 32, secret = CONFIG_SECRET) {
@@ -82,15 +82,10 @@ function deriveConfigKeys(secret) {
     };
 }
 
-// Rotation (audit S11). Every install URL is sealed under CONFIG_SECRET, so changing
-// it used to break every install at once — which kept a secret that had leaked, or had
-// only ever been a placeholder, in service because replacing it was worse. With the old
-// secret here, install URLs sealed under it keep decoding while users reinstall at
-// their own pace, and every new one is sealed under the current secret.
-// Only the config-token keys are derived for it: an HLS link lives an hour at most and
-// every playlist fetch mints fresh ones, so a rotation costs a live channel one reload.
-// Remove it once the note below stops appearing for as long as your users take to
-// reinstall.
+// Rotation (audit S11): install URLs sealed under the previous secret keep decoding
+// while users reinstall, and every new one is sealed under the current secret. Only
+// the config-token keys are derived for it — HLS links are re-minted on every
+// playlist fetch.
 const RAW_CONFIG_SECRET_PREVIOUS = process.env.CONFIG_SECRET_PREVIOUS || '';
 const PREVIOUS_CONFIG_KEYS = RAW_CONFIG_SECRET_PREVIOUS && RAW_CONFIG_SECRET_PREVIOUS !== RAW_CONFIG_SECRET
     ? deriveConfigKeys(RAW_CONFIG_SECRET_PREVIOUS)
@@ -112,13 +107,9 @@ function notePreviousSecretUse() {
 }
 
 // Install URLs shaped like this server's tokens that will not open (audit R6). The
-// routes degrade them quietly on purpose — Stremio shows raw errors to users — which
-// left the operator nothing: after a restart with a missing or changed CONFIG_SECRET,
-// every install on the instance became an unconfigured manifest, and not one line
-// said so. Reported in aggregate, at most once per interval, since one broken install
-// fires dozens of requests; and only well-formed tokens are counted, so paths probed
-// by scanners do not raise the alarm. A report is written when a refusal arrives and
-// the interval has passed, carrying everything counted since the last one.
+// routes degrade them quietly for the user, so this is what tells the operator that
+// CONFIG_SECRET changed. Reported in aggregate at most once per interval, and only
+// for well-formed tokens, so scanners do not raise it.
 const UNDECODABLE_REPORT_INTERVAL_MS = 5 * 60 * 1000;
 const undecodableTokens = { secret: 0, version: 0, lastReportAt: 0 };
 
@@ -141,15 +132,9 @@ function noteUndecodableToken(reason, now = Date.now()) {
     undecodableTokens.lastReportAt = now;
 }
 
-// The keys protecting HLS sub-resource links are separate from the config-token
-// pair. Those two purposes were domain-separated only by the `hls:` prefix
-// inside the signed string; a distinct key makes the separation structural, so
-// no future change to either message format can make a value valid in one
-// position replayable in the other.
-// They come from one derivation rather than two because scrypt's cost is the
-// memory-hard mixing and not the output length: 64 bytes cost the same ~65 ms as
-// 32, so splitting a single output keeps boot — and the module load every test
-// file pays — at three derivations rather than four.
+// HLS link keys are separate from the config-token pair, so no change to either
+// message format can make a value valid in one replayable in the other. One 64-byte
+// derivation split in two, because scrypt's cost is the mixing, not the length.
 const HLS_KEY_MATERIAL = deriveConfigKey('hls', 64);
 const HLS_ENC_KEY = HLS_KEY_MATERIAL.subarray(0, 32);
 const HLS_MAC_KEY = HLS_KEY_MATERIAL.subarray(32);
@@ -214,16 +199,10 @@ const TRUST_PROXY_HOPS = (() => {
     return Number.isInteger(n) && n > 0 ? n : 0;
 })();
 
-// The value a trusted proxy recorded in a forwarded header, or ''. Proxies
-// *append* to X-Forwarded-For, so everything left of what they added came from the
-// client: behind one proxy, the client wrote every entry but the last. The leftmost
-// entry used to be taken, so `X-Forwarded-For: <anything>` chose the rate limiter's
-// key and every request could be a fresh bucket (audit S5). Counting in from the
-// right by the number of trusted hops takes the entry the outermost trusted proxy
-// wrote. The same rule reads X-Forwarded-Proto and -Host: a proxy that overwrites
-// them rather than appending leaves a single value, which is also the last.
-// Every proxy that appends has to be counted — behind a CDN and nginx that both
-// append, TRUST_PROXY=true reads nginx's entry, which names the CDN.
+// The value a trusted proxy recorded in a forwarded header, or ''. Proxies *append*,
+// so everything left of their entries was written by the client (audit S5): the
+// value is read from the right, TRUST_PROXY_HOPS entries in. A proxy that
+// overwrites instead leaves a single value, which is also the last.
 function forwardedValue(req, header) {
     if (!TRUST_PROXY_HOPS) return '';
     const entries = String(req.headers?.[header] || '').split(',').map(v => v.trim()).filter(Boolean);
@@ -233,10 +212,7 @@ function forwardedValue(req, header) {
 
 function getBaseUrl(req) {
     if (PUBLIC_URL) return PUBLIC_URL;
-    // Only a trusted proxy's word counts (audit D4). These headers used to be
-    // honoured whether or not TRUST_PROXY was on — while the rate limiter, reading
-    // the same kind of header, required it — so the host an install link was minted
-    // for was whatever the request claimed.
+    // Only a trusted proxy's word counts (audit D4).
     const proto = forwardedValue(req, 'x-forwarded-proto') || req.protocol || 'http';
     const host = forwardedValue(req, 'x-forwarded-host') || req.headers.host || '';
     const safeProto = /^https?$/.test(proto) ? proto : 'http';
@@ -244,9 +220,8 @@ function getBaseUrl(req) {
     return `${safeProto}://${safeHost}`;
 }
 
-// null and undefined become '', but every other value is stringified as itself:
-// `String(str || '')` silently turned 0 and false into an empty string, which
-// is a trap for the next caller that interpolates a number.
+// null and undefined become ''; every other value, 0 and false included, is
+// stringified as itself.
 function escapeHtml(str) {
     return String(str ?? '').replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;').replace(/'/g, '&#039;');
 }
@@ -388,6 +363,11 @@ async function getManifest(cfg = null) {
             ['XT-Series', 'xtremio_series_featured', 'Featured', 'series']
         ];
 
+        const searchCatalogs = [
+            ['XT-Movies', 'xtremio_search_movies', 'Search Movies'],
+            ['XT-Series', 'xtremio_search_series', 'Search Series']
+        ];
+
         catalogs.push(
             ...genreCatalogs.map(([type, id, name, key]) => ({
                 type,
@@ -395,43 +375,23 @@ async function getManifest(cfg = null) {
                 name,
                 extra: genreExtra(genresOf(key))
             })),
-            {
-                type: 'XT-Movies',
-                id: 'xtremio_search_movies',
-                name: 'Search Movies',
+            ...searchCatalogs.map(([type, id, name]) => ({
+                type,
+                id,
+                name,
                 // Stremio sends only the extras a catalog declares, so without
-                // `skip` a search never asks for page two and a common word stops
-                // at the 100 most recently added matches.
+                // `skip` a search never asks for page two.
                 extra: [{ name: 'search', isRequired: true }, { name: 'skip' }],
-                // Not a field the Stremio SDK defines, so no client reads it.
-                // Kept because it is accurate documentation of what the search
-                // route actually does — filterByName matches on `name` only —
-                // and because an unknown key is inert where a mistyped known
-                // one (see `config` above) is not.
+                // Not an SDK field, so no client reads it; kept as documentation
+                // that filterByName matches on `name` only.
                 searchProperties: ['name']
-            },
-            {
-                type: 'XT-Series',
-                id: 'xtremio_search_series',
-                name: 'Search Series',
-                // Stremio sends only the extras a catalog declares, so without
-                // `skip` a search never asks for page two and a common word stops
-                // at the 100 most recently added matches.
-                extra: [{ name: 'search', isRequired: true }, { name: 'skip' }],
-                // Not a field the Stremio SDK defines, so no client reads it.
-                // Kept because it is accurate documentation of what the search
-                // route actually does — filterByName matches on `name` only —
-                // and because an unknown key is inert where a mistyped known
-                // one (see `config` above) is not.
-                searchProperties: ['name']
-            }
+            }))
         );
     }
 
     return {
         id: ADDON_ID,
-        // Read rather than restated, so a release cannot bump one and not the other.
-        version: require('./package.json').version,
+        version: ADDON_VERSION,
         name: 'xTremio',
         description: 'xTremio addon for Stremio',
         resources: ['catalog', 'meta', 'stream'],
@@ -513,24 +473,12 @@ function parseHostList(value, name) {
     return hosts;
 }
 
-// Which Xtream panels this instance will serve (audit S3). Empty, the default,
-// means any — the only workable setting when users bring their own providers, and
-// one that leaves this server usable as a relay: anyone who can reach /configure
-// can stand up a ten-line fake panel that passes the credential check, get an
-// install URL for it, and have the proxy fetch and relay whatever public URL that
-// panel redirects to, from this server's address. The per-account relay cap does
-// not bound it, since every made-up username is a new account, and nothing
-// stateless can tell such a panel from a real one. A list of the real ones can.
-//
-// Set, it is enforced everywhere a panel is chosen or used, because any one point
-// alone leaves a way round. /configure refuses an unlisted host before making any
-// request to it; a listed panel whose server_info names an unlisted origin keeps
-// the URL that connected; and decodeConfig refuses a token for an unlisted host,
-// so an install URL minted before the list was set — or while it was empty, which
-// is exactly when a fake panel could get one — stops working.
-// Matched by exact hostname, like HLS_TARGET_ALLOWED_HOSTS: one entry covers both
-// schemes and any port, and a subdomain needs an entry of its own. A listed panel
-// is trusted, including wherever it redirects.
+// Which Xtream panels this instance will serve (audit S3). Empty means any, which
+// leaves the server usable as a relay through a fake panel; nothing stateless can
+// tell such a panel from a real one, but a list of the real ones can. Set, it is
+// enforced at /configure, on server_info origins and in decodeConfig, since any one
+// point alone leaves a way round. Matched by exact hostname; a listed panel is
+// trusted, including wherever it redirects.
 const ALLOWED_PANEL_HOSTS = parseHostList(process.env.ALLOWED_PANEL_HOSTS, 'ALLOWED_PANEL_HOSTS');
 
 function panelHostAllowed(serverUrl) {
@@ -648,61 +596,23 @@ const PROXY_HEADER_TIMEOUT_MS = Math.max(1000, Number(process.env.PROXY_HEADER_T
 // body timeout.
 const PLAYLIST_BODY_TIMEOUT_MS = Math.max(1000, Number(process.env.PLAYLIST_BODY_TIMEOUT_MS) || 30000);
 
-// Reading the body is not the end of the work. The rewrite that follows resolves
-// DNS once per distinct origin named in the playlist, and it used to run with no
-// deadline at all: PLAYLIST_BODY_TIMEOUT_MS had been cleared and
-// PROXY_HEADER_TIMEOUT_MS long before that. At MAX_PLAYLIST_BYTES a playlist can
-// name on the order of 60,000 distinct hostnames, which held one request, its
-// socket and the buffered body for tens of minutes while emitting a resolver
-// query per host. Two bounds close it: a ceiling on how many distinct origins are
-// worth vetting at all, and a deadline over the phase as a whole.
-//
-// The cap is the load-bearing one — it bounds the *number* of lookups. The
-// deadline bounds the total and is the backstop for a slow resolver; it is
-// checked between lookups, so a single hung resolution can still overrun it by
-// that lookup's own timeout.
+// The rewrite after the body read resolves DNS once per distinct origin, so it is
+// bounded twice: the origin cap bounds the number of lookups, and the deadline is
+// the backstop for a slow resolver. The deadline is checked between lookups, so one
+// hung resolution can overrun it by that lookup's own timeout.
 const MAX_PLAYLIST_ORIGINS = Math.max(1, Number(process.env.MAX_PLAYLIST_ORIGINS) || 32);
 const PLAYLIST_REWRITE_TIMEOUT_MS = Math.max(1000, Number(process.env.PLAYLIST_REWRITE_TIMEOUT_MS) || 15000);
 
 // --- HLS playlist proxying -------------------------------------------------
 //
-// Live channels are served as either a continuous MPEG-TS body (.ts), which
-// relays byte-for-byte, or an HLS playlist (.m3u8), which does not. A playlist
-// is a manifest of further URLs, and an Xtream one names segments by absolute
-// URLs that embed /username/password/ themselves. Relaying such a body
-// unchanged would move the credential disclosure from the URL into the body
-// rather than fixing it, so playlists are rewritten: every URI inside is
-// resolved and replaced with a link back through this server.
-//
-// Those rewritten links must not turn the proxy into an open relay for
-// arbitrary URLs, so each target is HMAC-signed and the signature is checked
-// before any outbound request. The MAC uses its own key (HLS_MAC_KEY) and its
-// `hls:` prefix domain-separates the signed string as well, so a value valid in
-// one position cannot be replayed in the other.
-//
-// The target itself is encrypted, not merely encoded. It used to be plain
-// base64url, and the URL it names is the provider's own: for many panels that
-// is /live/<username>/<password>/<id>.ts, so anyone who read the query string
-// could decode working account credentials — credentials that keep working
-// against the provider directly and survive a CONFIG_SECRET rotation. Query
-// strings are recorded in player logs, in Stremio's history and in every
-// reverse-proxy access log, which is the same disclosure /configure refuses to
-// make when it declines to prefill the password back into its form.
-// The config token and the expiry are the ciphertext's associated data, so the
-// GCM tag covers exactly what the MAC covers: a payload minted for one account
-// will not decrypt under another's token, nor under a deadline someone extended.
-// A signature covers the config token and an expiry as well as the URL, so the
-// capability it grants is neither transferable nor permanent. It was previously
-// a pure function of the URL and the global MAC key, which meant one minted
-// while rewriting user A's playlist verified under *any* user's token, forever
-// — and the target it names is an Xtream segment URL with A's credentials in
-// the path. Obtaining one already requires A's token, so this is durability
-// rather than escalation: a link captured from a log or a shared screen stayed
-// valid indefinitely, and survived the user reconfiguring.
-//
-// None of the three fields can contain a `:` — the config token is base64url
-// with `.` separators, the expiry is digits, the payload is base64url — so
-// concatenating them is unambiguous and no field can be shifted into another.
+// An Xtream playlist names its segments by absolute URLs with the account's
+// credentials in the path, so playlists are rewritten: every URI becomes a link
+// back through this server. Each link's target is HMAC-signed (its own key, and an
+// `hls:` prefix) so the proxy is not an open relay, and encrypted so the
+// credentials cannot be read from a query string in a log. The signature and the
+// GCM associated data both cover the config token and an expiry, so a link is
+// bound to one account and dies. None of the signed fields can contain a `:`, so
+// concatenating them is unambiguous.
 const HLS_SIGNATURE_TTL_MS = Math.max(60 * 1000, Number(process.env.HLS_SIGNATURE_TTL_MS) || 60 * 60 * 1000);
 
 function signHlsTarget(payload, configToken = '', expiresAt = 0) {
@@ -882,15 +792,10 @@ async function rewriteHlsPlaylist(text, baseUrl, toProxyUrl, { deadline = null }
         if (!['http:', 'https:'].includes(absolute.protocol)) return null;
         const mapped = await toProxyUrl(absolute.toString(), Boolean(playlist));
         if (mapped) return mapped;
-        // The mapper refused this target, and leaving the line as the provider
-        // wrote it is the disclosure this rewrite exists to prevent: an Xtream
-        // playlist names its sub-resources by absolute URLs carrying the account's
-        // credentials, so a partly rewritten playlist hands them to the player.
-        // Refusing the whole playlist is the answer the deadline above gives, for
-        // the same reason — and dropping the line is not a safe alternative, since
-        // a dropped EXT-X-KEY URI leaves the player treating encrypted segments as
-        // plaintext. The operator's remedy is HLS_TARGET_ALLOWED_HOSTS, named in
-        // the warning the mapper logs.
+        // The mapper refused this target. Leaving the line would hand the player
+        // the provider's credential-bearing URL, and dropping it is unsafe (a
+        // dropped EXT-X-KEY URI makes encrypted segments look plaintext), so the
+        // whole playlist is refused.
         const err = new Error('playlist names a target this server will not proxy');
         err.code = 'PLAYLIST_TARGET_REFUSED';
         throw err;
@@ -1071,8 +976,12 @@ const dnsPins = new Map();
 
 function pinResolvedAddresses(hostname, addresses) {
     const now = Date.now();
+    // Every pin is (re-)inserted with the same TTL, so insertion order is expiry
+    // order and the sweep can stop at the first live one. A pin expired out of
+    // order is still refused on read by pinnedLookup.
     for (const [host, entry] of dnsPins) {
-        if (entry.expiresAt <= now) dnsPins.delete(host);
+        if (entry.expiresAt > now) break;
+        dnsPins.delete(host);
     }
     // Re-inserting rather than updating in place keeps insertion order equal to
     // recency, so the eviction below drops the least recently vetted host.
@@ -1121,20 +1030,11 @@ const PINNED_DISPATCHER = ALLOW_PRIVATE_NETWORKS
     ? null
     : new UndiciAgent({ connect: { lookup: pinnedLookup } });
 
-// The pinned dispatcher comes from the undici dependency while fetch() comes from the
-// undici Node bundles, so the two can differ, and not every pairing works. Measured
-// with this app's own pattern — a custom connect.lookup, a redirect, a streamed body
-// and an abort — dispatchers from undici 6 and 7 work with the fetch bundled in Node
-// 20.18.1 (undici 6.20), 22 (6.28) and 24 (7.25), in both directions, and the full
-// suite passes on all three. An undici 8 dispatcher fails every request against the
-// fetch in Node 22 and 24 with "invalid onRequestStart method", its handler interface
-// having changed, and does not load on Node 20 at all.
-// This used to compare majors and warn on any difference, so on the documented Node
-// 20.18.1 floor it told the operator that every outbound request would fail, where
-// every one succeeds (audit D2). It now warns only for a pairing outside the measured
-// set, and says the pairing is unverified rather than broken, since only the undici 8
-// direction has actually been seen to fail. The versions are parameters so the rule
-// can be tested without the runtime that would exercise each branch.
+// The pinned dispatcher comes from the undici dependency and fetch() from Node's
+// bundled undici, and not every pairing works. Measured: 6 and 7 interoperate with
+// the fetch in Node 20.18.1, 22 and 24; an undici 8 dispatcher fails every request
+// on 22 and 24. Only pairings outside the measured set warn (audit D2). The versions
+// are parameters so each branch can be tested.
 const UNDICI_INTEROPERABLE_MAJORS = new Set(['6', '7']);
 
 function warnOnUndiciMismatch(log = console, {
@@ -1163,27 +1063,17 @@ function blockedOutbound(message) {
     return Object.assign(new Error(message), { code: 'OUTBOUND_BLOCKED' });
 }
 
-// DNS resolution for the SSRF check, with a deadline (audit S6). dns.lookup runs
-// getaddrinfo on libuv's thread pool — four threads by default, uncancellable, and
-// deaf to the fetch's abort signal — so a panel on a domain whose nameserver never
-// answers held a pool thread for the resolver's whole timeout. Four such lookups,
-// two per /configure attempt, and every proxied range request on the instance
-// queued behind them: one caller's dead domain stalled everyone's playback.
-// c-ares (dns.Resolver) runs off the pool and can be cancelled, and each lookup
-// gets a resolver of its own, so cancelling one abandons nothing else. It does not
-// read /etc/hosts, which is why localhost names are refused by name in
-// assertSafeOutboundUrl rather than left to fail as unresolvable.
+// DNS resolution for the SSRF check, with a deadline (audit S6). dns.lookup runs on
+// libuv's four-thread pool and cannot be cancelled, so one dead nameserver stalled
+// everyone's relays. c-ares runs off the pool, one resolver per lookup, cancelled
+// at the deadline. It does not read /etc/hosts, hence the localhost check in
+// assertSafeOutboundUrl.
 const DNS_TIMEOUT_MS = Math.max(500, Number(process.env.DNS_TIMEOUT_MS) || 5000);
 
-// c-ares finds its nameservers by its own reading of the system configuration, and
-// that is not always what the OS uses. Measured on a Windows host whose resolver
-// worked: c-ares listed only 127.0.0.1, where nothing listened, so every query failed
-// at once with ECONNREFUSED and /configure answered "Cannot reach that server" for
-// every panel. These codes say the resolver itself is unusable — not that the name is
-// bad or its nameserver slow — so only they fall back to the OS resolver. A timeout
-// never does: that is the stall S6 removed. The fallback runs under the same deadline,
-// which bounds the wait though it cannot free the pool thread; on a host where the
-// alternative is that nothing resolves at all, that is the better trade.
+// c-ares reads the nameserver list itself and can get it wrong where the OS works
+// (one Windows host gave it only 127.0.0.1). These codes mean the resolver itself is
+// unusable, so only they fall back to the OS resolver, under the same deadline. A
+// timeout never falls back: that is the stall S6 removed.
 const DNS_RESOLVER_UNUSABLE = new Set(['ECONNREFUSED', 'ELOADIPHLPAPI', 'EADDRGETNETWORKPARAMS']);
 const dnsFallback = { warned: false };  // an object, so a test can reset it
 
@@ -1252,12 +1142,9 @@ async function assertSafeOutboundUrl(inputUrl, { resolve = resolveHostAddresses 
         throw blockedOutbound(`Blocked private outbound address for ${hostname}`);
     }
     const directIp = net.isIP(hostname) ? [{ address: hostname }] : null;
-    // A host vetted within the pin window is not resolved again (audit P4). Every
-    // range request of a movie used to pay a fresh lookup for addresses the connector
-    // was going to be held to anyway, and that reuse is what keeps the resolver off
-    // the hot path S6 is about. Only vetted addresses are ever pinned, so nothing is
-    // skipped but the lookup. Reuse does not extend the pin: its expiry still says
-    // when the addresses were last actually looked up.
+    // A host vetted within the pin window is not resolved again (audit P4), which
+    // keeps the resolver off the relay hot path. Only vetted addresses are pinned,
+    // and reuse does not extend the pin.
     const pinned = directIp ? null : dnsPins.get(hostname);
     if (pinned && pinned.expiresAt > Date.now()) return url;
     const addresses = directIp || await resolve(hostname);
@@ -1314,21 +1201,14 @@ async function safeFetch(inputUrl, options = {}, { maxRedirects = 3, onFinalUrl 
             onFinalUrl?.(url.toString());
             return res;
         }
-        // The redirect's own body is never read, and every proxy request traverses
-        // at least one 302, so this is the hot path for leaked connections. The
-        // audit expected undici to hold that connection until GC; measured, it
-        // does not — the abandoned
-        // socket closed in under 10 ms with and without this call, because a
-        // half-read response cannot be returned to the pool anyway. Kept as
-        // explicit hygiene rather than as a fix for a leak that reproduces: it
-        // states the intent at the point of abandonment instead of depending on
-        // that undici behaviour continuing to hold.
+        // The redirect's own body is never read. Explicit hygiene: undici was
+        // measured closing the abandoned socket either way, but this states the
+        // intent instead of depending on that behaviour.
         discardBody(res);
         if (redirects === maxRedirects) throw new Error('Too many redirects');
 
         url = await assertSafeOutboundUrl(new URL(location, url).toString());
     }
-    throw new Error('Too many redirects');
 }
 
 // The upstream host is supplied by the user and reachable before any
@@ -1337,39 +1217,20 @@ async function safeFetch(inputUrl, options = {}, { maxRedirects = 3, onFinalUrl 
 // return tens of MB for get_vod_streams, so the cap is generous but finite.
 const MAX_UPSTREAM_BYTES = Math.max(1, Number(process.env.MAX_UPSTREAM_MB) || 64) * 1024 * 1024;
 
-// What a JSON body will cost once parsed, estimated from its bytes as they
-// arrive. The byte count alone is the wrong measure, because the parsed graph
-// depends on the body's *shape*, and a hostile shape inflates by more than twenty
-// times. Measured on Node 24 with 16 MB bodies, heap retained after GC:
-//
-//   realistic get_vod_streams     18 MB  (1.1x)      [{},{},…]    341 MB  (21x)
-//   realistic get_series_info     20 MB  (1.2x)      [[],[],…]    213 MB  (13x)
-//
-// Nearly all of that difference is per-value overhead, and the structural bytes
-// expose it: every object opens with `{`, every array with `[`, and every further
-// member or element is preceded by `,`. So those three bytes are weighed by what
-// the value behind them costs — an empty object 56 bytes, an array 32, a slot 8 —
-// plus half a byte per body byte for string payload. Across eleven shapes the
-// estimate lands within 0.78x-1.27x of measured heap for every realistic body,
-// and at or above it for every hostile one (1.02x for [{},{},…]). The one shape
-// it under-counts is a single long string, by half, which is harmless: that
-// string costs about the body itself, and the byte cap already bounds the body.
-// The three bytes are counted wherever they appear, inside strings too. A comma
-// in a plot adds eight bytes that are not really there, and over-counting is the
-// safe side to be wrong on — the alternative is a string-aware scanner running on
-// every byte of every list.
+// What a JSON body will cost once parsed, estimated from its bytes as they arrive.
+// Shape matters more than size: a 16 MB realistic list retained 18 MB of heap, a
+// 16 MB [{},{},…] body 341 MB. The structural bytes are weighed by what the value
+// behind them costs — `{` 56, `[` 32, `,` 8 — plus half a byte per body byte. Fitted
+// across eleven shapes: 0.78-1.27x of real heap for realistic bodies, at or above it
+// for hostile ones. Counted inside strings too; over-counting is the safe side.
 const PARSED_WEIGHT = new Uint8Array(256);
 PARSED_WEIGHT[0x7b] = 56; // {
 PARSED_WEIGHT[0x5b] = 32; // [
 PARSED_WEIGHT[0x2c] = 8;  // ,
 
-// How large a body may be *estimated* to parse to, relative to its own byte cap.
-// Every realistic body measured estimates at 1.0-1.3x its size, so it reaches the
-// byte cap long before this one. A hostile [{},{},…] body estimates at ~22x, so
-// it is refused after ~6 MB of a 64 MB allowance — mid-download, and before
-// JSON.parse has built any of it. That puts the graph a single response can
-// produce at about 128 MB at the defaults; the same body shape used to reach
-// ~1.4 GB (341 MB measured at 16 MB, scaled to MAX_UPSTREAM_MB).
+// How large a body may be *estimated* to parse to, relative to its byte cap. Real
+// bodies estimate at 1.0-1.3x and hit the byte cap first; a hostile one is refused
+// mid-download. Keep it above what real bodies estimate at.
 const MAX_PARSED_TO_BODY_RATIO = 2;
 
 // The estimate each parsed payload arrived with, so the caches can weigh it from
@@ -1393,16 +1254,9 @@ async function readJsonCapped(res, label, maxBytes = MAX_UPSTREAM_BYTES, { onChu
     let total = 0;
     let structural = 0;
     const maxParsedBytes = maxBytes * MAX_PARSED_TO_BODY_RATIO;
-    // The count costs a few milliseconds per megabyte, and it does not spread
-    // itself across the download. When a fast upstream has already buffered the
-    // body, read() resolves chunk after chunk as microtasks without ever returning
-    // to the event loop, so the whole count ran as one block and merged with the
-    // parse that follows it: on a 25 MB list the longest event-loop stall grew from
-    // 179 ms to 247 ms, on the thread that relays every video. Handing the loop
-    // back once per counted megabyte keeps each slice of that work to a few
-    // milliseconds, at the cost of one setImmediate hop per megabyte. Measured
-    // with it, the same list's longest stall is 128 ms, against 131 ms before the
-    // count existed; the count still adds ~80 ms of total time, just not in one go.
+    // Yield to the event loop once per megabyte. With a buffered body, read()
+    // resolves as microtasks, so without this the count ran as one block merged
+    // with the parse (a 25 MB list's longest stall: 247 ms without, 128 ms with).
     const YIELD_EVERY_BYTES = 1024 * 1024;
     let nextYieldAt = YIELD_EVERY_BYTES;
     for (;;) {
@@ -1424,23 +1278,18 @@ async function readJsonCapped(res, label, maxBytes = MAX_UPSTREAM_BYTES, { onChu
                 `after ${total} bytes; refusing it before parsing`
             );
         }
-        chunks.push(Buffer.from(value));
+        // Kept as the Uint8Array it arrived as: Buffer.concat accepts those, and
+        // Buffer.from(value) copied every chunk of the body a second time.
+        chunks.push(value);
         if (onChunk) onChunk();
         if (total >= nextYieldAt) {
             nextYieldAt = total + YIELD_EVERY_BYTES;
             await new Promise((resolve) => setImmediate(resolve));
         }
     }
-    // Written as four statements rather than one expression because each step
-    // allocates a full copy of the body and the references are what decide how
-    // many of them are alive at once. `Buffer.concat(chunks).toString()` handed
-    // straight to the parser keeps `chunks` reachable through the concat *and* the
-    // stringify, and the buffer through the parse, so three copies of the body are
-    // alive while the parser builds the object graph — measured on a 21 MB body,
-    // ~3× the body. Dropping each reference as soon as the next copy exists holds
-    // that to one: the string, alongside the graph (~1×). One copy plus the parsed
-    // graph is the floor for a non-incremental parser; this only stops paying for
-    // the copies already spent.
+    // Four statements, not one expression: each step copies the body, and dropping
+    // each reference as the next copy appears keeps one copy alive at parse time
+    // instead of three (measured ~3x -> ~1x on a 21 MB body).
     let buf = Buffer.concat(chunks);
     chunks.length = 0;
     const text = buf.toString('utf8');
@@ -1450,13 +1299,9 @@ async function readJsonCapped(res, label, maxBytes = MAX_UPSTREAM_BYTES, { onChu
     return data;
 }
 
-// Three deadlines for one upstream call, because they bound three different failures
-// (audit R5). A single 15 s timeout used to cover the whole download, so a 25 MB list
-// from a panel slower than ~1.7 MB/s could never finish, and every retry started over
-// from nothing. Headers get a short deadline. The body gets an idle deadline that
-// every chunk resets, so a slow download that keeps moving completes. And the whole
-// call gets an overall deadline, since without one a panel sending a byte just inside
-// the idle window could hold the request open for as long as it liked.
+// Three deadlines for one upstream call (audit R5): headers, an idle deadline every
+// chunk resets so a slow but moving download completes, and an overall one so a
+// trickle cannot hold the request open indefinitely.
 const UPSTREAM_HEADER_TIMEOUT_MS = Math.max(100, Number(process.env.UPSTREAM_HEADER_TIMEOUT_MS) || 15000);
 const UPSTREAM_IDLE_TIMEOUT_MS = Math.max(100, Number(process.env.UPSTREAM_IDLE_TIMEOUT_MS) || 15000);
 const UPSTREAM_BODY_TIMEOUT_MS = Math.max(100, Number(process.env.UPSTREAM_BODY_TIMEOUT_MS) || 5 * 60 * 1000);
@@ -1482,7 +1327,7 @@ async function xtremioGet(cfg, action, params = {}, { timeoutMs = UPSTREAM_HEADE
         resetIdle();
         const data = await readJsonCapped(res, `xtremio ${action}`, MAX_UPSTREAM_BYTES, { onChunk: resetIdle });
 
-        console.log(`[xtremioGet] ${action} (${Array.isArray(data) ? data.length : '?'} items)`);
+        if (LOG_REQUESTS) console.log(`[xtremioGet] ${action} (${Array.isArray(data) ? data.length : '?'} items)`);
 
         return data;
     } catch (e) {
@@ -1504,15 +1349,8 @@ function toIsoDate(s) {
     return isNaN(d.getTime()) ? undefined : d.toISOString();
 }
 
-// A provider's title is not reliably a string. Panels that encode with PHP's
-// JSON_NUMERIC_CHECK send titles like 1917 and 300 as JSON *numbers*, and one of
-// those threw out of filterByName ('s.name.toLowerCase is not a function') —
-// which the catalog route's catch turned into an empty result for every search
-// on that account, not just the one title. Titles also reach Stremio, where the
-// SDK expects a string.
-// Only strings and numbers count: a provider that put an object or an array
-// there has sent no title at all, and "[object Object]" on a shelf is worse than
-// the fallback every caller already has.
+// A provider's title is not reliably a string: PHP's JSON_NUMERIC_CHECK sends 1917
+// and 300 as numbers. Strings and finite numbers count; anything else is no title.
 function titleOf(value) {
     if (typeof value === 'string') return value;
     return typeof value === 'number' && Number.isFinite(value) ? String(value) : '';
@@ -1556,21 +1394,10 @@ function accountCacheKey(cfg) {
     return `${cfg.serverUrl}\n${cfg.username}\n${cfg.password}`;
 }
 
-// One memory budget shared by every data cache (CACHE_MAX_MB). Each cache is also
-// bounded on its own, but those bounds were set independently and only ever added
-// up in prose — and four of them counted entries alone, so the sum was not a bound
-// at all: a hundred per-category lists at 7 MB each is 700 MB inside
-// CACHE_MAX_CATEGORY_LISTS, and an instance serving a few large providers could
-// reach 1-1.5 GB inside every configured limit (audit R2). This is the number a
-// container is actually sized by.
-//
-// It is least-recently-used across all the caches, in one order. A read in any of
-// them moves that entry to the recent end, and when the total is over, the oldest
-// entry anywhere goes first — which can be a stream list evicted to admit a series
-// payload, because the series payload was used more recently. Entries are tracked
-// by the entry object rather than by key, so two caches that happen to share a key
-// string cannot collide here, and each remembers the weight it was added with, so
-// the total cannot drift if an entry is mutated in place.
+// One memory budget shared by every data cache (CACHE_MAX_MB, audit R2): the
+// per-cache bounds do not add up to any figure of memory. LRU across all caches in
+// one order. Entries are tracked by object identity, so caches sharing a key string
+// cannot collide, and by the weight they were added with, so the total cannot drift.
 class CacheBudget {
     constructor(maxBytes) {
         this.maxBytes = maxBytes;
@@ -1619,23 +1446,12 @@ class CacheBudget {
     }
 }
 
-// Every cache below was previously an unbounded Map whose TTL was only checked
-// on read, so nothing was ever deleted: memory grew with every distinct account
-// and every series ever opened, and never shrank when users went away.
-//
-// Extending Map keeps the whole existing surface (`get`/`set`/`size`/iteration)
-// working unchanged. Map iterates in insertion order, so re-inserting an entry
-// when it is read makes the *first* key the least recently used one — which is
-// the one to drop when the cache is full.
+// An LRU Map bounded by entry count, optionally by weight (`maxBytes`, from each
+// entry's `bytes`) and by age (`sweep`). Map iterates in insertion order, so
+// re-inserting on read makes the first key the least recently used. `onEvict`
+// reports what was dropped and why. `ledger` charges entries to a shared
+// CacheBudget; opt-in, so a test's map does not compete with the real caches.
 class BoundedMap extends Map {
-    // `maxBytes` weighs entries by their `bytes` field as well as counting them,
-    // because entry count is a poor proxy for memory when one entry is a parsed
-    // 25 MB catalog and another is a few KB of categories. `onEvict` reports
-    // what was dropped and why, which is how the stream caches notice they are
-    // thrashing rather than caching.
-    // `ledger`, when given, is the CacheBudget this map's entries are charged to as
-    // well; every production data cache passes CACHE_BUDGET. Opt-in, so a map made
-    // for a test is not quietly competing with the real caches for their budget.
     constructor({ maxEntries, maxAgeMs = null, maxBytes = null, onEvict = null, ledger = null }) {
         super();
         this.maxEntries = maxEntries;
@@ -1656,22 +1472,17 @@ class BoundedMap extends Map {
         return entry;
     }
 
-    // Read without disturbing LRU order. Nothing in the request path uses this —
-    // it exists so tests can assert what a cache holds without the assertion
-    // itself promoting the entry and changing what is evicted next. Kept
-    // deliberately rather than deleted: the alternative is tests that cannot
-    // observe eviction order without perturbing it.
+    // Read without disturbing LRU order. vetHlsOrigin uses it to check an entry
+    // is still the one it wrote, and tests use it to inspect a cache without
+    // changing what is evicted next.
     peek(key) {
         return super.get(key);
     }
 
     set(key, value) {
-        // An entry the shared budget could never hold is not stored at all. The
-        // rule below keeps a single entry over *this* map's budget rather than
-        // refetch it on every request, and that is right for a per-cache bound. On
-        // the shared one it would evict every other cache's entries — every other
-        // account's data — for an entry that still did not fit, and then keep it.
-        // What it would have replaced goes too: that was the caller's intent.
+        // An entry larger than the whole shared budget is not stored at all:
+        // keeping it would evict every other account's data and still not fit.
+        // What it would have replaced goes too.
         if (this.ledger && weightOf(value) > this.ledger.maxBytes) {
             this.delete(key);
             console.warn(
@@ -1755,24 +1566,18 @@ function weightOf(entry) {
     return typeof entry?.bytes === 'number' ? entry.bytes : 0;
 }
 
-// What a cached value costs in memory — the parsed graph, not its serialized text.
-// It used to be the serialized length, which is what let a hostile list through:
-// `{}` serializes to two bytes and occupies 56, so a [{},{},…] list was weighed at
-// a twentieth of its real size, fitted the stream budget, and was kept for half
-// an hour. The weights are readJsonCapped's; see PARSED_WEIGHT.
+// What a cached value costs in memory — estimated heap, not serialized size (`{}`
+// serializes to 2 bytes and occupies 56). The weights are readJsonCapped's.
 function estimateBytes(value) {
-    // A payload read from upstream was weighed from every byte of its body as it
-    // arrived, which no sample can match — and a sample can be steered, because
-    // its positions follow from the list's length alone.
+    // A payload read from upstream was weighed from every byte of its body, which
+    // no sample can match, and a sample's positions can be steered.
     if (value !== null && typeof value === 'object') {
         const measured = parsedSizeEstimates.get(value);
         if (measured !== undefined) return Math.round(measured);
     }
 
-    // Everything else is sampled rather than serialized whole: JSON.stringify over
-    // a 25 MB list allocates a second 25 MB string to learn what twenty items
-    // already say, and doubling peak memory to police memory would be
-    // self-defeating.
+    // Everything else is sampled: serializing a whole list would double peak
+    // memory to measure memory.
     if (!Array.isArray(value)) {
         try {
             return Math.round(weighJson(JSON.stringify(value)));
@@ -1794,10 +1599,8 @@ function estimateBytes(value) {
         counted++;
     }
     if (!counted) return 0;
-    // Plus the list's own slots, which no item's JSON includes — the separating
-    // commas the streamed estimate counts. Without them the two paths disagree by
-    // a sixth on exactly the list this exists to catch: [{},{},…], at 57 bytes an
-    // item sampled against 65 streamed.
+    // Plus the list's own slots (the commas the streamed estimate counts), so the
+    // two paths agree.
     return Math.round((sampled / counted) * value.length + PARSED_WEIGHT[0x2c] * value.length);
 }
 
@@ -1816,26 +1619,13 @@ function weighJson(text) {
 // account count, not bytes.
 const CACHE_MAX_ACCOUNTS = Math.max(1, Number(process.env.CACHE_MAX_ACCOUNTS) || 100);
 
-// How many accounts' full stream lists to hold, per kind. This used to be the bound
-// that capped memory, at 4 — and it was a churn cliff (audit R3): a fifth active
-// account evicted a list that fitted the budget comfortably, and refetching it meant
-// parsing tens of MB again on the thread that relays every video. Memory is bounded
-// in bytes now (CACHE_MAX_STREAM_BYTES per kind, CACHE_MAX_BYTES across every cache),
-// so this only has to stop many tiny entries accumulating, and the byte budgets
-// decide what is evicted. Parsing in a worker thread was measured as the other way
-// out and is worse: a 20.7 MB list blocked the main thread 81-94 ms in JSON.parse,
-// and 111-153 ms when parsed in a worker, because the parsed graph comes back by
-// structured clone and deserializing it runs on the main thread anyway.
+// How many accounts' full stream lists to hold, per kind. Memory is bounded in
+// bytes, so this only stops many tiny entries accumulating; a low count was a churn
+// cliff (audit R3). A worker-thread parse was measured and is worse: structured
+// clone deserializes on the main thread anyway.
 const CACHE_MAX_STREAM_ACCOUNTS = Math.max(1, Number(process.env.CACHE_MAX_STREAM_ACCOUNTS) || 64);
 
-// Counting entries is not the same as bounding memory: four accounts' worth of
-// entries could be four megabytes or four hundred, and only the second one
-// matters. This is a budget *per kind*, so the ceiling across live, movies and
-// series is three times it, and it is measured in estimated heap — what an entry
-// occupies once parsed (see estimateBytes). It was measured in serialized JSON,
-// with resident cost said to run 3-10× that. Measured, a realistic list occupies
-// 1.1-1.4× its text and a hostile one 21×: no single multiplier describes both,
-// which is why the unit changed rather than the multiplier.
+// Stream list budget *per kind*, in estimated heap (see estimateBytes).
 const CACHE_MAX_STREAM_BYTES = Math.max(1, Number(process.env.CACHE_MAX_STREAM_MB) || 64) * 1024 * 1024;
 
 // One entry per series *per account* — the only dimension that grows without
@@ -1846,16 +1636,11 @@ const CACHE_MAX_SERIES_INFO = Math.max(1, Number(process.env.CACHE_MAX_SERIES_IN
 // kilobytes, not megabytes — so this bound is about entry count, not size.
 const CACHE_MAX_VOD_INFO = Math.max(1, Number(process.env.CACHE_MAX_VOD_INFO) || 500);
 
-// Per-category stream lists: one entry per category per account, and the count
-// grows with every genre a user opens. Each is a slice of the full list — usually
-// small, but a 20k-title category is ~7 MB, and a hundred of those is what
-// CACHE_MAX_MB below exists to stop.
+// Per-category stream lists: one entry per category per account.
 const CACHE_MAX_CATEGORY_LISTS = Math.max(1, Number(process.env.CACHE_MAX_CATEGORY_LISTS) || 100);
 
-// The shared ceiling across every data cache; see CacheBudget. 256 MB is about what
-// the per-cache bounds were meant to add up to — three 64 MB stream budgets, plus
-// room for the small caches — so a deployment that sat inside them before rarely
-// meets this one, and one that did not is now held to it.
+// The shared ceiling across every data cache; see CacheBudget. 256 MB is three
+// 64 MB stream budgets plus room for the small caches.
 const CACHE_MAX_BYTES = Math.max(1, Number(process.env.CACHE_MAX_MB) || 256) * 1024 * 1024;
 const CACHE_BUDGET = new CacheBudget(CACHE_MAX_BYTES);
 
@@ -1943,11 +1728,8 @@ function createStreamListCache() {
         maxAgeMs: CACHE_TTL,
         maxBytes: CACHE_MAX_STREAM_BYTES,
         ledger: CACHE_BUDGET,
-        // Evicting an entry that has not expired means the bounds are too tight
-        // for the load: that account's next request refetches 10-50 MB, and
-        // nothing else would say so. An expired entry leaving is routine and
-        // silent. The advice names the bound that actually did it — raising the
-        // per-kind budget does nothing when the shared one is the tight one.
+        // Evicting an unexpired list means the bounds are too tight for the load;
+        // the advice names the bound that did it.
         onEvict(key, entry, reason) {
             if (entry && entry.ts > Date.now() - CACHE_TTL) {
                 const knob = reason === 'global budget'
@@ -1972,11 +1754,8 @@ function createStreamListCache() {
             return null;
         },
         set(cfg, items) {
-            // An empty list is a legitimate answer, but a real provider also returns
-            // one transiently. Held for the full TTL it left search empty for half an
-            // hour after one bad answer; held for CACHE_FAILURE_TTL it is still a hit
-            // for the burst of requests that arrive together, and is asked again a
-            // minute later.
+            // An empty list is also something real providers return transiently, so
+            // it is held for CACHE_FAILURE_TTL rather than the full TTL.
             map.set(accountCacheKey(cfg), {
                 data: items,
                 ts: Date.now(),
@@ -1999,12 +1778,9 @@ function createStreamListCache() {
                     this.set(cfg, items);
                     return items;
                 } catch (e) {
-                    // A list we already have beats no list at all — the caller's
-                    // only other answer is an empty shelf. `ts` is deliberately
-                    // *not* re-stamped: the entry keeps its true age, so the
-                    // ordinary age sweep still reclaims it and stale data is
-                    // served for minutes rather than indefinitely. Only the ttl
-                    // moves, which is what schedules the retry.
+                    // A stale list beats an empty shelf. `ts` is not re-stamped, so
+                    // the age sweep still reclaims it; only the ttl moves, which
+                    // schedules the retry.
                     const stale = map.get(key);
                     if (!stale || !Array.isArray(stale.data) || !stale.data.length) throw e;
                     stale.ttl = (Date.now() - stale.ts) + CACHE_FAILURE_TTL;
@@ -2019,15 +1795,10 @@ function createStreamListCache() {
     };
 }
 
-// Cache-aside read with single-flight over a BoundedMap of `{ data, ts }`.
-// The full-list caches above and the series-info cache below each predate this
-// and carry behaviour of their own — per-entry TTLs, negative caching, a stale
-// fallback — so they keep their bespoke forms. This is the plain case, and both
-// caches added for the per-item and per-category paths are exactly it.
-// `ttlFor(data)` shortens one entry's lifetime. It is capped at `ttl`, which is
-// also the age the sweeper reclaims entries at.
-// `ledger` weighs each entry and charges it to that CacheBudget; the production
-// caches pass CACHE_BUDGET. Without one, entries carry no weight, as before.
+// Cache-aside read with single-flight over a BoundedMap of `{ data, ts }` — the
+// plain case; the older caches keep bespoke forms for their extra behaviour.
+// `ttlFor(data)` shortens one entry's lifetime, capped at `ttl`. `ledger` weighs
+// each entry and charges it to that CacheBudget.
 function createKeyedCache({ maxEntries, ttl = CACHE_TTL, ttlFor = null, ledger = null }) {
     const map = new BoundedMap({ maxEntries, maxAgeMs: ttl, ledger });
     const singleFlight = createSingleFlight();
@@ -2067,40 +1838,36 @@ const liveStreamsCache = createStreamListCache();
 const vodStreamsCache = createStreamListCache();
 const seriesStreamsCache = createStreamListCache();
 
-// Sorted catalog views, memoised so that paginating a shelf does not re-sort the
-// whole list for every page. `[...items].sort(comparator)` copied and sorted up
-// to 50,000 records to keep 100 of them, on every request, and Stremio fires
-// several catalog requests in parallel on install — 50-100 ms of blocking work
-// on the single thread that is also relaying video.
-//
-// Validity is decided by *identity*, not by a second TTL: an entry is reused
-// only when the array it was derived from is still the very array the list cache
-// hands back. Cached lists keep their identity until they are refetched, so a
-// refetch invalidates the sorted view in the same instant, with no window in
-// which the two could disagree. A TTL of its own could only be wrong in one
-// direction or the other.
-//
-// That identity is also what the views are keyed by — a WeakMap from the source
-// array — so a view lives exactly as long as the list it was sorted from. This
-// was a BoundedMap of its own, and an entry holding `source` kept a list
-// reachable after the stream cache had evicted it to stay within its budget:
-// with CACHE_MAX_STREAM_ACCOUNTS=1, six accounts opening one shelf each held
-// ~94 MB the stream cache had already let go of. It needs no count, TTL or sweep
-// of its own, because the list caches already bound the lists, and a view adds
-// one machine word per item it holds. Each source maps to `{ day, views }`; see
-// sortedCatalogItems.
+// Sorted catalog views, so paginating a shelf does not re-sort the whole list per
+// page. A WeakMap keyed by the cached array a view was sorted from: a refetch
+// invalidates it at once, and an evicted list takes its views with it. Nothing in a
+// view may hold a strong reference back to its list. Each source maps to
+// `{ day, views }`; see sortedCatalogItems.
 const sortedCatalogViews = new WeakMap();
 
-// Signing-time vetting of the origins named in an HLS playlist. This was memoised
-// per rewrite pass, which helped within one playlist and not at all across them —
-// and a live playlist is re-fetched every few seconds, so the same CDN host was
-// re-resolved for the life of the channel. Only OS-level DNS caching hid it.
-//
-// The TTL is the DNS pin's on purpose: a decision about a hostname must not
-// outlive the window in which that hostname's addresses are treated as fixed.
-// Caching this is safe because it is *not* the check that guards the fetch —
-// safeFetch re-runs assertSafeOutboundUrl, and re-pins, on every segment request.
-// This one only decides whether a URI is worth signing.
+// stream_id -> item for a cached live list, so opening a channel is a lookup
+// rather than a scan. Keyed by the list's identity, like sortedCatalogViews, so a
+// refetch invalidates it and an evicted list takes its index with it.
+const liveStreamIndexes = new WeakMap();
+
+function findLiveStream(list, streamId) {
+    let index = liveStreamIndexes.get(list);
+    if (!index) {
+        index = new Map();
+        for (const item of list) {
+            const id = String(item?.stream_id);
+            if (!index.has(id)) index.set(id, item);
+        }
+        liveStreamIndexes.set(list, index);
+    }
+    return index.get(String(streamId)) || null;
+}
+
+// Signing-time vetting of the origins named in HLS playlists, shared across
+// rewrites since a live playlist is re-fetched every few seconds. Keyed by origin,
+// not account. The TTL is the DNS pin's, so a decision about a hostname cannot
+// outlive its pinned addresses; caching is safe because safeFetch re-checks on
+// every segment request.
 const HLS_ORIGIN_VET_TTL_MS = DNS_PIN_TTL_MS;
 const HLS_ORIGIN_VET_MAX = 512;
 const hlsOriginVetCache = new BoundedMap({
@@ -2115,11 +1882,9 @@ function vetHlsOrigin(absolute, origin) {
     const cached = hlsOriginVetCache.get(origin);
     if (cached && cached.ts > Date.now() - HLS_ORIGIN_VET_TTL_MS) return cached.ok;
     const ok = assertSafeOutboundUrl(absolute).then(() => true, (e) => {
-        // Only a policy refusal is a verdict worth keeping. A resolver blip is
-        // not: remembered as "refused" it made every rewrite naming this origin
-        // fail for the rest of the window, and a refused origin now costs the
-        // whole playlist rather than leaking the provider's own URL.
-        // Checked by identity so a newer entry set after this one is left alone.
+        // Only a policy refusal is kept; a failed lookup is dropped so a resolver
+        // blip does not refuse the channel for the whole window. Checked by
+        // identity so a newer entry is left alone.
         if (e?.code !== 'OUTBOUND_BLOCKED' && hlsOriginVetCache.peek(origin)?.ok === ok) {
             hlsOriginVetCache.delete(origin);
         }
@@ -2145,18 +1910,9 @@ function getAllLiveStreams(cfg) {
 // a pair separator's right-hand side, which is what makes the split below safe.
 const EXTRA_KEYS = ['skip', 'genre', 'search'];
 
-// A pair boundary is a separator followed by one of those keys and its '='. A
-// '&' anywhere else belongs to a value and is kept: category names like
-// "SLOVAKIA & Czechia" and "Kids & Family" are common, and splitting on every
-// '&' cut them in half, so the manifest advertised a genre whose shelf could
-// never open. Anchoring on a declared key is what makes that decidable — the
-// previous code could not tell a separator from a value byte, because Express
-// percent-decodes a route param before any handler sees it, turning %26 into the
-// very character the parser split on.
-//
-// Both the separator and the '=' are matched raw or escaped, because how much of
-// the segment is escaped is the client's choice: some send `genre=A%20%26%20B`,
-// others escape the whole pair as `genre%3DA%2520%2526%2520B`.
+// A pair boundary is a separator followed by one of those keys and its '='; a '&'
+// anywhere else belongs to a value ("Kids & Family"). Separator and '=' are matched
+// raw or escaped, since clients escape different amounts of the segment.
 const EXTRA_KEY_ALT = EXTRA_KEYS.join('|');
 const EXTRA_PAIR_SPLIT = new RegExp(`(?:&|%26)(?=(?:${EXTRA_KEY_ALT})(?:=|%3D))`, 'i');
 const EXTRA_KEY_HEAD = new RegExp(`^(${EXTRA_KEY_ALT})(?:=|%3D)`, 'i');
@@ -2204,19 +1960,10 @@ function rawExtraSegment(req) {
 
 const PAGE_SIZE = 100;
 
-// `cacheMaxAge` and `staleRevalidate` are body fields, and in
-// stremio-addon-sdk's serveHTTP they are what the SDK *converts into* a
-// Cache-Control header. This addon is hand-rolled, so it emitted the fields and
-// no header at all: nothing downstream had anything to act on, and the 86400 on
-// movie meta was inert. This sets the header the fields were always describing,
-// and keeps the fields — they are harmless, documentary, and read directly by
-// some clients.
-//
-// `private` rather than `public` because every one of these responses is
-// account-specific and the path carries a bearer token. A shared cache keys on
-// the whole URL, so `public` would not leak between accounts, but it would put
-// credentialed content in intermediaries the operator does not control — and the
-// caching that actually matters here is the client's.
+// Sets the Cache-Control header that stremio-addon-sdk derives from the
+// `cacheMaxAge`/`staleRevalidate` body fields, and returns the fields too.
+// `private` because every response is account-specific and the path is a bearer
+// token.
 function withCacheHints(res, cacheMaxAge, staleRevalidate) {
     const directives = ['private', `max-age=${cacheMaxAge}`];
     if (staleRevalidate) directives.push(`stale-while-revalidate=${staleRevalidate}`);
@@ -2224,15 +1971,8 @@ function withCacheHints(res, cacheMaxAge, staleRevalidate) {
     return staleRevalidate === undefined ? { cacheMaxAge } : { cacheMaxAge, staleRevalidate };
 }
 
-// A payload that is not an array is a provider failure, not an empty catalog:
-// an overloaded Xtream panel answers `get_vod_streams` with an error object or a
-// bare `{}`. Coercing that to [] made it indistinguishable from a genuinely
-// empty account, and the empty list was then cached *positively* for the full 30
-// minutes — every movie shelf and every movie search blank until it expired, off
-// one blip, with no retry. Throwing keeps it out of the cache, because rejections
-// are not cached, so the next request tries again. Same lesson as
-// `isUsableSeriesInfo`: accepting less than the caller needs turns a flaky call
-// into a sticky one.
+// A payload that is not an array is a provider failure, not an empty catalog.
+// Throwing keeps it out of the cache, since rejections are not cached.
 async function getStreams(cfg, action, params = {}) {
     const data = await xtremioGet(cfg, action, params);
     if (!Array.isArray(data)) {
@@ -2248,13 +1988,9 @@ async function getStreams(cfg, action, params = {}) {
     return data;
 }
 
-// The per-category fetch is what `selectCatalogGenre` falls back to when the
-// full list is cold — which is precisely when Stremio's parallel catalog
-// requests arrive, and it was neither cached nor single-flighted. Paginating a
-// genre re-pulled the whole category from upstream on every page, and four
-// sequential loads of one genre cost four upstream calls.
-// An empty category is asked again within a minute: a real provider has answered
-// a category that served 500 items with an empty list on a later load.
+// The per-category fetch selectCatalogSource falls back to when the full list is
+// cold, cached and single-flighted. An empty category is asked again within a
+// minute, since real providers return those transiently.
 const categoryStreamsCache = createKeyedCache({
     maxEntries: CACHE_MAX_CATEGORY_LISTS,
     ledger: CACHE_BUDGET,
@@ -2278,34 +2014,18 @@ function parseYear(s) {
     return m ? parseInt(m[0]) : undefined;
 }
 
-// "Usable" has to mean the same thing here as it does at the point of use, or
-// the two disagree and the disagreement is cached. A payload carrying only
-// `info.cover` (or a plot, or a genre) counted as usable, was cached
-// *positively* for the full 30 minutes, and then failed the meta route's own
-// `hasContent` check — which requires a name or episodes — so the series
-// rendered as `meta: null` for half an hour with no retry. Accepting less than
-// the caller needs is worse than a retry: it turns a flaky call into a
-// sticky one.
-// This is the predicate for *answering* with a payload, and it still mirrors
-// `hasContent` exactly. What may be cached for half an hour is the stricter
-// `hasSeriesEpisodes` below.
+// Whether a payload is worth *answering* with: a name or episodes. It must mirror
+// the meta route's `hasContent` exactly, or the disagreement gets cached. What may
+// be cached for the full TTL is the stricter hasSeriesEpisodes.
 function isUsableSeriesInfo(info) {
     if (!info || typeof info !== 'object') return false;
     const hasName = info.info && typeof info.info === 'object' && info.info.name;
     return Boolean(hasName || hasSeriesEpisodes(info));
 }
 
-// What a payload needs before it is worth keeping for the full 30 minutes, and
-// it is a stricter test than the one above: episodes. A series with a name and
-// nothing to play is a page the user opens and leaves, and `get_series_info` is
-// flaky enough that an episodes-less answer is far more likely a bad call than a
-// real series with no episodes in it. Such a payload is still *returned* — the
-// meta route renders the name rather than nothing — but it is remembered under
-// SERIES_INFO_NEGATIVE_TTL, so the next request after a few minutes asks again
-// instead of being pinned to it for half an hour.
-// A season whose list is empty does not count. `{ episodes: { 1: [] } }` passed
-// the old key-count check while the meta route, which iterates only arrays,
-// built no videos from it at all — the same disagreement one level down.
+// Whether a payload may be cached for the full TTL: at least one non-empty season.
+// get_series_info is flaky enough that an episodes-less answer is likelier a bad
+// call, so one is still returned but kept only for SERIES_INFO_NEGATIVE_TTL.
 function hasSeriesEpisodes(info) {
     if (!info || typeof info !== 'object') return false;
     const eps = info.episodes;
@@ -2316,15 +2036,9 @@ function hasSeriesEpisodes(info) {
 const SERIES_INFO_MAX_ATTEMPTS = 3;
 const SERIES_INFO_BACKOFF_MS = 500;
 
-// A series that never returns usable data costs 3 sequential upstream calls
-// plus 1.5 s of backoff — and, uncached, pays that on *every* request. Single
-// flight collapses concurrent callers but does nothing for sequential ones, so
-// remember the failure briefly.
-//
-// Longer than CACHE_FAILURE_TTL (the category equivalent) because that case is
-// three parallel calls with no backoff, while this one is sequential and sleeps;
-// far shorter than the 30-minute positive TTL so a provider-side fix is picked
-// up soon rather than being pinned for half an hour.
+// A series that never returns usable data costs 3 upstream calls plus backoff per
+// request, so the failure is remembered briefly — longer than CACHE_FAILURE_TTL,
+// far shorter than the positive TTL.
 const SERIES_INFO_NEGATIVE_TTL = Math.max(1000, Number(process.env.SERIES_INFO_NEGATIVE_TTL_MS) || 5 * 60 * 1000);
 
 const seriesInfoCache = new BoundedMap({
@@ -2360,7 +2074,7 @@ function startCacheSweeper() {
 }
 
 function seriesInfoCacheKey(cfg, seriesId) {
-    return `${cfg.serverUrl}\n${cfg.username}\n${cfg.password}\n${seriesId}`;
+    return `${accountCacheKey(cfg)}\n${seriesId}`;
 }
 
 // Entries carry their own ttl (as catCache's do) because a remembered failure
@@ -2419,7 +2133,7 @@ async function fetchSeriesInfo(cfg, seriesId) {
     const cached = readSeriesInfoEntry(cfg, seriesId);
     if (cached) {
         if (!cached.negative) return cached.data;
-        console.log(`[getSeriesInfo] series ${seriesId} failed recently; skipping ${SERIES_INFO_MAX_ATTEMPTS} retries`);
+        if (LOG_REQUESTS) console.log(`[getSeriesInfo] series ${seriesId} failed recently; skipping ${SERIES_INFO_MAX_ATTEMPTS} retries`);
         if (cached.data !== null) return cached.data;
         throw new Error(cached.error);
     }
@@ -2456,22 +2170,16 @@ async function fetchSeriesInfo(cfg, seriesId) {
     throw failure;
 }
 
-// Movies get the same treatment as series, minus the retries and the negative
-// cache — `get_vod_info` is not flaky the way `get_series_info` is. Opening one
-// movie called it twice, once from the meta route and once from the stream
-// route, and re-opening the same movie paid both again: nothing cached it.
+// Movie details, needed by both the meta and stream routes. No retries or negative
+// cache: get_vod_info is not flaky the way get_series_info is.
 const vodInfoCache = createKeyedCache({ maxEntries: CACHE_MAX_VOD_INFO, ledger: CACHE_BUDGET });
 
 function vodInfoCacheKey(cfg, vodId) {
     return `${accountCacheKey(cfg)}\n${vodId}`;
 }
 
-// The rule isUsableSeriesInfo states for series, for the same reason: the meta
-// route needs a name and the stream route a container. A payload with neither
-// was cached for 30 minutes and rendered as a movie called "Unknown" with a
-// playable-looking mp4 stream — measured against a real account with a movie id
-// that does not exist. Some panels put the fields at the root, which is why the
-// meta route reads `info?.info ?? info` and why this does too.
+// A name or movie data, or the payload is not cached (a nonexistent id otherwise
+// became a movie called "Unknown"). Some panels put the fields at the root.
 function isUsableVodInfo(payload) {
     const isObject = v => Boolean(v) && typeof v === 'object' && !Array.isArray(v);
     if (!isObject(payload)) return false;
@@ -2496,29 +2204,20 @@ function schemeOf(url) {
     return String(url || '').startsWith('https:') ? 'https' : 'http';
 }
 
-// A downgrade can arrive by two routes, and both end up baked into the config
-// token permanently: the https attempt failing and the http retry succeeding,
-// or the provider's own server_info naming http. Neither used to be visible to
-// the user, so credentials could travel in cleartext forever because https
-// hiccuped once during setup.
+// An https -> http move is baked into the token, so it is reported to the user.
 function describeDowngrade(requested, finalUrl, source) {
     if (schemeOf(requested) !== 'https' || schemeOf(finalUrl) !== 'http') return null;
     return { from: 'https', to: 'http', source };
 }
 
-// The URL a provider names for itself in `server_info`, or null when those fields
-// do not make one. They are provider-controlled and used to be concatenated
-// unchecked: a `url` that already carried its port gave `http://host:8080:8080`,
-// which does not parse, and one with a trailing slash gave `http://host/:8080`,
-// which parses but has lost its port. Both reported "Connected!" and minted an
-// install link whose every catalog was empty. Only a bare http(s) origin is
-// accepted; the caller keeps the URL that just worked otherwise.
+// The URL a provider names for itself in `server_info`, or null unless the fields
+// form a bare http(s) origin; they have arrived with the port already in `url`, or
+// a trailing slash.
 function serverInfoOrigin(si) {
     if (!si || !si.url) return null;
     const proto = si.server_protocol || 'http';
-    // An https server_info names its port in https_port. Borrowing `port` when that
-    // is empty gave https://host:80 — TLS spoken to the http port, which never
-    // connects (audit S8). With no https_port, https means its default port.
+    // https takes its port from https_port alone; borrowing `port` gave
+    // https://host:80 (audit S8).
     const port = proto === 'https' ? si.https_port : si.port;
     let parsed;
     try {
@@ -2550,18 +2249,12 @@ async function credentialsWorkAt(origin, username, password) {
 
 async function validateXtremioCredentials(serverUrl, username, password) {
     const base = normalizeUrl(serverUrl);
-    // Someone who typed https:// asked for https and is never moved off it
-    // automatically (audit S7). Any failure of the https attempt — a TLS reset, a
-    // non-JSON 5xx page, a reset on port 443 from someone on the path — used to
-    // trigger an http retry that sent the password in cleartext before the page could
-    // warn anyone. Without a scheme, or with http://, the fallback only ever tries
-    // https, which costs nothing.
+    // Someone who typed https:// is never moved onto http (audit S7). Otherwise the
+    // only fallback tried is https.
     const askedForHttps = schemeOf(base) === 'https';
     const urls = askedForHttps ? [base] : [base, base.replace(/^http:/, 'https:')];
-    // Whether any attempt got an HTTP response at all. A server that answers with
-    // an HTML page, a login screen or a 404 is reachable — the URL is wrong, not the
-    // network — and "Cannot reach that server" sent people chasing the wrong fault.
-    // Saying so discloses nothing the JSON-but-not-a-panel answer did not already.
+    // Whether any attempt got an HTTP response at all: a server that answered is
+    // reachable, and the error should say the URL is wrong, not the network.
     let anyAnswered = false;
 
     for (const url of urls) {
@@ -2593,10 +2286,8 @@ async function validateXtremioCredentials(serverUrl, username, password) {
             if (si && si.url && !named) {
                 console.warn('[configure] provider server_info does not form a usable URL; keeping the one that connected');
             }
-            // A listed panel does not get to move the install URL to a host that is
-            // not listed. server_info is provider data, and adopting an unlisted
-            // origin would bake it into the token — which decodeConfig then refuses,
-            // leaving a "Connected!" page whose install link never works.
+            // server_info cannot move the install URL to an unlisted host, which
+            // decodeConfig would then refuse.
             if (named && !panelHostAllowed(named)) {
                 console.warn(
                     `[configure] provider server_info names ${JSON.stringify(hostnameOf(named))}, ` +
@@ -2604,9 +2295,7 @@ async function validateXtremioCredentials(serverUrl, username, password) {
                 );
                 named = null;
             }
-            // Nor does the panel's own configuration move someone who asked for https
-            // onto http. server_info routinely names http, and following it baked
-            // cleartext into the install URL for a user who had typed https.
+            // Nor onto http for someone who asked for https.
             if (named && askedForHttps && schemeOf(named) === 'http') {
                 console.warn(
                     `[configure] provider server_info names http for ${JSON.stringify(hostnameOf(named))}; ` +
@@ -2614,13 +2303,9 @@ async function validateXtremioCredentials(serverUrl, username, password) {
                 );
                 named = null;
             }
-            // And whatever origin survives is adopted only once these credentials have
-            // worked there too (audit S8). It used to replace the URL that connected
-            // untested, so a panel reporting its internal address — a common
-            // misconfiguration — got "Connected!" and an install link whose every
-            // catalog was empty, because the SSRF guard refused every request to it.
-            // Checked last, so a host already refused above is never contacted, and
-            // skipped for the origin that just answered, which proves nothing new.
+            // And a surviving origin is adopted only once the credentials work there
+            // (audit S8). Checked last, so a refused host is never contacted, and
+            // skipped for the origin that just answered.
             if (named && new URL(named).origin !== new URL(url).origin
                 && !await credentialsWorkAt(named, username, password)) {
                 console.warn(
@@ -2645,12 +2330,8 @@ async function validateXtremioCredentials(serverUrl, username, password) {
                 downgrade
             };
         } catch (e) {
-            // Distinguishing ECONNREFUSED / ENOTFOUND / timeout back to an
-            // unauthenticated caller turns this page into a port scanner: the
-            // reply says whether an arbitrary host:port is closed, nonexistent,
-            // or filtered. The operator still gets the detail in the log — for
-            // every attempt, since the http failure was the one that explained a
-            // failed check and it used to be skipped silently.
+            // The caller gets no detail about why (that would make this page a port
+            // scanner); the operator gets it in the log for every attempt.
             const reason = e.name === 'AbortError' ? 'timeout' : e.cause?.code || e.message;
             const retrying = url === urls[0] && urls.length > 1;
             console.warn(
@@ -2669,7 +2350,6 @@ async function validateXtremioCredentials(serverUrl, username, password) {
             clearTimeout(timer);
         }
     }
-    return { valid: false, error: 'Cannot connect to server' };
 }
 
 // `nonce` comes from setPrivateHeaders and is the only thing that lets this
@@ -2888,26 +2568,12 @@ function renderConfigPage({ serverUrl = '', username = '', password = '', status
     </body></html>`;
 }
 
-// The configure page echoes back a submitted password and embeds the install token.
-// Keep it out of shared caches, browser history, and outbound Referer headers.
-//
-// The framing and CSP headers are the backstop behind the escapeHtml discipline
-// in renderConfigPage, not a replacement for it. Framing is the one with a live
-// attack behind it: this is the only page with a submit button that sends
-// plaintext credentials, so a framed copy of it is a clickjacking target, and
-// both frame-ancestors and X-Frame-Options are sent because the latter is all
-// an older client understands.
-//
-// The policy can be nearly `default-src 'none'` because the page loads nothing
-// external — no fonts, no stylesheets, no scripts, and its icons are inline
-// <svg> rather than images.
-// Scripts run only under a per-response nonce, which is what forced the copy
-// handler out of an onclick attribute and into a real script block: an inline
-// handler would need script-src 'unsafe-inline', which would give back exactly
-// the injected-script execution the policy exists to deny. style-src keeps
-// 'unsafe-inline' because the page's <style> block and its remaining style="…"
-// attributes both need it, and a style nonce does not cover attributes.
-// Returns the nonce, which the caller must pass to renderConfigPage.
+// The configure page echoes a submitted password and embeds the install token, so
+// it is kept out of caches and Referer headers, and cannot be framed (it is a
+// clickjacking target). The CSP is a backstop behind escapeHtml: nothing external
+// loads, scripts run only under a per-response nonce (so no inline on* handlers),
+// and style-src keeps 'unsafe-inline' for the style="…" attributes. Returns the
+// nonce, which the caller must pass to renderConfigPage.
 function setPrivateHeaders(res) {
     res.setHeader('Cache-Control', 'no-store');
     res.setHeader('Referrer-Policy', 'no-referrer');
@@ -2935,10 +2601,8 @@ function setPrivateHeaders(res) {
 // configuring an addon needs.
 const CONFIGURE_RATE_LIMIT = Math.max(1, Number(process.env.CONFIGURE_RATE_LIMIT) || 10);
 const CONFIGURE_RATE_WINDOW_MS = Math.max(1000, Number(process.env.CONFIGURE_RATE_WINDOW_MS) || 60 * 1000);
-// Bound the map so the limiter cannot itself become a memory-exhaustion vector.
-// Once full, the oldest bucket makes room for the new one. It used to let every
-// new client through instead, which meant that 10,000 addresses in one window —
-// cheap in IPv6 before /64 bucketing — switched the limiter off for everyone.
+// Bounded; once full, the oldest bucket makes room rather than letting new clients
+// through untracked.
 const CONFIGURE_RATE_MAX_CLIENTS = 10000;
 const configureAttempts = new Map();
 
@@ -2973,15 +2637,23 @@ function addressBucket(address) {
 }
 
 // Fixed window: on the first hit of a window the count resets. Sweeping expired
-// entries on each call keeps the map proportional to *active* clients.
+// entries on each call keeps the map proportional to *active* clients. A bucket is
+// only ever inserted at the start of its window, and the window is fixed, so
+// insertion order is expiry order and the sweep stops at the first live bucket;
+// one that expired out of order is replaced when its client next arrives.
 function rateLimitConfigure(req) {
     const now = Date.now();
     for (const [key, entry] of configureAttempts) {
-        if (entry.resetAt <= now) configureAttempts.delete(key);
+        if (entry.resetAt > now) break;
+        configureAttempts.delete(key);
     }
 
     const key = clientKey(req);
-    const entry = configureAttempts.get(key);
+    let entry = configureAttempts.get(key);
+    if (entry && entry.resetAt <= now) {
+        configureAttempts.delete(key);
+        entry = undefined;
+    }
     if (!entry) {
         while (configureAttempts.size >= CONFIGURE_RATE_MAX_CLIENTS) {
             configureAttempts.delete(configureAttempts.keys().next().value);
@@ -2997,17 +2669,9 @@ function rateLimitConfigure(req) {
     return { allowed: true, retryAfter: 0 };
 }
 
-// Prefill comes from an encrypted `config` token and nothing else. The route
-// used to accept serverUrl, username and password as loose query parameters
-// too. They were escaped, so it was never XSS — but it invited a URL with a
-// plaintext password into browser history, referrer chains, proxy logs and
-// anything that shoulder-surfs an address bar.
-//
-// Even from a token, only the server URL and username are prefilled. The token
-// is the install URL Stremio stores and syncs, and rendering its password into
-// the form made this page decrypt it for whoever held one — handing out a
-// password that works against the provider directly, bypasses this server and
-// survives a CONFIG_SECRET rotation. Reconfiguring costs retyping one field.
+// Prefill comes from an encrypted `config` token only, and never includes the
+// password: the token is the install URL Stremio syncs, and decrypting its password
+// into the page would hand whoever holds that URL a working provider credential.
 function sendConfigurePage(req, res, token) {
     const nonce = setPrivateHeaders(res);
     const existing = decodeConfig(token) || {};
@@ -3030,35 +2694,30 @@ app.get('/:config/configure', (req, res) => sendConfigurePage(req, res, req.para
 
 app.post('/configure', async (req, res) => {
     const nonce = setPrivateHeaders(res);
-    // req.body is undefined when nothing parsed the body (no Content-Type, or a
-    // JSON one), and extended urlencoded turns `serverUrl[]=a&serverUrl[]=b` or
-    // `serverUrl[a]=1` into an array or an object. Either way the fields are not
-    // guaranteed to be strings, and this runs before the try below, so calling
-    // .trim() on one was an unauthenticated 500.
+    // req.body may be undefined, and its fields are not guaranteed to be strings.
     const body = req.body || {};
     const rawServerUrl = asString(body.serverUrl).trim().replace(/\/+$/, '');
     const username = asString(body.username);
     const password = asString(body.password);
+    const render = (status, serverUrl = rawServerUrl) => res.send(renderConfigPage({
+        serverUrl,
+        username,
+        password,
+        status,
+        baseUrl: getBaseUrl(req),
+        nonce
+    }));
+    const fail = (error) => render({ valid: false, error });
 
     const limit = rateLimitConfigure(req);
     if (!limit.allowed) {
         res.status(429);
         res.setHeader('Retry-After', String(limit.retryAfter));
-        return res.send(renderConfigPage({
-            serverUrl: rawServerUrl,
-            username,
-            password,
-            status: { valid: false, error: `Too many attempts. Try again in ${limit.retryAfter} second${limit.retryAfter === 1 ? '' : 's'}.` },
-            baseUrl: getBaseUrl(req),
-            nonce
-        }));
+        return fail(`Too many attempts. Try again in ${limit.retryAfter} second${limit.retryAfter === 1 ? '' : 's'}.`);
     }
 
-    // An empty serverUrl made normalizeUrl throw, which the catch below reported
-    // as the generic "Something went wrong" — true, but silent about which field
-    // is at fault. The browser's `required` attributes normally prevent this, so
-    // it is only reachable by a direct POST, but the field still deserves an
-    // answer it can act on.
+    // Normally prevented by `required`, but a direct POST still gets told which
+    // field is missing.
     const missing = [
         !rawServerUrl && 'server URL',
         !username && 'username',
@@ -3068,14 +2727,7 @@ app.post('/configure', async (req, res) => {
         const named = missing.length === 1
             ? missing[0]
             : `${missing.slice(0, -1).join(', ')} and ${missing[missing.length - 1]}`;
-        return res.send(renderConfigPage({
-            serverUrl: rawServerUrl,
-            username,
-            password,
-            status: { valid: false, error: `Please enter your ${named}.` },
-            baseUrl: getBaseUrl(req),
-            nonce
-        }));
+        return fail(`Please enter your ${named}.`);
     }
 
     // Before any request is made to the host: the credential check is itself an
@@ -3086,50 +2738,22 @@ app.post('/configure', async (req, res) => {
             `[configure] refused ${JSON.stringify(hostnameOf(rawServerUrl) || rawServerUrl.slice(0, 100))}: ` +
             'not in ALLOWED_PANEL_HOSTS'
         );
-        return res.send(renderConfigPage({
-            serverUrl: rawServerUrl,
-            username,
-            password,
-            status: { valid: false, error: 'This instance only accepts accounts from specific providers, and that server is not one of them.' },
-            baseUrl: getBaseUrl(req),
-            nonce
-        }));
+        return fail('This instance only accepts accounts from specific providers, and that server is not one of them.');
     }
 
     try {
         const validation = await validateXtremioCredentials(rawServerUrl, username, password);
-        const finalServerUrl = validation.valid
+        render(validation, validation.valid
             ? (validation.resolvedUrl || normalizeUrl(rawServerUrl))
-            : rawServerUrl;
-
-        res.send(renderConfigPage({
-            serverUrl: finalServerUrl,
-            username,
-            password,
-            status: validation,
-            baseUrl: getBaseUrl(req),
-            nonce
-        }));
+            : rawServerUrl);
     } catch (e) {
-        res.send(renderConfigPage({
-            serverUrl: rawServerUrl,
-            username,
-            password,
-            status: { valid: false, error: 'Something went wrong. Please try again.' },
-            baseUrl: getBaseUrl(req),
-            nonce
-        }));
+        fail('Something went wrong. Please try again.');
     }
 });
 
-// Route failures are answered quietly — an empty shelf, a null meta — because Stremio
-// shows raw errors to users, so the log is the only place one failure can be told
-// from another. It used to print e.message for everything, and a bug in this file read
-// exactly like a provider outage: C1's "s.name.toLowerCase is not a function" emptied
-// every search on an account and looked like a flaky panel (audit R6). An error this
-// code raised by mistake now keeps its stack; provider and network failures stay one
-// line, since they are expected and their stacks say nothing. Stacks rather than error
-// objects, for the reason terminalErrorHandler gives.
+// Route failures are answered quietly, so the log is where a bug has to look
+// different from a provider outage (audit R6): a programming error keeps its stack,
+// provider and network failures stay one line.
 function isProgrammingError(e) {
     if (e instanceof ReferenceError || e instanceof RangeError) return true;
     // fetch reports a network failure as TypeError('fetch failed') with a cause.
@@ -3195,15 +2819,9 @@ const CATALOG_KINDS = {
     }
 };
 
-// Which kind a catalog id belongs to, and which variant of it. Note the overlap
-// with item id prefixes: `xtremio_series_new` is a catalog id that starts with
-// the item prefix `xtremio_series_`, which is why item ids are matched by
-// `typeMatchesId` and never by this.
-// The three variants the manifest actually declares. Anything else has to be
-// rejected rather than resolved: an unknown suffix used to yield a real kind
-// with `variant: 'bogus'`, which gives a null comparator, so the catalog was
-// served *unsorted* instead of 404ing. A silently wrong order is harder to
-// notice than a missing shelf.
+// Which kind a catalog id belongs to, and which variant. Catalog ids overlap item
+// id prefixes (`xtremio_series_new`), so item ids go through typeMatchesId instead.
+// Variants are an allowlist: an unknown one must be rejected, not served unsorted.
 const CATALOG_VARIANTS = new Set(['new', 'popular', 'featured']);
 
 function parseCatalogId(id) {
@@ -3225,13 +2843,9 @@ function catalogTypesFor(id) {
     return route ? CATALOG_KINDS[route.kind].catalogTypes : null;
 }
 
-// Every comparator ends in the item id, making each sort a *total* order. Without
-// that, two items with the same rating keep whatever order the source happened to
-// produce — and the same catalog has two sources (the warm full list or a
-// per-category fetch), so the page you got depended on cache state. That was the
-// audit's L3.
-// `now` is a parameter only so the featured shuffle can be tested across days
-// without moving the system clock. Production always takes the default.
+// Every comparator ends in the item id, making each sort a total order, so a page
+// does not depend on which source served the list (audit L3). `now` is a parameter
+// only for testing the featured shuffle across days.
 function catalogComparator(kind, variant, now = Date.now()) {
     const idOf = s => parseInt(s[kind.idField]) || 0;
     const byId = (a, b) => idOf(a) - idOf(b);
@@ -3243,52 +2857,47 @@ function catalogComparator(kind, variant, now = Date.now()) {
         return (a, b) => ((parseFloat(b.rating) || 0) - (parseFloat(a.rating) || 0)) || byId(a, b);
     }
     if (variant === 'featured') {
-        // Seeded on the day so the shuffle holds still while the user paginates
-        // and changes when the day does. The seed has to enter the hash *before*
-        // the multiply. It used to be added after (`id * C + daySeed`), and
-        // adding a constant is order-preserving except for the single item that
-        // wraps 2^31 — with tens of thousands of items spread over that range the
-        // mean gap is tens of thousands, so the rotation took tens of thousands of
-        // days to cross one item boundary. "Featured" was a fixed permutation:
-        // measured identical at day+1, +30, +365 and +3650.
+        // Seeded on the day, so the shuffle holds still while paginating. The seed
+        // must enter *before* the multiply: added after, it preserves order and
+        // the shuffle never changed.
         const daySeed = Math.floor(now / 86400000);
-        // Spread the day across the whole word first, so consecutive days are not
-        // near-identical keys.
+        // Spread the day across the word so consecutive days differ widely.
         const dayKey = Math.imul(daySeed, 0x9e3779b1);
-        // XOR is a permutation of the id space and 2654435761 is odd, so this
-        // stays a bijection modulo 2^31 exactly as the previous hash was: two
-        // distinct ids still cannot collide, which is what the injectivity test
-        // below relies on.
+        // XOR then an odd multiplier: a bijection modulo 2^31, so distinct ids
+        // cannot collide.
         const hash = s => (Math.imul(idOf(s) ^ dayKey, 2654435761) & 0x7fffffff);
         return (a, b) => (hash(a) - hash(b)) || byId(a, b);
     }
     return null;
 }
 
-function filterByName(items, search) {
+// `limit` stops the scan once that many matches are found: the route needs one
+// page, and a common word would otherwise lowercase and test every title.
+function filterByName(items, search, limit = Infinity) {
     if (!search) return items;
     const q = search.toLowerCase();
-    return items.filter(s => titleOf(s.name).toLowerCase().includes(q));
+    const found = [];
+    for (const s of items) {
+        if (found.length >= limit) break;
+        if (titleOf(s.name).toLowerCase().includes(q)) found.push(s);
+    }
+    return found;
 }
 
 function toCatalogMetas(items, kind) {
     return items.map(s => ({
         id: `${kind.idPrefix}${s[kind.idField]}`,
         type: kind.metaType,
-        // `|| undefined` so an item with no title still omits the key rather
-        // than shipping an empty string, which is what it did before.
+        // An item with no title omits the key rather than sending ''.
         name: titleOf(s.name) || undefined,
         poster: s[kind.posterField] || undefined,
         posterShape: kind.posterShape
     }));
 }
 
-// Which categories an item is filed under. Xtream items carry a primary
-// `category_id`, and many panels list every category in `category_ids` as well. The
-// per-category upstream call returns an item for each of them, so matching the cached
-// full list on `category_id` alone kept a multi-category item off all but one shelf
-// once the list was warm, while the same shelf cold showed it (audit C4): what a
-// shelf held depended on whether a search had happened to fill the cache.
+// Which categories an item is filed under: `category_id`, plus `category_ids` on
+// many panels. Both count, so a warm full list matches what the per-category call
+// returns (audit C4).
 function hasCategoryIds(item) {
     return (item.category_id != null && item.category_id !== '')
         || (Array.isArray(item.category_ids) && item.category_ids.length > 0);
@@ -3312,8 +2921,9 @@ function uniqueById(items, idField) {
 }
 
 // Resolves a genre to its items *and* to the cached array they were derived
-// from, or to null when the genre does not resolve to a category. The second half is what lets the sorted view be invalidated by
-// identity: a genre shelf is usually a fresh `.filter()` of the full list, so
+// from, or to null when the genre does not resolve to a category. The second half
+// is what lets the sorted view be invalidated by identity: a genre shelf is
+// usually a fresh `.filter()` of the full list, so
 // the items array is new on every request and says nothing about whether the
 // underlying data changed — but the array it was filtered from is the one the
 // list cache holds, and that is replaced only by a refetch.
@@ -3322,9 +2932,6 @@ function uniqueById(items, idField) {
 // 'all', or the categories — every one that shares the genre's name. The sorted
 // view is keyed on it rather than on the genre the request carried, because the
 // no-categories path ignores that genre.
-//
-// `selectCatalogGenre` below is the plain-items form, kept because it is the
-// exported surface and the shape the rest of the file describes.
 async function selectCatalogSource(cfg, kind, genre) {
     const cats = await getCategories(cfg);
     const categories = cats[kind.categoryKey] || [];
@@ -3341,10 +2948,8 @@ async function selectCatalogSource(cfg, kind, genre) {
     // Stremio marks genre required, but a bare catalog request still falls back
     // to the first category rather than showing an empty shelf.
     const selectedGenre = genre || (categories[0] && categories[0].category_name);
-    // Every category with that name, not the first (audit C3). The manifest offers
-    // each name once, so two "Action" categories are one genre to the user — but the
-    // shelf resolved the name to the first of them alone, and the second one's titles
-    // could not be reached from anywhere in the addon.
+    // Every category with that name, not the first (audit C3): the manifest offers
+    // each name once.
     const ids = [...new Set(categories
         .filter(c => c.category_name === selectedGenre)
         .map(c => String(c.category_id)))];
@@ -3354,14 +2959,9 @@ async function selectCatalogSource(cfg, kind, genre) {
     // Unambiguous for any ids, and exactly the old `category:<id>` for one numeric id.
     const selection = `category:${ids.map(encodeURIComponent).sort().join(',')}`;
 
-    // A full list is a shortcut for the per-category fetch, and either one can be
-    // wrong: a real provider has answered the unscoped get_vod_streams with an
-    // empty list while its category_id calls worked, and on another load answered
-    // a category_id call with an empty list while the full list worked. Any cached
-    // array used to count as warm — `[]` is truthy — so one search cached the empty
-    // full list and blanked every movie shelf for its whole TTL. The full list now
-    // serves a genre only when it has something for it; otherwise the category is
-    // asked directly. Both caches hold an empty answer for a minute, not thirty.
+    // A warm full list serves a genre only when it has items for it; otherwise the
+    // category is asked directly. Real providers have answered each of the two
+    // calls with a transient empty list while the other worked.
     if (kind.matchCategoryName) {
         const genreLower = String(selectedGenre || '').toLowerCase();
         const all = await kind.loadAll(cfg);
@@ -3382,19 +2982,12 @@ async function selectCatalogSource(cfg, kind, genre) {
         }
     }
 
-    // The per-category lists are themselves cached, so one is its own identity token,
-    // as before. Several are merged into an array that is new on every request, so its
-    // sorted view is computed per request and collected with it — a sort paid only on
-    // the cold path, and only by an account whose provider duplicates a name.
+    // One cached per-category list is its own identity token. Several are merged into
+    // a fresh array, whose sorted view is computed per request and collected with it.
     const lists = await Promise.all(ids.map(id => getCategoryStreams(cfg, kind.categoryAction, id)));
     if (lists.length === 1) return { items: lists[0], source: lists[0], selection };
     const merged = uniqueById(lists.flat(), kind.idField);
     return { items: merged, source: merged, selection };
-}
-
-async function selectCatalogGenre(cfg, kind, genre) {
-    const selected = await selectCatalogSource(cfg, kind, genre);
-    return selected && selected.items;
 }
 
 // The sorted view of one shelf, memoised against the identity of the list it was
@@ -3402,17 +2995,9 @@ async function selectCatalogGenre(cfg, kind, genre) {
 // variant has no comparator — the live shelf and any unsorted kind — so nothing
 // is cached for a shelf whose order was never computed in the first place.
 //
-// Under one source, a view is keyed by the variant and by `selection`, the subset
-// selectCatalogSource resolved — never by the genre string the request carried.
-// Search and a kind with no categories ignore the genre, so keying on it let
-// every distinct string mint a fresh sort of the same list, and while the views
-// shared one LRU across accounts, one token holder could evict everyone else's.
-// Keyed by what was selected, the views a source can have are bounded by its own
-// account's categories, and a search shares its view with the no-categories
-// shelf, which is the same list sorted the same way.
-//
-// Account and kind are not in the key because the source already implies them:
-// every list cache is keyed by account, and each kind has its own.
+// Under one source, a view is keyed by variant and by `selection` — never by the
+// request's genre string, which would be an unbounded key space. Account and kind
+// are implied by the source.
 function sortedCatalogItems(kind, route, { items, source, selection }, now = Date.now()) {
     const variant = route.search ? 'new' : route.variant;
     const comparator = catalogComparator(kind, variant, now);
@@ -3438,20 +3023,18 @@ function sortedCatalogItems(kind, route, { items, source, selection }, now = Dat
 }
 
 app.get(['/:config/catalog/:type/:id.json', '/:config/catalog/:type/:id/:extra.json'], async (req, res) => {
-    // Degraded answers are the default: every early return below is an empty
-    // shelf or a null meta produced by a failure, and a client or intermediary
-    // applying heuristic caching to one would pin a transient fault for as long
-    // as it liked. withCacheHints overwrites this on the paths that succeeded.
+    // Degraded answers are the default, in this route and in meta and stream:
+    // every early return is an empty answer produced by a failure, and a client
+    // applying heuristic caching to one would pin a transient fault.
+    // withCacheHints overwrites this on the paths that succeeded.
     res.setHeader('Cache-Control', 'no-store');
     const cfg = decodeConfig(req.params.config);
     if (!cfg) return res.json({ metas: [] });
 
     const { id, type } = req.params;
 
-    // Asked of catalogTypesFor rather than re-derived here. The route used to
-    // inline the equivalent lookup, which left the function with no production
-    // caller at all and its six assertions testing something that never ran —
-    // exactly the shape that lets a check and its test drift apart.
+    // Through catalogTypesFor, not a copy of it, so the tested check is the one
+    // that runs.
     const types = catalogTypesFor(id);
     if (!types) return res.json({ metas: [] });
     if (!types.includes(type)) {
@@ -3478,34 +3061,18 @@ app.get(['/:config/catalog/:type/:id.json', '/:config/catalog/:type/:id/:extra.j
             if (!selected) return res.json({ metas: [] });
         }
 
-        // Both branches sort, and they did not used to. A search catalog has no
-        // variant, so it got no comparator and was served in whatever order the
-        // provider happened to return — which is stable only for as long as one
-        // cached list survives. Across a TTL refetch an upstream reordering moves
-        // the page boundaries, and the reader sees an item twice or not at all.
-        // `new` is the variant chosen for search because it is a total order (it
-        // ends in the item id, like every comparator here) and "most recently
-        // added first" is the most useful ranking available behind a substring
-        // match, which carries no relevance signal of its own.
-        //
-        // The sort now runs *before* the search filter rather than after it. The
-        // two commute — a filter preserves relative order, and every comparator
-        // here is a total order, so filtering a sorted list gives exactly the
-        // list a sort of the filtered items would — and doing it in this order
-        // means the sorted array depends only on the shelf, not on the search
-        // term, which is what makes it memoisable at all. Keying a cache by a
-        // caller-supplied search string would be an unbounded key space.
+        // Search sorts too (as `new`), so pages stay stable across refetches. The
+        // sort runs before the search filter: for a total order the two commute,
+        // and this way the memoised view does not depend on the search term. The
+        // filter stops once it has this page's worth of matches.
         const items = filterByName(
             sortedCatalogItems(kind, route, selected),
-            extra.search
+            extra.search,
+            skip + PAGE_SIZE
         );
 
         const metas = toCatalogMetas(items.slice(skip, skip + PAGE_SIZE), kind);
-        // An empty page stays no-store, like the degraded answers above. Real
-        // providers return empty lists transiently and the server-side caches
-        // retry those within a minute, but a client told to keep the page for
-        // 300 s plus 600 s stale would pin the blank shelf long after the server
-        // had recovered. Recomputing an empty page costs nothing.
+        // An empty page stays no-store: empty lists are often transient.
         if (!metas.length) return res.json({ metas });
         return res.json({ metas, ...withCacheHints(res, 300, 600) });
     } catch (e) {
@@ -3515,15 +3082,12 @@ app.get(['/:config/catalog/:type/:id.json', '/:config/catalog/:type/:id/:extra.j
 });
 
 app.get('/:config/meta/:type/:id.json', async (req, res) => {
-    // Degraded answers are the default: every early return below is an empty
-    // shelf or a null meta produced by a failure, and a client or intermediary
-    // applying heuristic caching to one would pin a transient fault for as long
-    // as it liked. withCacheHints overwrites this on the paths that succeeded.
+    // Degraded answers are the default; see the catalog route.
     res.setHeader('Cache-Control', 'no-store');
     const cfg = decodeConfig(req.params.config);
     if (!cfg) return res.json({ meta: null });
     const { id, type } = req.params;
-    console.log(`[meta] type=${type} id=${id}`);
+    if (LOG_REQUESTS) console.log(`[meta] type=${type} id=${id}`);
 
     if (!typeMatchesId(type, id)) {
         console.warn(`[meta] type/id mismatch: type=${type} id=${id}`);
@@ -3534,8 +3098,7 @@ app.get('/:config/meta/:type/:id.json', async (req, res) => {
         if (id.startsWith('xtremio_live_')) {
             const streamId = getPrefixedNumericId(id, 'xtremio_live_');
             if (!streamId) return res.status(400).json({ meta: null });
-            const allLive = await getAllLiveStreams(cfg);
-            let s = allLive.find(i => String(i.stream_id) === streamId);
+            const s = findLiveStream(await getAllLiveStreams(cfg), streamId);
 
             if (!s) return res.json({ meta: null });
             const meta = {
@@ -3608,11 +3171,8 @@ app.get('/:config/meta/:type/:id.json', async (req, res) => {
                         skippedEpisodes++;
                         continue;
                     }
-                    // `|| 1` turned a legitimate episode 0 into episode 1, and
-                    // providers do number specials, pilots and recaps 0 — so the
-                    // episode was relabelled and collided with the real episode 1
-                    // of the same season. Only a value that will not parse falls
-                    // back now.
+                    // Episode 0 is real (specials, pilots); only a value that
+                    // will not parse falls back to 1.
                     const parsedEpisode = parseInt(ep.episode_num);
                     const episodeNum = Number.isInteger(parsedEpisode) ? parsedEpisode : 1;
                     videos.push({
@@ -3622,9 +3182,7 @@ app.get('/:config/meta/:type/:id.json', async (req, res) => {
                         title: titleOf(ep.title) || `Episode ${episodeNum}`,
                         season: parseInt(seasonNum),
                         episode: episodeNum,
-                        // Omitted rather than epoch-defaulted: Stremio renders a
-                        // date it is given, so the old fallback printed "1970"
-                        // next to every episode whose provider sent no date.
+                        // Omitted, never epoch-defaulted: Stremio renders any date.
                         released: toIsoDate(ep.info?.releasedate) || undefined,
                         overview: ep.info?.plot || undefined,
                         thumbnail: ep.info?.movie_image || undefined
@@ -3672,15 +3230,12 @@ app.get('/:config/meta/:type/:id.json', async (req, res) => {
 });
 
 app.get('/:config/stream/:type/:id.json', async (req, res) => {
-    // Degraded answers are the default: every early return below is an empty
-    // shelf or a null meta produced by a failure, and a client or intermediary
-    // applying heuristic caching to one would pin a transient fault for as long
-    // as it liked. withCacheHints overwrites this on the paths that succeeded.
+    // Degraded answers are the default; see the catalog route.
     res.setHeader('Cache-Control', 'no-store');
     const cfg = decodeConfig(req.params.config);
     if (!cfg) return res.json({ streams: [] });
     const { id, type } = req.params;
-    console.log(`[stream] type=${type} id=${id}`);
+    if (LOG_REQUESTS) console.log(`[stream] type=${type} id=${id}`);
 
     if (!typeMatchesId(type, id)) {
         console.warn(`[stream] type/id mismatch: type=${type} id=${id}`);
@@ -3695,13 +3250,8 @@ app.get('/:config/stream/:type/:id.json', async (req, res) => {
         if (id.startsWith('xtremio_live_')) {
             const streamId = getPrefixedNumericId(id, 'xtremio_live_');
             if (!streamId) return res.status(400).json({ streams: [] });
-            // Live goes through the proxy for the same reason movies and
-            // episodes do, plus one of its own: the upstream URL embeds the
-            // account username and password, and handing it to Stremio put
-            // those in client logs and — for the http-only providers that are
-            // the norm — in cleartext on the wire. Neither format is MP4, so
-            // both are notWebReady; isNotWebReady is used rather than a
-            // hardcoded true so the rule stays stated in one place.
+            // Live is proxied too, because its upstream URL embeds the
+            // credentials (audit M9).
             const proxyBase = `${getBaseUrl(req)}/${req.params.config}/proxy/live/${streamId}`;
             const variants = [
                 { ext: 'm3u8', title: 'HLS' },
@@ -3731,12 +3281,8 @@ app.get('/:config/stream/:type/:id.json', async (req, res) => {
             const ext = normalizeContainerExt(rawExt);
             const extStated = statedContainerExt(rawExt) !== null;
             const proxyUrl = `${getBaseUrl(req)}/${req.params.config}/proxy/movie/${streamId}.${ext}`;
-            // Cacheable like the live answer: the proxy URL is stable for a
-            // given title, because it is the proxy that re-resolves the
-            // provider's short-lived token on every playback, not this response.
-            // Only when the provider named the container, though: a guessed mp4
-            // held by the client for an hour outlives any fix to the provider's
-            // data.
+            // Cacheable, since the proxy URL is stable — but only when the
+            // provider named the container, not when mp4 was guessed.
             return res.json({
                 streams: [
                     {
@@ -3810,34 +3356,14 @@ async function readTextCapped(body, maxBytes) {
             await reader.cancel().catch(() => {});
             throw new Error(`playlist exceeded ${maxBytes} bytes`);
         }
-        chunks.push(Buffer.from(value));
+        chunks.push(value);
     }
     return Buffer.concat(chunks).toString('utf8');
 }
 
-// The shared body of both proxy routes: resolve the upstream, forward the
-// headers that matter for playback, and either rewrite a playlist or stream
-// the bytes through. Both routes need identical abort, timeout and
-// header-forwarding behaviour, so it lives in one place — the difference
-// between them is only how the upstream URL is arrived at.
-//
-// `rewriteFor` is called with the response's final URL and content type; it
-// returns a mapper for playlist URIs, or null to stream the body untouched.
-// RFC 9110 §14.3: Accept-Ranges carries a range-*unit* — `bytes` or `none` —
-// not a range. A real provider answers a ranged movie request with
-// `accept-ranges: 0-3328437858`, which this proxy relayed verbatim; a strict
-// player that cannot parse the unit may conclude ranges are unsupported and
-// disable seeking, or fall back to pulling a 3.3 GB file linearly.
-//
-// The opposite mistake lived here too: whenever upstream omitted the header the
-// proxy asserted `bytes`, and an origin that *ignores* Range answers 200 with
-// the whole body. Measured against the real provider, a player asking for 2 KB
-// of an HLS segment was told ranges work and handed 3,675,400 bytes — and in
-// that exchange upstream's own `accept-ranges: bytes` was the lie, so trusting
-// a well-formed value is not enough either.
-//
-// So the header is decided by what the exchange actually demonstrated, in that
-// order of confidence, rather than by what either side claims.
+// Accept-Ranges carries a range-*unit* (RFC 9110 §14.3), and providers get it wrong
+// both ways: one sends a range instead of a unit, another claims `bytes` while
+// ignoring Range. So the header is decided by what the exchange demonstrated.
 const RANGE_UNIT = /^(?:bytes|none)$/i;
 
 function normalizeAcceptRanges({ status, upstreamValue, sentRange, sentIfRange }) {
@@ -3860,6 +3386,10 @@ function normalizeAcceptRanges({ status, upstreamValue, sentRange, sentIfRange }
     return 'bytes';
 }
 
+// The shared body of both proxy routes: resolve the upstream, forward the headers
+// that matter for playback, and either rewrite a playlist or stream the bytes.
+// `rewriteFor(finalUrl, contentType)` returns a mapper for playlist URIs, or null
+// to stream the body untouched.
 async function relayUpstream(req, res, { upstreamUrl, label, ext, rewriteFor }) {
     const headers = { 'User-Agent': PROXY_USER_AGENT };
     // A Range on a playlist would yield a partial body that cannot be parsed or
@@ -3900,20 +3430,9 @@ async function relayUpstream(req, res, { upstreamUrl, label, ext, rewriteFor }) 
     let headersTimedOut = false;
     const headerTimer = setTimeout(() => { headersTimedOut = true; abort(); }, PROXY_HEADER_TIMEOUT_MS);
     try {
-        // A HEAD from the player used to become a GET upstream whose body was
-        // then dropped unread, spending a buffer window of the provider's
-        // bandwidth — bounded by undici's backpressure, but wasted, and a movie
-        // here is routinely 3 GB. So the method is passed through.
-        //
-        // But HEAD cannot be trusted to work, and the failure is not tidy.
-        // Measured against a real Xtream account: the panel answers HEAD with
-        // **502 and no redirect at all**, and the CDN behind its 302 drops the
-        // connection outright, so `fetch` *throws* rather than returning a
-        // status. An earlier version of this fell back only on 405/501 and
-        // turned every real HEAD into a 502 — the regression this shape exists
-        // to prevent. Anything short of a usable response therefore falls back
-        // to the GET that has always worked: one wasted round trip on providers
-        // that reject HEAD, against a whole body saved on those that honour it.
+        // HEAD is passed through, and anything short of a usable response falls
+        // back to GET. Do not narrow this to 405/501: the real panel answers HEAD
+        // with a 502 and its CDN drops the connection, so fetch throws.
         if (req.method === 'HEAD') {
             try {
                 const head = await safeFetch(upstreamUrl, {
@@ -3961,12 +3480,8 @@ async function relayUpstream(req, res, { upstreamUrl, label, ext, rewriteFor }) 
         ? rewriteFor(finalUrl, contentType)
         : null;
 
-    // Fail closed on a playlist we cannot rewrite. The sub-resource route has
-    // to forward Range, because EXT-X-BYTERANGE segments depend on it, so a
-    // ranged request for a nested playlist would come back 206 and skip the
-    // rewrite above — relaying the provider's credential-bearing URIs verbatim,
-    // which is the one thing this whole path exists to prevent. Players do not
-    // range-request playlists, so refusing costs nothing real.
+    // Fail closed on a partial playlist: a 206 skips the rewrite and would relay
+    // the provider's credential-bearing URIs.
     if (!mapper && upstream.status === 206 && looksLikePlaylist(ext, contentType)) {
         console.warn(`[proxy] refusing to relay a partial playlist for ${label}`);
         discardBody(upstream);
@@ -3976,13 +3491,8 @@ async function relayUpstream(req, res, { upstreamUrl, label, ext, rewriteFor }) 
 
     if (mapper && req.method !== 'HEAD') {
         let text;
-        // The header timer is gone by now — correct for the streaming path,
-        // where a long body is the point, but this branch buffers the whole
-        // thing before answering. An upstream that sends headers and then
-        // trickles one byte a minute would otherwise hold the request, its
-        // socket and up to MAX_PLAYLIST_BYTES of buffer indefinitely;
-        // REQUEST_TIMEOUT_MS does not help, since that bounds receiving the
-        // *request*. A playlist is kilobytes, so this deadline is generous.
+        // This branch buffers the whole body, so it gets its own deadline; the
+        // header timer is already cleared.
         let bodyTimedOut = false;
         const bodyTimer = setTimeout(() => { bodyTimedOut = true; abort(); }, PLAYLIST_BODY_TIMEOUT_MS);
         try {
@@ -4003,15 +3513,8 @@ async function relayUpstream(req, res, { upstreamUrl, label, ext, rewriteFor }) 
             clearTimeout(bodyTimer);
         }
 
-        // The body settles what the headers could only suggest. Whether to take
-        // this branch has to be decided before a byte arrives — the alternative
-        // is a segment that must not be buffered — so a target that says .m3u8
-        // and is really a video stream gets this far, and parsing one as a
-        // playlist would hand the player a mangled body.
-        // Refused rather than relayed: if this *is* a playlist whose first line
-        // went missing, relaying it verbatim is the credential disclosure the
-        // rewrite exists to prevent, and a player rejects a playlist with no
-        // #EXTM3U either way.
+        // The body confirms what the headers suggested. A body without #EXTM3U
+        // is refused, not relayed: it may still carry credential-bearing URLs.
         if (!HLS_BODY_PREFIX.test(text)) {
             console.warn(`[proxy] expected a playlist for ${label} but the body does not start with #EXTM3U; refusing`);
             if (!res.headersSent) res.status(502).end('bad playlist');
@@ -4100,18 +3603,10 @@ async function relayUpstream(req, res, { upstreamUrl, label, ext, rewriteFor }) 
         }
         // The client is already gone, or the response already finished.
         if (res.destroyed || res.writableEnded) return;
-        // Once bytes are on the wire the status and length are promised, and a
-        // dead connection is the only honest signal left. Ending the response
-        // instead left a keep-alive socket open with the client waiting for the
-        // bytes its Content-Length still promised — measured against this relay:
-        // 500 of 1,000 bytes, socket still open 8 s later, until keepAliveTimeout.
-        // A closed connection is what makes a player retry with a Range request.
+        // Once bytes are out, status and length are promised: destroy the socket
+        // so the player retries, rather than leaving it waiting on keep-alive.
         if (res.headersSent) return res.destroy();
-        // Nothing sent yet, but the headers set above describe the upstream body,
-        // not a 502: sent as they were, the 502 promised the movie's full length
-        // and delivered nothing. The length is set again explicitly because
-        // removing it tells Node the response has none, and it falls back to
-        // chunked encoding.
+        // Nothing sent yet: drop the upstream headers and answer a bare 502.
         for (const h of [...forward, 'accept-ranges']) res.removeHeader(h);
         const body = 'upstream stream failed';
         res.status(502);
@@ -4127,40 +3622,18 @@ async function relayUpstream(req, res, { upstreamUrl, label, ext, rewriteFor }) 
     nodeStream.pipe(res);
 }
 
-// Stream proxy. Xtream providers 302-redirect to a CDN URL that carries
-// a short-lived signed token (~60s). Handing that URL directly to
-// Stremio causes "playback error" after ~1 minute when the token
-// expires. By proxying every range request through the addon, we
-// re-resolve the origin URL (and get a fresh token) for each request.
+// Stream proxy. Providers 302 to a CDN URL whose token expires in about a minute,
+// so every range request is re-resolved here; this also keeps the credentials in
+// the upstream path off the player.
 //
-// It also keeps the account credentials on the server: the upstream path
-// embeds username and password, and this is what stops that URL reaching the
-// player. Live channels use it for the same reason (see the stream route).
-// Signing a target hands out a capability, and the URIs come from the provider,
-// not from us — a hostile or compromised panel can put any absolute URL in its
-// playlist. Signing one the server would refuse to fetch is the wrong default,
-// so the same check runs here. A target that cannot be signed is not left in the
-// playlist verbatim: those lines are the provider's own credential-bearing URLs,
-// so rewriteHlsPlaylist refuses the playlist instead (502) and the warnings below
-// name the setting that would admit the host.
-// This is defence in depth over the fetch-time check, not a replacement for it.
-// Escape hatch for a provider that genuinely fans segments out beyond the panel
-// and the playlist's own origin. Hostnames rather than origins, so a provider
-// serving the playlist over http and its segments over https needs one entry, not
-// two. Empty by default — the two derived origins cover every real provider seen
-// so far, and every entry here is a host this server will fetch from on request.
-// Parsed by the same parseHostList as ALLOWED_PANEL_HOSTS, so an entry written as
-// `host:port` or as a URL names its host here too, rather than never matching.
+// Extra hostnames a playlist may name beyond the panel and the playlist's own
+// origin, for a provider that fans out. Every entry is a host this server will
+// fetch from on a provider's instruction.
 const HLS_TARGET_ALLOWED_HOSTS = parseHostList(process.env.HLS_TARGET_ALLOWED_HOSTS, 'HLS_TARGET_ALLOWED_HOSTS');
 
-// The origins a playlist is allowed to name. The account's own panel is not
-// enough on its own: real providers 302 the playlist to a CDN on a different
-// host — one live account here serves its segments from a bare IP that is not the
-// panel hostname at all — so the origin the playlist was *finally* fetched from
-// has to be in the set too, alongside the one it was requested from.
-// normalizeUrl throws on an empty serverUrl, and a config that decoded is not a
-// guarantee of a usable one. A panel with no origin simply contributes nothing to
-// the allowed set rather than taking the request down.
+// The origins a playlist may name: the panel, and the URLs the playlist was
+// requested from and finally fetched from, since providers 302 playlists to a CDN.
+// A panel URL that will not parse contributes nothing.
 function panelOrigin(cfg) {
     try {
         return normalizeUrl(cfg.serverUrl);
@@ -4180,21 +3653,12 @@ function hlsTargetOrigins(...candidates) {
     return origins;
 }
 
-// `allowedOrigins` is required and there is deliberately no permissive default:
-// a caller that forgets it signs nothing, which fails closed and shows up
-// immediately, rather than quietly restoring the playlist relay this closes.
-// Closes it for playlists from an honest panel, that is (audit D1): a malicious
-// panel's own origin and final URL are in the set by construction. That case is
-// S3, closed by ALLOWED_PANEL_HOSTS and otherwise bounded by the relay caps.
+// `allowedOrigins` is required, with no permissive default, so a caller that forgets
+// it signs nothing. It bounds a misbehaving playlist from an honest panel, not a
+// malicious panel, whose own origins are in the set (audit D1; see S3).
 function makeHlsProxyMapper(base, configToken, allowedOrigins) {
-    // Playlists name hundreds of segments on one host, so vetting is per origin —
-    // one DNS resolution rather than hundreds, and now shared across passes via
-    // hlsOriginVetCache rather than only within one.
-    //
-    // Distinct origins are capped per playlist because each new one costs a
-    // resolution and a real playlist names one or two. Past the cap nothing more
-    // is signed and no further lookups are made, which refuses the playlist —
-    // a playlist naming more hosts than the cap is hostile or broken either way.
+    // Vetting is per origin, shared through hlsOriginVetCache, and distinct origins
+    // are capped per playlist; past the cap the playlist is refused.
     const seen = new Set();
     let warned = false;
     let refusedOrigin = false;
@@ -4207,13 +3671,8 @@ function makeHlsProxyMapper(base, configToken, allowedOrigins) {
         }
         const origin = url.origin;
 
-        // Checked before the cap and before any DNS work, so a playlist naming
-        // hosts this account has no business fetching costs nothing at all.
-        // assertSafeOutboundUrl below only refuses *private* targets, which left
-        // every public host a playlist named signable — and therefore fetchable and
-        // relayable from the operator's address. This bounds what a compromised or
-        // misbehaving playlist can reach; it cannot bound a panel that is itself
-        // hostile, whose own hosts are the allowed ones (audit D1, and see S3).
+        // Checked before the cap and any DNS work, so foreign hosts cost nothing.
+        // assertSafeOutboundUrl alone would admit every public host.
         if (!(allowedOrigins && allowedOrigins.has(origin))
             && !HLS_TARGET_ALLOWED_HOSTS.has(url.hostname.toLowerCase())) {
             if (!refusedOrigin) {
@@ -4248,30 +3707,11 @@ function makeHlsProxyMapper(base, configToken, allowedOrigins) {
     };
 }
 
-// An install URL is a bearer credential, and one that leaks or is deliberately
-// shared can open as many simultaneous relays as the sharers have players — each
-// one a full-rate video stream out of this server's egress, paid for by the
-// operator. Nothing else here bounds that: the caches bound memory and the
-// timeouts bound stalled requests, but a thousand healthy concurrent relays look
-// exactly like a popular household.
-//
-// The counter is keyed by *account* rather than by the token string, even though
-// the limit is named for the token: `/configure` will mint a fresh token for the
-// same credentials on demand (the IV is random, so the ciphertext differs every
-// time), and a budget that a new install URL resets is not a budget. Two people
-// legitimately sharing one account share one allowance, which is the same thing
-// the provider's own connection limit already does.
-//
-// Set to 0 to disable, for an operator whose reverse proxy already does this.
-// The default is generous on purpose — a single player keeps one or two relays
-// open, a live HLS channel two or three, and a household with several devices
-// still lands far below it — so reaching it means something is wrong rather than
-// something is popular.
-//
-// Parsed by hand rather than with the `Number(x) || default` the cache bounds
-// use, because 0 is a *meaningful* value here and that idiom would quietly turn
-// the documented way to disable the limit into the default. An empty or
-// unparseable setting is treated as unset.
+// Concurrent relay caps. An install URL is a bearer credential, and a leaked or
+// shared one could otherwise open unlimited full-rate streams. The per-account cap
+// is keyed by account, not token string, since /configure mints fresh tokens for
+// the same credentials on demand. Parsed by hand because 0 (disabled) is meaningful
+// and `Number(x) || default` would turn it into the default.
 function relayLimitFromEnv(name, fallback) {
     const raw = process.env[name];
     if (typeof raw !== 'string' || !raw.trim()) return fallback;
@@ -4281,22 +3721,9 @@ function relayLimitFromEnv(name, fallback) {
 
 const PROXY_MAX_CONCURRENT_PER_TOKEN = relayLimitFromEnv('PROXY_MAX_CONCURRENT_PER_TOKEN', 16);
 
-// Two more budgets over the same relays, because the one above is keyed by account
-// and an account is free. /configure mints one for any panel that passes the
-// credential check, so a caller with a panel of their own — or many made-up
-// usernames on one — gets a fresh per-account allowance each time (audit S3). On
-// an instance where anyone may bring any provider, nothing about the account can be
-// relied on to bound the traffic.
-//
-// Per client, because addresses are not free: keyed by clientKey, so an IPv6 client
-// counts by its /64 and a proxied one by the address TRUST_PROXY vouches for. The
-// default sits well above a household — several players at two or three relays
-// each — and is generous on purpose, since carrier NAT puts many unrelated users
-// behind one address.
-// And in total, because a caller with many addresses is still bounded by the
-// server's own capacity. That one is the operator's to size to their bandwidth; the
-// default is a ceiling a small host should lower, not a recommendation.
-// Both are parsed like the per-token limit, where 0 disables.
+// Accounts are free to make (audit S3), so relays are also capped per client
+// (keyed by clientKey; generous, for carrier NAT) and in total (size it to your
+// bandwidth).
 const PROXY_MAX_CONCURRENT_PER_CLIENT = relayLimitFromEnv('PROXY_MAX_CONCURRENT_PER_CLIENT', 32);
 const PROXY_MAX_CONCURRENT_TOTAL = relayLimitFromEnv('PROXY_MAX_CONCURRENT_TOTAL', 256);
 
@@ -4312,14 +3739,10 @@ function releaseCount(map, key) {
     else map.delete(key);
 }
 
-// Takes a slot for the life of this response, or returns the limit that refused it
-// ({ scope }) for rejectOverCap. Null means the relay may go ahead. All three limits
-// are checked before any is counted, so a refused request holds nothing.
-// The release is bound to the response's `close` event rather than to the end of
-// the handler: `relayUpstream` returns as soon as the body is piped, while the
-// relay it started may run for hours. `close` fires exactly once, on a finished
-// response and on a dropped connection alike, which is what keeps the counts from
-// drifting upward until a cap locks a caller out permanently.
+// Takes a slot for the life of this response and returns null, or returns the
+// limit that refused it ({ scope }). All limits are checked before any is counted.
+// Released on the response's `close`, which fires once on completion and on abort
+// alike; relayUpstream returns long before a relay ends.
 function acquireProxySlot(cfg, req, res) {
     if (!PROXY_MAX_CONCURRENT_PER_TOKEN && !PROXY_MAX_CONCURRENT_PER_CLIENT && !PROXY_MAX_CONCURRENT_TOTAL) {
         return null;
@@ -4685,18 +4108,10 @@ app.use((req, res) => {
     res.status(404).type('text/plain').end('not found');
 });
 
-// Terminal error handler. Express's default one writes the stack into the
-// response whenever NODE_ENV is not exactly 'production' — absolute filesystem
-// paths, this file's line numbers and the dependency tree, to anyone who can
-// reach the port. Two routes into it were reachable unauthenticated: a
-// non-string field on POST /configure, and a malformed percent-escape anywhere
-// in a path, which throws a URIError out of the router *before* any handler
-// runs. Nothing a handler does can catch the second one — only this can.
-//
-// Registered last because Express matches middleware in order, and an error
-// handler only sees throws from what was registered before it. The four
-// parameters are what identify it as one, so `next` stays whether or not every
-// path uses it.
+// Terminal error handler: Express's default writes stacks into responses. A
+// malformed percent-escape throws a URIError out of the router before any handler
+// runs, so only this can catch it. Registered last; the four parameters are what
+// mark it as an error handler.
 function terminalErrorHandler(err, req, res, next) {
     // A URIError from decodeParam means the client sent a bad path, not that
     // the server broke; anything carrying its own status (body-parser and
@@ -4708,15 +4123,9 @@ function terminalErrorHandler(err, req, res, next) {
         : (claimed >= 400 && claimed <= 599 ? claimed : 500);
 
     const where = `${req.method} ${redactConfigInPath(req.originalUrl || req.url)} -> ${status}`;
-    // A 4xx is the client's mistake and arrives as often as someone cares to
-    // send one; a stack per malformed path would be a log flood with no
-    // information in it. A 5xx is ours, and the stack is the whole point.
-    //
-    // The stack, not the error object: printing an object prints its own
-    // properties too, and some carry request data. A failed `new URL()` holds its
-    // rejected input, which on the proxy route was a path with the account's
-    // username and password in it. redactConfigInPath covers the request path;
-    // nothing could cover properties it never sees.
+    // A 5xx logs its stack; a 4xx one line. The stack, never the error object,
+    // whose properties can carry request data (a failed `new URL()` holds its
+    // input, which can include credentials).
     if (status >= 500) console.error(`[error] ${where}:`, err?.stack || String(err));
     else console.warn(`[error] ${where}: ${err?.message}`);
 
@@ -4760,27 +4169,15 @@ if (require.main === module) {
     const shutdown = createShutdownHandler(server);
     process.on('SIGTERM', () => shutdown('SIGTERM'));
     process.on('SIGINT', () => shutdown('SIGINT'));
-    // No AbortError exemption. Client disconnects are handled where they happen —
-    // the proxy route aborts its own upstream fetch and filters the resulting
-    // errors at each failure point — so an abort reaching here would mean a real
-    // gap, and swallowing it would hide exactly the `write after end` class of bug
-    // this handler exists to catch.
+    // No AbortError exemption: client disconnects are handled where they happen,
+    // so an abort reaching here is a real gap.
     process.on('uncaughtException', (err) => {
-        // Process state is undefined after an uncaught throw. Exiting lets the
-        // platform restart us; staying up serves requests from a wedged process
-        // that /health would still report as healthy.
+        // Process state is undefined after an uncaught throw; exit and be restarted.
         console.error('Uncaught exception, exiting:', err);
         process.exit(1);
     });
-    // Same treatment as an uncaught throw, and for the same reason: a rejection
-    // nobody handled leaves the process in exactly the undefined state the
-    // handler above exists to escape, while /health cheerfully keeps answering
-    // 200. Logging and continuing also diverged from Node's own default, which
-    // has been to exit since v15. Express 5 forwards async route errors to the
-    // terminal error handler, so anything reaching here is a genuine bug rather
-    // than routine traffic — including a client disconnect, which the proxy
-    // handles locally and which is covered by a test that kills a socket
-    // mid-stream and asserts the process survives.
+    // Same for an unhandled rejection; Express 5 already routes async route
+    // errors to the terminal handler, so anything here is a bug.
     process.on('unhandledRejection', (err) => {
         console.error('Unhandled rejection, exiting:', err);
         process.exit(1);
@@ -4838,7 +4235,6 @@ module.exports = {
     filterByName,
     titleOf,
     toCatalogMetas,
-    selectCatalogGenre,
     selectCatalogSource,
     sortedCatalogItems,
     sortedCatalogViews,
