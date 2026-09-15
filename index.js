@@ -181,6 +181,25 @@ function enforceConfigSecretPolicy({ raw = RAW_CONFIG_SECRET, production = IS_PR
     return true;
 }
 
+// The other half of that policy, for the other thing a deployment can get wrong
+// silently. SAFE_HOST below only checks the *shape* of the host an install link
+// is built from, so with PUBLIC_URL unset any hostname an attacker controls and
+// points at this instance mints install links carrying that hostname — and
+// whoever controls it can repoint its DNS later and collect the config tokens
+// users installed (audit L7). Warned rather than refused: a single-host
+// deployment behind a proxy that sets Host correctly is legitimate, but in
+// production it should be a deliberate choice rather than the default.
+function warnOnUnpinnedBaseUrl({ publicUrl = PUBLIC_URL, production = IS_PRODUCTION, log = console } = {}) {
+    if (publicUrl || !production) return false;
+    log.warn(
+        '[security] PUBLIC_URL is not set, so install links are built from the request Host. ' +
+        'A hostname an attacker controls, pointed at this instance, mints install URLs carrying ' +
+        'that hostname, and repointing its DNS later collects the config tokens users installed. ' +
+        "Set PUBLIC_URL to this addon's own public address."
+    );
+    return true;
+}
+
 // Host and X-Forwarded-* are attacker-controllable unless a trusted proxy sets
 // them, and the result is embedded in the install link handed out by
 // /configure — a poisoned host would send users' config tokens elsewhere.
@@ -2281,6 +2300,12 @@ function schemeOf(url) {
     return String(url || '').startsWith('https:') ? 'https' : 'http';
 }
 
+// How long /configure waits for a panel to answer. The probe deadline covers an
+// attempt at a scheme the user did not type, which is a guess and must not cost
+// the whole wait; see validateXtremioCredentials.
+const CONFIGURE_TIMEOUT_MS = 15000;
+const CONFIGURE_PROBE_TIMEOUT_MS = 6000;
+
 // An https -> http move is baked into the token, so it is reported to the user.
 function describeDowngrade(requested, finalUrl, source) {
     if (schemeOf(requested) !== 'https' || schemeOf(finalUrl) !== 'http') return null;
@@ -2326,17 +2351,41 @@ async function credentialsWorkAt(origin, username, password) {
 
 async function validateXtremioCredentials(serverUrl, username, password) {
     const base = normalizeUrl(serverUrl);
-    // Someone who typed https:// is never moved onto http (audit S7). Otherwise the
-    // only fallback tried is https.
+    // normalizeUrl assumes http for a URL with no scheme, so the normalized value
+    // cannot tell a typed `http://` from no scheme at all — and the two deserve
+    // different orders.
+    const typed = String(serverUrl || '').trim().toLowerCase();
+    const typedScheme = typed.startsWith('http://') || typed.startsWith('https://');
+    // Someone who typed https:// is never moved onto http (audit S7). Someone who
+    // typed http:// asked for it, so that is tried first and https is the upgrade.
+    // With no scheme at all, https goes first: the old order put the password on
+    // the wire in cleartext before anything had tried the panel's TLS port, and no
+    // warning afterwards takes a sent password back (audit L9).
     const askedForHttps = schemeOf(base) === 'https';
-    const urls = askedForHttps ? [base] : [base, base.replace(/^http:/, 'https:')];
+    const httpsBase = base.replace(/^http:/, 'https:');
+    // A scheme the user did not type is a guess, and a guess must not cost the
+    // whole deadline: an http-only panel behind a firewalled 443 would otherwise
+    // make every scheme-less /configure wait CONFIGURE_TIMEOUT_MS before trying
+    // what works. Only the attempt the user actually asked for gets the full one.
+    const attempts = [];
+    if (askedForHttps) {
+        attempts.push({ url: base, timeoutMs: CONFIGURE_TIMEOUT_MS });
+    } else if (typedScheme) {
+        attempts.push({ url: base, timeoutMs: CONFIGURE_TIMEOUT_MS });
+        attempts.push({ url: httpsBase, timeoutMs: CONFIGURE_PROBE_TIMEOUT_MS });
+    } else {
+        attempts.push({ url: httpsBase, timeoutMs: CONFIGURE_PROBE_TIMEOUT_MS });
+        attempts.push({ url: base, timeoutMs: CONFIGURE_TIMEOUT_MS });
+    }
     // Whether any attempt got an HTTP response at all: a server that answered is
     // reachable, and the error should say the URL is wrong, not the network.
     let anyAnswered = false;
 
-    for (const url of urls) {
+    for (let i = 0; i < attempts.length; i++) {
+        const { url, timeoutMs } = attempts[i];
+        const next = attempts[i + 1] || null;
         const controller = new AbortController();
-        const timer = setTimeout(() => controller.abort(), 15000);
+        const timer = setTimeout(() => controller.abort(), timeoutMs);
         let answered = false;
         try {
             const apiUrl = buildUrl(url, '/player_api.php', { username, password });
@@ -2410,12 +2459,12 @@ async function validateXtremioCredentials(serverUrl, username, password) {
             // The caller gets no detail about why (that would make this page a port
             // scanner); the operator gets it in the log for every attempt.
             const reason = e.name === 'AbortError' ? 'timeout' : e.cause?.code || e.message;
-            const retrying = url === urls[0] && urls.length > 1;
+            // Names the scheme actually coming next, which is no longer always https.
             console.warn(
                 `[configure] connection to ${new URL(url).origin} ${answered ? 'answered, but not as a panel' : 'failed'}: ` +
-                `${reason}${retrying ? '; trying https' : ''}`
+                `${reason}${next ? `; trying ${schemeOf(next.url)}` : ''}`
             );
-            if (retrying) continue;
+            if (next) continue;
             if (anyAnswered) return { valid: false, error: 'Not a valid xTremio server' };
             return {
                 valid: false,
@@ -3510,6 +3559,21 @@ async function readTextCapped(body, maxBytes) {
 // ignoring Range. So the header is decided by what the exchange demonstrated.
 const RANGE_UNIT = /^(?:bytes|none)$/i;
 
+// Every response that carries provider bytes gets these, in both branches of
+// relayUpstream. The content type is the panel's and is forwarded as sent, so a
+// panel could serve text/html from this origin: `nosniff` stops a body it
+// labelled something else being sniffed into one, and `sandbox` — with no
+// allow- tokens — puts anything that is HTML in an opaque origin with no
+// scripts, no forms and no top-level navigation (audit L8). The impact is small
+// because this site sets no cookies, but the panel is untrusted and this is two
+// headers. `no-store` rides along because it belongs to the same rule: nothing
+// relayed here is worth a cache's memory of it.
+function setRelayHeaders(res) {
+    res.setHeader('Cache-Control', 'no-store');
+    res.setHeader('X-Content-Type-Options', 'nosniff');
+    res.setHeader('Content-Security-Policy', 'sandbox');
+}
+
 function normalizeAcceptRanges({ status, upstreamValue, sentRange, sentIfRange }) {
     // A 206 is proof: the origin honoured a byte range in this very exchange.
     if (status === 206) return 'bytes';
@@ -3691,7 +3755,7 @@ async function relayUpstream(req, res, { upstreamUrl, label, ext, rewriteFor }) 
         // Deliberately not forwarding content-length: the rewritten body is a
         // different size. Nor accept-ranges — a playlist is not seekable.
         if (contentType) res.setHeader('Content-Type', contentType);
-        res.setHeader('Cache-Control', 'no-store');
+        setRelayHeaders(res);
         return res.end(Buffer.from(rewritten, 'utf8'));
     }
 
@@ -3732,7 +3796,7 @@ async function relayUpstream(req, res, { upstreamUrl, label, ext, rewriteFor }) 
         sentIfRange
     });
     if (acceptRanges) res.setHeader('Accept-Ranges', acceptRanges);
-    res.setHeader('Cache-Control', 'no-store');
+    setRelayHeaders(res);
 
     if (req.method === 'HEAD' || !upstream.body) {
         // A HEAD that fell back to GET above still has a body nobody will read.
@@ -4290,6 +4354,7 @@ if (require.main === module) {
     // Before binding a port: a production deploy with a weak or absent secret
     // should fail loudly at startup, not quietly issue forgeable install URLs.
     enforceConfigSecretPolicy();
+    warnOnUnpinnedBaseUrl();
     warnOnUndiciMismatch();
 
     // Only when actually serving: importing this module for tests should not
@@ -4349,6 +4414,7 @@ module.exports = {
     validateConfig,
     configSecretProblems,
     enforceConfigSecretPolicy,
+    warnOnUnpinnedBaseUrl,
     corsApplies,
     deriveConfigKey,
     CONFIG_TOKEN_VERSION,
@@ -4389,6 +4455,9 @@ module.exports = {
     statedContainerExt,
     isNotWebReady,
     normalizeAcceptRanges,
+    setRelayHeaders,
+    CONFIGURE_TIMEOUT_MS,
+    CONFIGURE_PROBE_TIMEOUT_MS,
     estimateBytes,
     CACHE_MAX_STREAM_BYTES,
     PLAYLIST_BODY_TIMEOUT_MS,

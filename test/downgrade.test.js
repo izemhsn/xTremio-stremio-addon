@@ -11,7 +11,9 @@ const {
     validateXtremioCredentials,
     describeDowngrade,
     schemeOf,
-    renderConfigPage
+    renderConfigPage,
+    CONFIGURE_TIMEOUT_MS,
+    CONFIGURE_PROBE_TIMEOUT_MS
 } = require('../index.js');
 
 const realFetch = global.fetch;
@@ -81,15 +83,73 @@ test('an https request that falls back to http is reported', async () => {
     assert.match(result.error, /http:\/\//, 'and the user is told how to choose http themselves');
 });
 
-test('without a scheme the fallback only ever tries https', async () => {
+test('without a scheme, https is tried before the password can go out in cleartext', async () => {
+    // Audit L9. This used to assert ['http', 'https']: the password went to the
+    // panel's cleartext port first and reached TLS only after that failed, so a
+    // panel supporting both never protected the one request that matters — and no
+    // warning afterwards takes a sent password back.
     const attempted = stubProvider({ works: ['https'] });
 
     const result = await validateXtremioCredentials('provider.test', 'u', 'p');
 
+    assert.deepStrictEqual(attempted, ['https'], 'nothing went out over http');
     assert.strictEqual(result.valid, true);
-    assert.deepStrictEqual(attempted, ['http', 'https']);
     assert.match(result.resolvedUrl, /^https:/);
     assert.strictEqual(result.downgrade, null);
+});
+
+test('a scheme-less URL still reaches an http-only panel, just second', async () => {
+    // The order is a preference, not a restriction. Most Xtream panels are http
+    // only, and they have to keep working for a user who typed no scheme.
+    const attempted = stubProvider({ works: ['http'] });
+
+    const result = await validateXtremioCredentials('provider.test', 'u', 'p');
+
+    assert.deepStrictEqual(attempted, ['https', 'http'], 'https first, then what works');
+    assert.strictEqual(result.valid, true);
+    assert.match(result.resolvedUrl, /^http:/, 'the panel that answered is the one baked into the token');
+    // Not a downgrade: they never asked for https, so there is nothing they lost.
+    assert.strictEqual(result.downgrade, null);
+});
+
+test('a typed http:// is still tried first, with https only as the upgrade', async () => {
+    // The scheme-less reordering must not second-guess a scheme the user typed.
+    const attempted = stubProvider({ works: ['http', 'https'] });
+
+    const result = await validateXtremioCredentials('http://provider.test', 'u', 'p');
+
+    assert.strictEqual(result.valid, true);
+    assert.deepStrictEqual(attempted, ['http'], 'what the user asked for is what is used');
+});
+
+test('the guessed scheme is bounded by the shorter deadline, not the full one', async () => {
+    // Trying https first costs nothing when it fails fast, but an http-only panel
+    // behind a firewalled 443 hangs instead — and that wait is paid by every
+    // scheme-less /configure. The attempt the user did not ask for gets the probe
+    // deadline; the one they did gets the full one.
+    assert.ok(
+        CONFIGURE_PROBE_TIMEOUT_MS < CONFIGURE_TIMEOUT_MS,
+        'a guess must not cost as much as a request the user actually made'
+    );
+
+    const deadlines = [];
+    const realSetTimeout = global.setTimeout;
+    global.setTimeout = (fn, ms, ...rest) => {
+        deadlines.push(ms);
+        return realSetTimeout(fn, ms, ...rest);
+    };
+    try {
+        stubProvider({ works: ['http'] });
+        await validateXtremioCredentials('provider.test', 'u', 'p');
+    } finally {
+        global.setTimeout = realSetTimeout;
+    }
+
+    // One timer per attempt, in attempt order: the https guess, then http.
+    const attemptDeadlines = deadlines.filter(
+        ms => ms === CONFIGURE_PROBE_TIMEOUT_MS || ms === CONFIGURE_TIMEOUT_MS
+    );
+    assert.deepStrictEqual(attemptDeadlines, [CONFIGURE_PROBE_TIMEOUT_MS, CONFIGURE_TIMEOUT_MS]);
 });
 
 test('https that works is never reported as downgraded', async () => {

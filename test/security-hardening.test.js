@@ -23,6 +23,7 @@ const {
     decodeConfig,
     configSecretProblems,
     enforceConfigSecretPolicy,
+    warnOnUnpinnedBaseUrl,
     corsApplies,
     deriveConfigKey,
     CONFIG_TOKEN_VERSION,
@@ -172,6 +173,56 @@ test('a production boot with a weak secret exits rather than serving', () => {
     assert.equal(code, 1, 'a production boot with a weak secret must exit 1');
     assert.match(output, /Refusing to start/);
     assert.doesNotMatch(output, /Addon running at/, 'it must not have bound a port');
+});
+
+// --- L7 (later audit): an install link built from an unpinned Host ----------
+//
+// With PUBLIC_URL unset the install link /configure hands out is built from the
+// request's Host, and SAFE_HOST only checks its shape. Any hostname an attacker
+// controls and points at this instance therefore mints install URLs carrying
+// that hostname; repointing its DNS later collects the config tokens users
+// installed. It is a warning rather than a refusal because a single-host
+// deployment behind a proxy that sets Host correctly is a legitimate setup.
+
+test('production without PUBLIC_URL is warned about', () => {
+    const log = collect();
+    assert.equal(warnOnUnpinnedBaseUrl({ publicUrl: null, production: true, log }), true);
+    assert.equal(log.entries.length, 1);
+    const [level, message] = log.entries[0];
+    assert.equal(level, 'warn', 'a warning, not a refusal');
+    assert.match(message, /PUBLIC_URL/);
+});
+
+test('a pinned base URL, or development, says nothing', () => {
+    // Warning in development would train operators to ignore it, and it is
+    // exactly where running on the request Host is normal.
+    for (const args of [
+        { publicUrl: 'https://addon.example', production: true },
+        { publicUrl: null, production: false },
+        { publicUrl: 'https://addon.example', production: false }
+    ]) {
+        const log = collect();
+        assert.equal(warnOnUnpinnedBaseUrl({ ...args, log }), false, JSON.stringify(args));
+        assert.deepEqual(log.entries, [], JSON.stringify(args));
+    }
+});
+
+test('a production boot without PUBLIC_URL warns and still serves', () => {
+    // As with the secret policy above: the check is only useful if the bootstrap
+    // calls it. The process is left running on purpose — the point is that this
+    // one does not exit — so it is stopped by the timeout.
+    const env = { ...process.env, NODE_ENV: 'production', CONFIG_SECRET: 'x'.repeat(48), PORT: '3196' };
+    delete env.PUBLIC_URL;
+
+    let output = '';
+    try {
+        output = execFileSync(process.execPath, [INDEX], { env, encoding: 'utf8', timeout: 3000 });
+    } catch (e) {
+        output = (e.stdout || '') + (e.stderr || '');
+        assert.notEqual(e.status, 1, 'a missing PUBLIC_URL must not stop the server starting');
+    }
+    assert.match(output, /PUBLIC_URL is not set/);
+    assert.match(output, /Addon running at/, 'it warned and carried on');
 });
 
 // --- L9: CORS scope --------------------------------------------------------

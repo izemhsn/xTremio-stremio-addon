@@ -86,6 +86,14 @@ function providerHandler(req, res) {
         return res.end('TS-BYTES-PAYLOAD');
     }
 
+    // A panel answering a stream request with an error page, which real ones do.
+    // It reaches the player as what it is; the L8 headers are what keep it from
+    // being rendered as a document on this addon's origin.
+    if (req.url === `/live/${creds}/12.ts`) {
+        res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8' });
+        return res.end('<script>alert(document.domain)</script>');
+    }
+
     // A media playlist whose segments are absolute and credential-bearing.
     if (req.url === `/live/${creds}/5.m3u8`) {
         return sendPlaylist([
@@ -626,4 +634,59 @@ test('the passthrough route still requires a valid config token', async () => {
     const res = await realFetch(`${base}/not-a-token/proxy/hls?u=${u}&s=${s}&e=${e}`);
     assert.strictEqual(res.status, 401);
     assert.deepStrictEqual(providerHits, []);
+});
+
+// --- L8 — relayed bytes are the provider's, served from this origin ---------
+//
+// The proxy forwards the panel's Content-Type as sent, so a panel could serve
+// text/html from this addon's origin and have a browser render it there. The
+// impact is bounded — the site sets no cookies and the relay carries no CORS
+// headers — but the panel is untrusted, and the two headers that close it cost
+// nothing. `nosniff` stops a body labelled something else being sniffed into a
+// document; `sandbox`, with no allow- tokens, gives anything that is one an
+// opaque origin with no scripts, no forms and no top-level navigation.
+
+test('a byte relay is marked unsniffable and sandboxed', async () => {
+    const res = await get('/proxy/live/5.ts');
+
+    assert.strictEqual(res.status, 200);
+    assert.strictEqual(res.headers.get('x-content-type-options'), 'nosniff');
+    assert.strictEqual(res.headers.get('content-security-policy'), 'sandbox');
+    assert.strictEqual(res.headers.get('cache-control'), 'no-store');
+});
+
+test('a rewritten playlist gets the same headers as a byte relay', async () => {
+    // The two branches answer from different code, and a header set in only one
+    // of them is the kind of gap that survives review.
+    const res = await get('/proxy/live/5.m3u8');
+
+    assert.strictEqual(res.status, 200);
+    assert.strictEqual(res.headers.get('x-content-type-options'), 'nosniff');
+    assert.strictEqual(res.headers.get('content-security-policy'), 'sandbox');
+    assert.strictEqual(res.headers.get('cache-control'), 'no-store');
+});
+
+test('the signed passthrough carries them too', async () => {
+    // Every segment and key a player fetches comes through this route, so it is
+    // the one a hostile body would most likely arrive on.
+    const playlist = await (await get('/proxy/live/5.m3u8')).text();
+    // A bare URI line, not the #EXT-X-KEY attribute that also carries one.
+    const link = playlist.split('\n').find(l => l.startsWith(base) && !l.startsWith('#'));
+    assert.ok(link, 'a segment line was rewritten');
+    const res = await realFetch(link);
+
+    assert.strictEqual(res.status, 200);
+    assert.strictEqual(res.headers.get('x-content-type-options'), 'nosniff');
+    assert.strictEqual(res.headers.get('content-security-policy'), 'sandbox');
+});
+
+test('an html body from the panel is still relayed, just not as a document', async () => {
+    // Not blocked: a panel that answers an error page has to reach the player as
+    // whatever it is. The headers are what make that safe, so the assertion is
+    // that the type survives *and* the headers came with it.
+    const res = await get('/proxy/live/12.ts');
+
+    assert.match(res.headers.get('content-type') || '', /text\/html/);
+    assert.strictEqual(res.headers.get('x-content-type-options'), 'nosniff');
+    assert.strictEqual(res.headers.get('content-security-policy'), 'sandbox');
 });
