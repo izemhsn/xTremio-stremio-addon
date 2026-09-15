@@ -15,7 +15,10 @@ const assert = require('node:assert');
 const {
     getAllVodStreams,
     vodStreamsCache,
-    CACHE_FAILURE_TTL
+    sweepCaches,
+    CACHE_TTL,
+    CACHE_FAILURE_TTL,
+    CACHE_STALE_MAX_AGE_MS
 } = require('../index.js');
 
 const realFetch = global.fetch;
@@ -90,8 +93,8 @@ test('a failed refresh serves the last good list instead of an empty shelf', asy
     assert.deepEqual(await getAllVodStreams(cfg), LIST, 'stale beats empty');
     assert.equal(calls, 1, 'the refresh was attempted');
 
-    // `ts` keeps the data's true age, so the ordinary age sweep still reclaims
-    // it — only the ttl moved, and only far enough to schedule the retry.
+    // `ts` keeps the data's true age — it is what CACHE_STALE_MAX_AGE_MS is
+    // measured against — and only the ttl moved, far enough to schedule the retry.
     const after = onlyEntry();
     assert.equal(after.ts, trueTs, 'ts must not be re-stamped');
     const servableFor = after.ts + after.ttl - Date.now();
@@ -105,4 +108,90 @@ test('a failure with nothing cached rejects rather than inventing an empty list'
     stubFetch([new Error('upstream down')]);
     await assert.rejects(() => getAllVodStreams(cfg), /upstream down/);
     assert.equal(vodStreamsCache.map.size, 0);
+});
+
+// --- L3 — the sweeper used to undo the stale fallback -----------------------
+//
+// The stale copy is kept alive by extending its ttl, but `ts` deliberately still
+// says how old the data is, and the map was swept on `ts` against the plain
+// 30-minute TTL. So the fallback lasted only until the next sweep — between 0
+// and CACHE_SWEEP_INTERVAL_MS — and after that an outage produced a hard error
+// instead of a slightly old shelf. "Stale beats empty" was true for a few
+// minutes at a time.
+
+// Age an entry by rewriting `ts`, the way real time would.
+function ageEntryBy(ms) {
+    const entry = onlyEntry();
+    entry.ts -= ms;
+    return entry;
+}
+
+test('a sweep leaves the stale copy an outage is being served from', async () => {
+    stubFetch([LIST]);
+    await getAllVodStreams(cfg);
+    ageEntryBy(CACHE_TTL + 1);
+
+    stubFetch([new Error('upstream down')]);
+    assert.deepEqual(await getAllVodStreams(cfg), LIST, 'stale beats empty');
+
+    // The sweep that used to end it. Its own return value must not count the
+    // entry either, or the operator reads a reclaim that did not happen.
+    const dropped = sweepCaches(Date.now());
+    assert.equal(dropped, 0, 'nothing was reclaimed');
+    assert.ok(onlyEntry(), 'the stale copy survived the sweep');
+
+    // And it is still served: within the retry window this is a cache hit, so
+    // the dead provider is not asked again on every request.
+    stubFetch([new Error('still down')]);
+    assert.deepEqual(await getAllVodStreams(cfg), LIST);
+    assert.equal(calls, 0, 'served from the stale copy without another upstream call');
+});
+
+test('an expired list nobody is falling back on is still reclaimed on the normal TTL', async () => {
+    // The other half of the rule: only an entry whose ttl was deliberately
+    // extended survives. A plain expired list is the largest thing in the cache
+    // and must not linger for a day just because catCache's entries may.
+    stubFetch([LIST]);
+    await getAllVodStreams(cfg);
+    ageEntryBy(CACHE_TTL + 1);
+
+    assert.equal(sweepCaches(Date.now()), 1, 'reclaimed');
+    assert.equal(vodStreamsCache.map.size, 0);
+});
+
+test('the stale window is bounded, so a provider that is gone stops being served', async () => {
+    stubFetch([LIST]);
+    await getAllVodStreams(cfg);
+    ageEntryBy(CACHE_STALE_MAX_AGE_MS + 1);
+
+    stubFetch([new Error('upstream down')]);
+    await assert.rejects(
+        () => getAllVodStreams(cfg),
+        /upstream down/,
+        'a day-old lineup is not worth serving; the route degrades instead'
+    );
+
+    // Nothing extended it, so the sweeper can now take it.
+    assert.equal(sweepCaches(Date.now()), 1);
+    assert.equal(vodStreamsCache.map.size, 0);
+});
+
+test('repeated failures extend the stale copy only up to the cap', async () => {
+    stubFetch([LIST]);
+    await getAllVodStreams(cfg);
+    // Just inside the window, with less than one retry interval left in it.
+    ageEntryBy(CACHE_STALE_MAX_AGE_MS - Math.round(CACHE_FAILURE_TTL / 2));
+
+    stubFetch([new Error('upstream down')]);
+    assert.deepEqual(await getAllVodStreams(cfg), LIST);
+
+    const entry = onlyEntry();
+    assert.equal(
+        entry.ttl, CACHE_STALE_MAX_AGE_MS,
+        'the extension is clamped, so the copy cannot outlive the cap by repeated retries'
+    );
+    assert.ok(
+        entry.ts + entry.ttl - Date.now() <= CACHE_FAILURE_TTL,
+        'and what is left of the window is shorter than a full retry interval'
+    );
 });

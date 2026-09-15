@@ -1594,11 +1594,20 @@ class BoundedMap extends Map {
 
     // Drops entries past maxAgeMs. Caches whose expired entries are still
     // useful (see catCache) pass a deliberately generous age, or none at all.
+    //
+    // An entry carrying its own ttl longer than maxAgeMs is reclaimed on that
+    // instead: the stale-on-failure path extends one deliberately so the list
+    // keeps being served through an outage, and sweeping it on the map's age
+    // silently undid that a few minutes later (audit L3). A *shorter* per-entry
+    // ttl never shortens the sweep — those entries stop being served on their
+    // own ttl and are reclaimed here on the map's, exactly as before — so this
+    // only ever keeps an entry that something deliberately asked to keep.
     sweep(now = Date.now()) {
         if (!this.maxAgeMs) return 0;
         let dropped = 0;
         for (const [key, entry] of this) {
-            if (entry && typeof entry.ts === 'number' && entry.ts <= now - this.maxAgeMs) {
+            const maxAge = Math.max(this.maxAgeMs, typeof entry?.ttl === 'number' ? entry.ttl : 0);
+            if (entry && typeof entry.ts === 'number' && entry.ts <= now - maxAge) {
                 super.delete(key);
                 this.totalBytes -= weightOf(entry);
                 if (this.ledger) this.ledger.remove(entry);
@@ -1767,9 +1776,11 @@ function createSingleFlight() {
 
 // Stream list caches - populated on first fetch, reused for catalogs, search and meta
 function createStreamListCache() {
-    // Expired entries here are never served as a fallback (`get` returns null
-    // once past the TTL), so they can be swept on the normal TTL — and these
-    // are by far the largest entries, so reclaiming them matters most.
+    // Swept on the normal TTL, not on CACHE_STALE_MAX_AGE_MS like catCache:
+    // these are by far the largest entries, so reclaiming an abandoned one
+    // matters most. The one entry that must outlive that is the stale copy an
+    // outage is being served from, and it says so itself by carrying a longer
+    // ttl, which sweep() honours (audit L3).
     const map = new BoundedMap({
         maxEntries: CACHE_MAX_STREAM_ACCOUNTS,
         maxAgeMs: CACHE_TTL,
@@ -1778,7 +1789,11 @@ function createStreamListCache() {
         // Evicting an unexpired list means the bounds are too tight for the load;
         // the advice names the bound that did it.
         onEvict(key, entry, reason) {
-            if (entry && entry.ts > Date.now() - CACHE_TTL) {
+            // Against the entry's own ttl, so evicting the stale copy an outage
+            // is being served from still reports — that is when the bounds bite
+            // hardest and when losing the list hurts most.
+            const inUseFor = Math.max(CACHE_TTL, entry?.ttl || 0);
+            if (entry && entry.ts > Date.now() - inUseFor) {
                 const knob = reason === 'global budget'
                     ? 'CACHE_MAX_MB'
                     : 'CACHE_MAX_STREAM_ACCOUNTS or CACHE_MAX_STREAM_MB';
@@ -1825,12 +1840,18 @@ function createStreamListCache() {
                     this.set(cfg, items);
                     return items;
                 } catch (e) {
-                    // A stale list beats an empty shelf. `ts` is not re-stamped, so
-                    // the age sweep still reclaims it; only the ttl moves, which
-                    // schedules the retry.
+                    // A stale list beats an empty shelf, for as long as the copy is
+                    // worth serving. `ts` is never re-stamped, so it keeps saying how
+                    // old the data really is; only the ttl moves, and only far enough
+                    // to schedule the next retry. Past CACHE_STALE_MAX_AGE_MS — the
+                    // same window catCache gives its own stale fallback — the copy is
+                    // abandoned and the failure is answered as one, so a provider that
+                    // is gone for good does not leave a day-old lineup on the shelf.
                     const stale = map.get(key);
                     if (!stale || !Array.isArray(stale.data) || !stale.data.length) throw e;
-                    stale.ttl = (Date.now() - stale.ts) + CACHE_FAILURE_TTL;
+                    const age = Date.now() - stale.ts;
+                    if (age >= CACHE_STALE_MAX_AGE_MS) throw e;
+                    stale.ttl = Math.min(age + CACHE_FAILURE_TTL, CACHE_STALE_MAX_AGE_MS);
                     console.warn(
                         `[cache] upstream list failed (${e.message}); serving ${stale.data.length} ` +
                         `stale items, retrying in ${CACHE_FAILURE_TTL / 1000}s`
