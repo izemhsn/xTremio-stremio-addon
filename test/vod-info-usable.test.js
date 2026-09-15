@@ -19,6 +19,7 @@ const {
     statedContainerExt,
     normalizeContainerExt,
     vodInfoCache,
+    vodStreamsCache,
     seriesInfoCache
 } = require('../index.js');
 
@@ -63,6 +64,7 @@ test.after(async () => {
 
 test.beforeEach(() => {
     vodInfoCache.map.clear();
+    vodStreamsCache.map.clear();
     seriesInfoCache.clear();
     vodAnswers = [HEAT];
     seriesAnswer = null;
@@ -133,6 +135,55 @@ test('a movie stream with a guessed container is served but not cacheable', asyn
     const stated = await get('/stream/XT-Movies/xtremio_movie_7.json');
     assert.match(stated.body.streams[0].url, /\/proxy\/movie\/7\.mkv$/);
     assert.equal(stated.headers.get('cache-control'), 'private, max-age=3600');
+});
+
+// --- audit M2: the warm movie list stands in for a failed get_vod_info ---------
+
+const LISTED = { stream_id: 7, name: 'Heat', stream_icon: 'http://img.test/heat.jpg', rating: '8.1', container_extension: 'mkv' };
+
+test('a failed get_vod_info still plays a movie the warm list names', async () => {
+    vodStreamsCache.set(CFG_ARGS, [{ stream_id: 3, name: 'Other' }, LISTED]);
+    vodAnswers = [{}];
+
+    const stream = await get('/stream/XT-Movies/xtremio_movie_7.json');
+    assert.match(stream.body.streams[0].url, /\/proxy\/movie\/7\.mkv$/, 'the list item names the container');
+    assert.equal(stream.headers.get('cache-control'), 'no-store', 'a stand-in answer is not cached');
+    assert.equal(countOf('get_vod_streams'), 0, 'the fallback must never fetch the full list');
+});
+
+test('a failed get_vod_info still gives a listed movie a page', async () => {
+    vodStreamsCache.set(CFG_ARGS, [LISTED]);
+    vodAnswers = [{}];
+
+    const meta = await get('/meta/XT-Movies/xtremio_movie_7.json');
+    assert.deepEqual(meta.body.meta, {
+        id: 'xtremio_movie_7',
+        type: 'XT-Movies',
+        name: 'Heat',
+        poster: 'http://img.test/heat.jpg',
+        posterShape: 'poster',
+        imdbRating: '8.1'
+    });
+    assert.equal(meta.headers.get('cache-control'), 'no-store');
+    assert.equal(vodInfoCache.map.size, 0);
+});
+
+test('info without a container borrows the list item\'s, uncached', async () => {
+    vodStreamsCache.set(CFG_ARGS, [LISTED]);
+    vodAnswers = [{ info: { name: 'Heat' }, movie_data: [] }];
+
+    const stream = await get('/stream/XT-Movies/xtremio_movie_7.json');
+    assert.match(stream.body.streams[0].url, /\/proxy\/movie\/7\.mkv$/);
+    assert.equal(stream.headers.get('cache-control'), 'no-store');
+});
+
+test('a movie the warm list does not name still gets nothing', async () => {
+    // The fallback serves only what the provider listed; an unknown id stays unknown.
+    vodStreamsCache.set(CFG_ARGS, [{ stream_id: 3, name: 'Other', container_extension: 'mkv' }]);
+    vodAnswers = [{}];
+
+    assert.deepEqual((await get('/stream/XT-Movies/xtremio_movie_7.json')).body, { streams: [] });
+    assert.deepEqual((await get('/meta/XT-Movies/xtremio_movie_7.json')).body, { meta: null });
 });
 
 test('an episode stream with a guessed container is served but not cacheable', async () => {

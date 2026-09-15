@@ -346,9 +346,13 @@ async function getManifest(cfg = null) {
         // `isRequired: true` as "the client must supply one of these options",
         // so a required genre with an empty list is a catalog nobody can open —
         // strictly worse than the plain catalog it was meant to degrade into.
+        // No `search`: Stremio searches every catalog whose only required extra is
+        // search, so a degraded manifest put all seven shelves into search beside
+        // the two search catalogs — duplicate rows, each rescanning the lists
+        // (audit M3). With a required genre it was unreachable anyway.
         const genreExtra = (genres) => (genres.length
-            ? [{ name: 'genre', options: genres, isRequired: true }, { name: 'skip' }, { name: 'search' }]
-            : [{ name: 'skip' }, { name: 'search' }]);
+            ? [{ name: 'genre', options: genres, isRequired: true }, { name: 'skip' }]
+            : [{ name: 'skip' }]);
 
         // One row per catalog, so the rule cannot apply to some and miss others
         // — which is how the empty-options bug survived in the first place:
@@ -1390,8 +1394,19 @@ const CACHE_FAILURE_TTL = 60 * 1000;
 
 // Keys must include credentials so two users on the same Xtream host don't
 // share cached catalogs/streams (different accounts can see different content).
+// Keyed by the panel's origin, not the URL as typed: every upstream URL is built
+// from an absolute path, so `http://PANEL.x:80/a?b` reaches the same account as
+// `http://panel.x`, and keying on the spelling gave one account a fresh relay
+// budget and a second copy of its lists per variant (audit M1). JSON rather than
+// a separator, which a username or password could contain (audit L11).
 function accountCacheKey(cfg) {
-    return `${cfg.serverUrl}\n${cfg.username}\n${cfg.password}`;
+    let server = cfg.serverUrl;
+    try {
+        server = new URL(normalizeUrl(cfg.serverUrl)).origin;
+    } catch {
+        // Unparseable: no request can reach it either, so the raw string is as good a key.
+    }
+    return JSON.stringify([server, cfg.username, cfg.password]);
 }
 
 // One memory budget shared by every data cache (CACHE_MAX_MB, audit R2): the
@@ -1845,20 +1860,21 @@ const seriesStreamsCache = createStreamListCache();
 // `{ day, views }`; see sortedCatalogItems.
 const sortedCatalogViews = new WeakMap();
 
-// stream_id -> item for a cached live list, so opening a channel is a lookup
-// rather than a scan. Keyed by the list's identity, like sortedCatalogViews, so a
-// refetch invalidates it and an evicted list takes its index with it.
-const liveStreamIndexes = new WeakMap();
+// stream_id -> item for a cached live or movie list, so opening a channel or
+// falling back from get_vod_info is a lookup rather than a scan. Keyed by the
+// list's identity, like sortedCatalogViews, so a refetch invalidates it and an
+// evicted list takes its index with it.
+const streamIdIndexes = new WeakMap();
 
-function findLiveStream(list, streamId) {
-    let index = liveStreamIndexes.get(list);
+function findStreamById(list, streamId) {
+    let index = streamIdIndexes.get(list);
     if (!index) {
         index = new Map();
         for (const item of list) {
             const id = String(item?.stream_id);
             if (!index.has(id)) index.set(id, item);
         }
-        liveStreamIndexes.set(list, index);
+        streamIdIndexes.set(list, index);
     }
     return index.get(String(streamId)) || null;
 }
@@ -2198,6 +2214,14 @@ function getVodInfo(cfg, vodId) {
         if (!isUsableVodInfo(info)) throw new Error(`get_vod_info returned no usable data for movie ${vodId}`);
         return info;
     });
+}
+
+// This movie's item in the warm full list, or null. Never fetches: it is the
+// fallback for when get_vod_info fails, and a cold list costs seconds. The item
+// usually names the container, which is all the stream route needs (audit M2).
+function warmVodItem(cfg, vodId) {
+    const list = vodStreamsCache.get(cfg);
+    return Array.isArray(list) ? findStreamById(list, vodId) : null;
 }
 
 function schemeOf(url) {
@@ -3098,7 +3122,7 @@ app.get('/:config/meta/:type/:id.json', async (req, res) => {
         if (id.startsWith('xtremio_live_')) {
             const streamId = getPrefixedNumericId(id, 'xtremio_live_');
             if (!streamId) return res.status(400).json({ meta: null });
-            const s = findLiveStream(await getAllLiveStreams(cfg), streamId);
+            const s = findStreamById(await getAllLiveStreams(cfg), streamId);
 
             if (!s) return res.json({ meta: null });
             const meta = {
@@ -3116,7 +3140,27 @@ app.get('/:config/meta/:type/:id.json', async (req, res) => {
         if (id.startsWith('xtremio_movie_')) {
             const streamId = getPrefixedNumericId(id, 'xtremio_movie_');
             if (!streamId) return res.status(400).json({ meta: null });
-            const info = await getVodInfo(cfg, streamId);
+            let info;
+            try {
+                info = await getVodInfo(cfg, streamId);
+            } catch (e) {
+                // A movie the catalog lists is still worth a page when its details
+                // fail: name and poster from the list, served no-store so the full
+                // meta replaces it once get_vod_info answers (audit M2).
+                const item = isProgrammingError(e) ? null : warmVodItem(cfg, streamId);
+                if (!item) throw e;
+                console.warn(`[meta] get_vod_info failed for movie ${streamId} (${e.message}); serving the catalog item`);
+                return res.json({
+                    meta: {
+                        id: `xtremio_movie_${streamId}`,
+                        type: 'XT-Movies',
+                        name: titleOf(item.name) || 'Unknown',
+                        poster: item.stream_icon || undefined,
+                        posterShape: 'poster',
+                        imdbRating: ratingOf(item.rating)
+                    }
+                });
+            }
             const movie = info?.info ?? info ?? {};
             const cast = splitList(movie.cast);
             const backdrop = pickBackdrop(movie.backdrop_path);
@@ -3276,13 +3320,30 @@ app.get('/:config/stream/:type/:id.json', async (req, res) => {
         if (id.startsWith('xtremio_movie_')) {
             const streamId = getPrefixedNumericId(id, 'xtremio_movie_');
             if (!streamId) return res.status(400).json({ streams: [] });
-            const info = await getVodInfo(cfg, streamId);
-            const rawExt = info?.movie_data?.container_extension;
+            // The stream needs only the container, and the warm full list usually
+            // names it, so a failed or container-less get_vod_info no longer means
+            // "No streams" for a file the proxy would serve (audit M2).
+            let info = null;
+            try {
+                info = await getVodInfo(cfg, streamId);
+            } catch (e) {
+                if (isProgrammingError(e) || !warmVodItem(cfg, streamId)) throw e;
+                console.warn(`[stream] get_vod_info failed for movie ${streamId} (${e.message}); using the catalog item's container`);
+            }
+            let rawExt = info?.movie_data?.container_extension;
+            let fromList = false;
+            if (statedContainerExt(rawExt) === null) {
+                const listExt = warmVodItem(cfg, streamId)?.container_extension;
+                if (statedContainerExt(listExt) !== null) {
+                    rawExt = listExt;
+                    fromList = true;
+                }
+            }
             const ext = normalizeContainerExt(rawExt);
             const extStated = statedContainerExt(rawExt) !== null;
             const proxyUrl = `${getBaseUrl(req)}/${req.params.config}/proxy/movie/${streamId}.${ext}`;
-            // Cacheable, since the proxy URL is stable — but only when the
-            // provider named the container, not when mp4 was guessed.
+            // Cacheable, since the proxy URL is stable — but only when get_vod_info
+            // named the container, not when mp4 was guessed or the list stood in.
             return res.json({
                 streams: [
                     {
@@ -3294,7 +3355,7 @@ app.get('/:config/stream/:type/:id.json', async (req, res) => {
                         }
                     }
                 ],
-                ...(extStated ? withCacheHints(res, 3600) : {})
+                ...(extStated && !fromList && info ? withCacheHints(res, 3600) : {})
             });
         }
 
