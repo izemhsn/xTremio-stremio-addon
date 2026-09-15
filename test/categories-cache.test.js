@@ -143,3 +143,31 @@ test('cache entries are keyed by credentials, not just server URL', async () => 
     await getCategories(b);
     assert.ok(calls.length > callsAfterA, 'a second account must not reuse the first account cache');
 });
+
+test('one account is one key however its server URL is spelled (audit M1)', () => {
+    // Upstream URLs are built from absolute paths, so only the origin reaches the
+    // panel; each spelling used to be a separate account with its own relay budget.
+    const key = (serverUrl) => accountCacheKey({ serverUrl, username: 'alice', password: 'pw' });
+    const canonical = key('http://panel.example.com');
+    for (const spelling of [
+        'http://PANEL.example.com',
+        'http://panel.example.com:80',
+        'http://panel.example.com/',
+        'http://panel.example.com/x',
+        'http://panel.example.com/?x=1',
+        'panel.example.com'
+    ]) {
+        assert.strictEqual(key(spelling), canonical, spelling);
+    }
+    // What does reach the panel still separates accounts.
+    assert.notStrictEqual(key('https://panel.example.com'), canonical);
+    assert.notStrictEqual(key('http://panel.example.com:8080'), canonical);
+});
+
+test('credentials containing the old separator cannot collide (audit L11)', () => {
+    const serverUrl = 'http://panel.example.com';
+    assert.notStrictEqual(
+        accountCacheKey({ serverUrl, username: 'u\np', password: 'q' }),
+        accountCacheKey({ serverUrl, username: 'u', password: 'p\nq' })
+    );
+});

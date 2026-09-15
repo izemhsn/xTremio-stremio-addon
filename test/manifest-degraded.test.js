@@ -119,9 +119,10 @@ test('total category failure still advertises all nine catalogs, without genres'
         const catalog = manifest.catalogs.find(c => c.id === id);
         assert.ok(catalog, `${id} is missing`);
         assert.equal(genreOf(catalog), undefined, `${id} still offers a genre`);
-        // skip and search survive: paginating and searching do not need a genre,
-        // and dropping them would take working features away with the broken one.
-        assert.deepEqual((catalog.extra || []).map(e => e.name), ['skip', 'search'], id);
+        // skip survives: paginating does not need a genre. search does not: a
+        // catalog whose only optional extra is search joins Stremio's global
+        // search, so seven shelves would duplicate the two search catalogs (M3).
+        assert.deepEqual((catalog.extra || []).map(e => e.name), ['skip'], id);
     }
 });
 
@@ -165,8 +166,24 @@ test('a healthy provider is unchanged', async () => {
     });
     assert.deepEqual(
         (manifest.catalogs.find(c => c.id === 'xtremio_movies_new').extra || []).map(e => e.name),
-        ['genre', 'skip', 'search']
+        ['genre', 'skip']
     );
+});
+
+test('only the two search catalogs are searchable, degraded or not', async () => {
+    // Stremio's global search queries every catalog that declares `search` and
+    // requires no other extra. Anything beyond the two search catalogs shows up
+    // as a duplicate row and rescans the same lists (audit M3).
+    for (const working of [[], ['vod'], ['live', 'vod', 'series']]) {
+        clearCaches();
+        stubProvider({ working });
+        const manifest = await getManifest(CFG_ARGS);
+        const searchable = manifest.catalogs
+            .filter(c => (c.extra || []).some(e => e.name === 'search'))
+            .filter(c => !(c.extra || []).some(e => e.name !== 'search' && e.isRequired))
+            .map(c => c.id);
+        assert.deepEqual(searchable, ['xtremio_search_movies', 'xtremio_search_series'], `working=[${working}]`);
+    }
 });
 
 test('the manifest keeps its catalog order', async () => {

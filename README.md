@@ -197,7 +197,7 @@ length of a file.
 | **XT-Movies** | 3 + Search | Popular (rating), New (recently added), Featured (day-seeded shuffle) |
 | **XT-Series** | 3 + Search | Popular, New, Featured |
 
-Each per-genre catalog supports genre filtering, pagination (100 items/page), and local name search. The two **Search** catalogs hook into Stremio's global search and query across all categories.
+Each per-genre catalog supports genre filtering and pagination (100 items/page). Searching is done through the two **Search** catalogs, which hook into Stremio's global search and query across all categories.
 
 ### Meta & Streams
 

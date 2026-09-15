@@ -177,6 +177,22 @@ test('a fresh token for the same credentials shares one budget', async () => {
     for (const r of relays) r.controller.abort();
 });
 
+test('a different spelling of the server URL shares one budget (audit M1)', async () => {
+    // The budget was keyed on the URL as typed, so a path or query nothing upstream
+    // ever sees bought a whole second allowance: 32 relays against a cap of 16.
+    const respelled = encodeConfig({ serverUrl: `${providerBase}/x?y=1`, username: 'alice', password: 'secret' });
+
+    const relays = Array.from({ length: CAP }, () => startRelay());
+    await Promise.all(relays.map(r => r.done));
+    await whenHeld(CAP);
+
+    const over = await fetch(`${base}/${respelled}/proxy/movie/9.mp4`);
+    assert.equal(over.status, 429, 're-spelling the server URL bought a fresh allowance');
+    await over.text();
+
+    for (const r of relays) r.controller.abort();
+});
+
 test('the signed sub-resource route is capped too', async () => {
     // The HLS route is the one that serves live segments, so leaving it uncapped
     // would leave the cap off for the traffic that runs continuously.
