@@ -152,3 +152,68 @@ test('anything unparseable is refused rather than allowed', () => {
         assert.equal(isPrivateIp(value), true, `${JSON.stringify(value)} must not be treated as public`);
     }
 });
+
+// --- L4 — three ranges that still read as public ---------------------------
+//
+// The audit found the numeric rewrite above had closed the string-prefix gaps
+// but left three holes: RFC 8215's local-use NAT64 prefix, the deprecated
+// IPv4-compatible form, and Teredo. Each is a way to name an internal address
+// in a spelling the table did not recognise.
+
+test('local-use NAT64 (64:ff9b:1::/48) is blocked whole', () => {
+    // RFC 8215 set this prefix aside for translation inside a single network,
+    // so it is local by definition — unlike the well-known 64:ff9b::/96 above,
+    // there is no embedded public address worth letting through. The /48 is
+    // also why it cannot be decided by the embedded IPv4: where that address
+    // sits depends on the translation prefix length.
+    const blocked = [
+        ['64:ff9b:1::a9fe:a9fe', 'the metadata endpoint, translated locally'],
+        ['64:ff9b:1::7f00:1', 'loopback, translated locally'],
+        ['64:ff9b:1::', 'bottom of the prefix'],
+        ['64:ff9b:1:ffff:ffff:ffff:ffff:ffff', 'top of the /48'],
+        ['64:ff9b:1:0:8.8.8.8::', 'a public IPv4 inside it is still local-use']
+    ];
+    for (const [ip, what] of blocked) {
+        assert.equal(isPrivateIp(ip), true, `${ip} (${what}) must be blocked`);
+    }
+    // The well-known prefix keeps its embedded-address rule, and the neighbours
+    // of the /48 stay reachable.
+    assert.equal(isPrivateIp('64:ff9b::8.8.8.8'), false, 'NAT64 to a public address stays reachable');
+    assert.equal(isPrivateIp('64:ff9b:2::1'), false, 'just above the local-use /48');
+});
+
+test('IPv4-compatible addresses (::/96) are blocked whole', () => {
+    // RFC 4291 deprecated the format outright, so nothing legitimate is reached
+    // through it — while `::127.0.0.1` is still loopback to anything that
+    // accepts one. Blocked rather than judged by the address it embeds, which
+    // is the one place this table departs from the wrapper rule.
+    const blocked = [
+        ['::127.0.0.1', 'loopback, IPv4-compatible'],
+        ['::169.254.169.254', 'the metadata endpoint, IPv4-compatible'],
+        ['::8.8.8.8', 'a public address in a deprecated wrapper is still refused'],
+        ['::', 'unspecified, now covered by the /96'],
+        ['::1', 'loopback, now covered by the /96'],
+        ['::ffff', 'top of the first /112']
+    ];
+    for (const [ip, what] of blocked) {
+        assert.equal(isPrivateIp(ip), true, `${ip} (${what}) must be blocked`);
+    }
+    // v4-mapped sits at ::ffff:0:0/96 and is unaffected: it is still decided by
+    // the IPv4 it carries, so a real provider reached that way stays reachable.
+    assert.equal(isPrivateIp('::ffff:8.8.8.8'), false, 'v4-mapped public must stay reachable');
+    assert.equal(isPrivateIp('::ffff:127.0.0.1'), true, 'v4-mapped loopback must stay blocked');
+    assert.equal(isPrivateIp('::1:0:0'), false, 'just above ::/96');
+});
+
+test('Teredo (2001::/32) is blocked, and its neighbours are not', () => {
+    // A Teredo address is a tunnel endpoint inside someone else's network, and
+    // the IPv4 it carries is obfuscated rather than plainly embedded.
+    for (const ip of ['2001::1', '2001:0:5ef5:79fb:8000:1:ac10:1', '2001:0:ffff:ffff:ffff:ffff:ffff:ffff']) {
+        assert.equal(isPrivateIp(ip), true, `${ip} is Teredo and must be blocked`);
+    }
+    // The /32 is narrow on purpose: 2001::/23 holds real allocations, and
+    // blocking a provider's address would be the worse and quieter bug.
+    for (const ip of ['2001:1::1', '2001:4860:4860::8888', '2001:db8::1', '2000::1']) {
+        assert.equal(isPrivateIp(ip), false, `${ip} must stay reachable`);
+    }
+});

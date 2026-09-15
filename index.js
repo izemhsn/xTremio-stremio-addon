@@ -920,8 +920,14 @@ function ipv6MatchesPrefix(bytes, prefixBytes, bits) {
 }
 
 const IPV6_PRIVATE_PREFIXES = [
-    ['::', 128],             // unspecified
-    ['::1', 128],            // loopback
+    // ::/96 covers the unspecified address, loopback, and the deprecated
+    // IPv4-compatible form (audit L4). Unlike the wrappers below it is blocked
+    // whole rather than judged by the IPv4 it embeds: RFC 4291 deprecated the
+    // format outright, so nothing legitimate is reached through it, while
+    // `::127.0.0.1` is loopback on any host that still accepts one.
+    ['::', 96],
+    ['64:ff9b:1::', 48],     // local-use NAT64 (RFC 8215) — local by definition
+    ['2001::', 32],          // Teredo, a tunnel into someone else's network
     ['fc00::', 7],           // unique local (fc00–fdff)
     ['fe80::', 10],          // link-local (fe80–febf) — the old check saw 1/64 of this
     ['fec0::', 10],          // site-local, deprecated but still routed on some networks
@@ -1374,6 +1380,32 @@ function splitList(value) {
     if (!value) return [];
     if (Array.isArray(value)) return value.map(v => String(v).trim()).filter(Boolean);
     return String(value).split(',').map(v => v.trim()).filter(Boolean);
+}
+
+// Stremio has no `trailer` meta field: a trailer is an entry in `trailers`,
+// `{ source, type }`, where source is the YouTube video id — so the old key was
+// simply ignored and the button never appeared (audit L2). Panels put either a
+// bare id or a watch/share URL in `youtube_trailer`, and both are accepted.
+// Anything that does not reduce to an id is dropped rather than passed on: a
+// trailer button that cannot play is worse than no button.
+const YOUTUBE_ID = /^[A-Za-z0-9_-]{11}$/;
+
+function youtubeTrailers(value) {
+    const raw = String(value || '').trim();
+    if (!raw) return undefined;
+    let id = raw;
+    if (raw.includes('/')) {
+        id = '';
+        // Panels store these without a scheme as often as with one.
+        for (const candidate of [raw, `https://${raw}`]) {
+            try {
+                const url = new URL(candidate);
+                id = url.searchParams.get('v') || url.pathname.split('/').filter(Boolean).pop() || '';
+                break;
+            } catch { /* not a URL in this spelling; try the next */ }
+        }
+    }
+    return YOUTUBE_ID.test(id) ? [{ source: id, type: 'Trailer' }] : undefined;
 }
 
 // `backdrop_path` can be an array of URLs or a single URL string.
@@ -2956,6 +2988,33 @@ function uniqueById(items, idField) {
 // 'all', or the categories — every one that shares the genre's name. The sorted
 // view is keyed on it rather than on the genre the request carried, because the
 // no-categories path ignores that genre.
+
+// "no categories" is a fact about an account and a kind, but selectCatalogSource
+// runs on every catalog request, so an account whose category calls are failing
+// wrote the same line for every shelf the client opened — dozens per refresh, and
+// the interesting lines around them scrolled away (audit L6). Once per account and
+// kind per interval says exactly as much. Bounded and evicted oldest-first,
+// because the accounts come from install URLs rather than from configuration:
+// dropping an entry only re-arms its warning, which is the safe direction.
+const DEGRADED_CATALOG_LOG_INTERVAL_MS = 10 * 60 * 1000;
+const DEGRADED_CATALOG_LOG_MAX = 1000;
+const degradedCatalogLogged = new Map();
+
+function noteDegradedCatalog(cfg, categoryKey, now = Date.now()) {
+    const key = JSON.stringify([accountCacheKey(cfg), categoryKey]);
+    const last = degradedCatalogLogged.get(key);
+    if (last !== undefined && now - last < DEGRADED_CATALOG_LOG_INTERVAL_MS) return false;
+    // Re-inserting moves the key to the end, so the eviction below is least
+    // recently warned rather than first ever seen.
+    degradedCatalogLogged.delete(key);
+    if (degradedCatalogLogged.size >= DEGRADED_CATALOG_LOG_MAX) {
+        degradedCatalogLogged.delete(degradedCatalogLogged.keys().next().value);
+    }
+    degradedCatalogLogged.set(key, now);
+    console.warn(`[catalog] no ${categoryKey} categories for this account; serving the full list`);
+    return true;
+}
+
 async function selectCatalogSource(cfg, kind, genre) {
     const cats = await getCategories(cfg);
     const categories = cats[kind.categoryKey] || [];
@@ -2965,7 +3024,7 @@ async function selectCatalogSource(cfg, kind, genre) {
     // is no category for the genre to resolve to; the full list is the honest
     // answer, and it is the same list search already uses.
     if (!categories.length) {
-        console.warn(`[catalog] no ${kind.categoryKey} categories; serving the full list`);
+        noteDegradedCatalog(cfg, kind.categoryKey);
         const all = await kind.loadAll(cfg);
         return { items: all, source: all, selection: 'all' };
     }
@@ -3062,7 +3121,10 @@ app.get(['/:config/catalog/:type/:id.json', '/:config/catalog/:type/:id/:extra.j
     const types = catalogTypesFor(id);
     if (!types) return res.json({ metas: [] });
     if (!types.includes(type)) {
-        console.warn(`[catalog] type/id mismatch: type=${type} id=${id}`);
+        // Quoted, here and in meta and stream: both values come straight from the
+        // path, and a %0A in :type let a caller write its own log line (audit L1).
+        // JSON.stringify escapes the newline and makes the boundaries visible.
+        console.warn(`[catalog] type/id mismatch: type=${JSON.stringify(type)} id=${JSON.stringify(id)}`);
         return res.json({ metas: [] });
     }
 
@@ -3111,10 +3173,10 @@ app.get('/:config/meta/:type/:id.json', async (req, res) => {
     const cfg = decodeConfig(req.params.config);
     if (!cfg) return res.json({ meta: null });
     const { id, type } = req.params;
-    if (LOG_REQUESTS) console.log(`[meta] type=${type} id=${id}`);
+    if (LOG_REQUESTS) console.log(`[meta] type=${JSON.stringify(type)} id=${JSON.stringify(id)}`);
 
     if (!typeMatchesId(type, id)) {
-        console.warn(`[meta] type/id mismatch: type=${type} id=${id}`);
+        console.warn(`[meta] type/id mismatch: type=${JSON.stringify(type)} id=${JSON.stringify(id)}`);
         return res.status(404).json({ meta: null });
     }
 
@@ -3176,12 +3238,12 @@ app.get('/:config/meta/:type/:id.json', async (req, res) => {
                 releaseInfo: movie.releasedate ? String(movie.releasedate) : undefined,
                 genres: splitList(movie.genre),
                 runtime: movie.duration ? String(movie.duration) + ' min' : (movie.episode_run_time ? String(movie.episode_run_time) + ' min' : undefined),
-                director: movie.director || undefined,
+                director: splitList(movie.director),
                 cast,
                 imdbRating: ratingOf(movie.rating),
                 year: parseYear(movie.releasedate),
                 country: movie.country || undefined,
-                trailer: movie.youtube_trailer || undefined
+                trailers: youtubeTrailers(movie.youtube_trailer)
             };
             return res.json({ meta, ...withCacheHints(res, 86400) });
         }
@@ -3257,7 +3319,7 @@ app.get('/:config/meta/:type/:id.json', async (req, res) => {
                 releaseInfo: series.releaseDate ? String(series.releaseDate) : undefined,
                 genres: splitList(series.genre),
                 runtime: series.episode_run_time ? String(series.episode_run_time) + ' min' : undefined,
-                director: series.director || undefined,
+                director: splitList(series.director),
                 cast,
                 imdbRating: ratingOf(series.rating),
                 year: parseYear(series.releaseDate),
@@ -3279,10 +3341,10 @@ app.get('/:config/stream/:type/:id.json', async (req, res) => {
     const cfg = decodeConfig(req.params.config);
     if (!cfg) return res.json({ streams: [] });
     const { id, type } = req.params;
-    if (LOG_REQUESTS) console.log(`[stream] type=${type} id=${id}`);
+    if (LOG_REQUESTS) console.log(`[stream] type=${JSON.stringify(type)} id=${JSON.stringify(id)}`);
 
     if (!typeMatchesId(type, id)) {
-        console.warn(`[stream] type/id mismatch: type=${type} id=${id}`);
+        console.warn(`[stream] type/id mismatch: type=${JSON.stringify(type)} id=${JSON.stringify(id)}`);
         return res.status(404).json({ streams: [] });
     }
 
@@ -4258,6 +4320,9 @@ module.exports = {
     UPSTREAM_BODY_TIMEOUT_MS,
     isProgrammingError,
     noteUndecodableToken,
+    noteDegradedCatalog,
+    degradedCatalogLogged,
+    DEGRADED_CATALOG_LOG_INTERVAL_MS,
     undecodableTokens,
     UNDECODABLE_REPORT_INTERVAL_MS,
     validateConfig,
@@ -4348,6 +4413,7 @@ module.exports = {
     parseYear,
     toIsoDate,
     splitList,
+    youtubeTrailers,
     pickBackdrop,
     isUsableSeriesInfo,
     isUsableVodInfo,
