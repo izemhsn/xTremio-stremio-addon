@@ -21,7 +21,8 @@ const {
     setShuttingDown,
     KEEPALIVE_TIMEOUT_MS,
     HEADERS_TIMEOUT_MS,
-    REQUEST_TIMEOUT_MS
+    REQUEST_TIMEOUT_MS,
+    HEALTH_MAX_EVENT_LOOP_LAG_MS
 } = require('../index.js');
 
 const quietLog = { log() {}, warn() {} };
@@ -195,6 +196,52 @@ test('/health reports ok, then unhealthy once draining', async (t) => {
     assert.equal(res.status, 503, 'a draining instance must fail its health check');
     body = await res.json();
     assert.equal(body.status, 'shutting_down');
+});
+
+// Liveness alone said only that the process was running, which on this server is
+// nearly always true and nearly never the question: the thread that answers this
+// route is the thread that parses catalogs and relays video.
+test('/health reports event-loop lag, and a stalled loop fails the check', async (t) => {
+    const server = await new Promise(resolve => {
+        const s = app.listen(0, '127.0.0.1', () => resolve(s));
+    });
+    const base = `http://127.0.0.1:${server.address().port}`;
+    t.after(async () => { await new Promise(r => server.close(r)); });
+
+    // A healthy instance reports a number and stays healthy. The idle floor is the
+    // platform's timer granularity — 15.6 ms on Windows — so this asserts a
+    // plausible reading rather than a small one.
+    let body = await (await fetch(`${base}/health`)).json();
+    assert.equal(typeof body.eventLoopLagMs, 'number', 'the reading must be reported');
+    assert.equal(typeof body.eventLoopLagMeanMs, 'number');
+    assert.ok(body.eventLoopLagMs >= 0 && body.eventLoopLagMs < HEALTH_MAX_EVENT_LOOP_LAG_MS,
+        `an idle instance reported ${body.eventLoopLagMs}ms of lag`);
+
+    // Block the loop for longer than the threshold. Deferred by a timer so the
+    // block lands in its own tick: run inline, it would finish before the
+    // histogram's timer re-armed and go unrecorded, which is how the first
+    // attempt at this test measured nothing at all.
+    await new Promise(resolve => setTimeout(resolve, 20));
+    await new Promise(resolve => {
+        setTimeout(() => {
+            const until = Date.now() + HEALTH_MAX_EVENT_LOOP_LAG_MS + 300;
+            while (Date.now() < until) { /* deliberately blocking */ }
+            resolve();
+        }, 20);
+    });
+
+    const res = await fetch(`${base}/health`);
+    assert.equal(res.status, 503, 'a loop blocked past the threshold is not ready');
+    body = await res.json();
+    assert.equal(body.status, 'stalled');
+    assert.ok(body.eventLoopLagMs > HEALTH_MAX_EVENT_LOOP_LAG_MS,
+        `reported ${body.eventLoopLagMs}ms after blocking for longer than that`);
+
+    // The window is reset per read, so the next probe is healthy again rather than
+    // pinned by a spike that has passed.
+    const after = await fetch(`${base}/health`);
+    assert.equal(after.status, 200, 'the stall must not persist once it is over');
+    assert.equal((await after.json()).status, 'ok');
 });
 
 test('the shutdown handler is what flips /health', () => {

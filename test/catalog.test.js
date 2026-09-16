@@ -19,6 +19,8 @@ const {
     decodeConfig,
     parseCatalogId,
     CATALOG_KINDS,
+    FEATURED_PERIOD_MS,
+    featuredEpoch,
     catalogComparator,
     filterByName,
     toCatalogMetas,
@@ -34,6 +36,10 @@ const {
 const realFetch = global.fetch;
 
 const DAY_MS = 86400000;
+// One featured shuffle lasts this long. Read from the module rather than written
+// out here, so lengthening the period does not silently leave these tests
+// asserting against a boundary that has moved.
+const PERIOD_MS = FEATURED_PERIOD_MS;
 
 const CFG_ARGS = { serverUrl: 'http://provider.test:8080', username: 'alice', password: 'secret' };
 const CFG = encodeConfig(CFG_ARGS);
@@ -218,7 +224,7 @@ test('the featured shuffle is injective, so it is already a total order', () => 
     }
 });
 
-test('the featured shuffle actually varies from day to day', () => {
+test('the featured shuffle actually varies from period to period', () => {
     // The seed used to be *added* after the multiply. Adding a constant is
     // order-preserving except for the one item that wraps 2^31, so "featured"
     // was a fixed permutation — measured byte-identical at day+1, +30, +365 and
@@ -232,20 +238,23 @@ test('the featured shuffle actually varies from day to day', () => {
         .map(s => s[kind.idField]);
 
     const base = orderAt(t0);
-    for (const day of [1, 7, 30, 365, 3650]) {
-        const later = orderAt(t0 + day * DAY_MS);
+    for (const periods of [1, 2, 8, 52, 520]) {
+        const later = orderAt(t0 + periods * PERIOD_MS);
         const held = later.filter((x, i) => x === base[i]).length;
-        // A genuine reshuffle leaves only a handful of positions by coincidence;
-        // the old hash left every single one.
+        // The bug this guards left every single position in place. A real
+        // reshuffle leaves almost none: measured across these offsets the counts
+        // are 0 except at period+1, which keeps 22 of 2000 (1.1%) because the seed
+        // is XORed into ids that only occupy eleven bits, so adjacent seeds share
+        // structure. 5% sits well clear of that and still fails loudly at 100%.
         assert.ok(
-            held < items.length / 100,
-            `day+${day} kept ${held}/${items.length} positions — the shuffle is not varying`
+            held < items.length / 20,
+            `period+${periods} kept ${held}/${items.length} positions — the shuffle is not varying`
         );
     }
 });
 
-test('the featured shuffle holds still within a day', () => {
-    // The other half of the intent, and the reason it is seeded by day at all:
+test('the featured shuffle holds still within a period', () => {
+    // The other half of the intent, and the reason it is seeded at all:
     // paginating a shelf must not reshuffle underneath the user.
     const kind = CATALOG_KINDS.series;
     const items = Array.from({ length: 500 }, (_, i) => ({ [kind.idField]: i + 1 }));
@@ -253,11 +262,35 @@ test('the featured shuffle holds still within a day', () => {
         .sort(catalogComparator(kind, 'featured', t))
         .map(s => s[kind.idField]);
 
-    const dayStart = Date.UTC(2026, 5, 15);
-    const first = orderAt(dayStart);
-    for (const offset of [1, 1000, 3600000, DAY_MS - 1]) {
-        assert.deepEqual(orderAt(dayStart + offset), first, `order changed ${offset}ms into the same day`);
+    // Anchored on a boundary, so "within" means what it says whatever the period
+    // is; Date.UTC(2026, 5, 15) is not one once the period is longer than a day.
+    const periodStart = Math.floor(Date.UTC(2026, 5, 15) / PERIOD_MS) * PERIOD_MS;
+    const first = orderAt(periodStart);
+    for (const offset of [1, 1000, 3600000, DAY_MS, PERIOD_MS - 1]) {
+        assert.deepEqual(orderAt(periodStart + offset), first, `order changed ${offset}ms into the same period`);
     }
+});
+
+// L14 — the order changed at UTC midnight. Stremio holds catalog pages for
+// max-age 300 with stale-while-revalidate 600, so for up to fifteen minutes after
+// a boundary a shelf could be paginated across two different orders. A longer
+// period does not remove the boundary — nothing stateless can, since the client
+// holds pages this server has already forgotten — it makes it rare.
+test('one featured order lasts much longer than a client caches a page (L14)', () => {
+    const STREMIO_PAGE_STALENESS_MS = (300 + 600) * 1000;
+    assert.ok(PERIOD_MS > 6 * DAY_MS, `a featured order lasts only ${PERIOD_MS}ms`);
+    assert.ok(PERIOD_MS / STREMIO_PAGE_STALENESS_MS > 500,
+        'the window where two orders can be mixed is not small against the period');
+
+    // And the comparator and the memo key read the same function, so a sorted
+    // view cannot outlive the seed it was built from. Computing the period in two
+    // places is what made that a thing that had to be kept in agreement by hand.
+    // Anchored on a boundary, or `t + PERIOD_MS - 1` lands in the next period and
+    // the test asserts the opposite of what it means.
+    const t = Math.floor(Date.UTC(2026, 5, 15) / PERIOD_MS) * PERIOD_MS;
+    assert.equal(featuredEpoch(t), Math.floor(t / PERIOD_MS));
+    assert.equal(featuredEpoch(t), featuredEpoch(t + PERIOD_MS - 1));
+    assert.notEqual(featuredEpoch(t), featuredEpoch(t + PERIOD_MS));
 });
 
 test('an unknown variant sorts not at all, preserving upstream order', () => {

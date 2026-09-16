@@ -7,6 +7,9 @@ const net = require('net');
 // through the global fetch. See PINNED_DISPATCHER for why the two have to come
 // from the same undici major.
 const { Agent: UndiciAgent } = require('undici');
+// Event-loop delay for /health. Native, and its timer does not hold the process
+// open, so it does not interfere with a graceful shutdown.
+const { monitorEventLoopDelay } = require('node:perf_hooks');
 
 // The address tables the SSRF guard refuses. Pure, and the one part of the guard
 // with a test file of its own, so it is the first thing to leave index.js.
@@ -1585,8 +1588,7 @@ async function fetchSeriesInfo(cfg, seriesId) {
             console.warn(`[getSeriesInfo] attempt ${attempt}/${SERIES_INFO_MAX_ATTEMPTS} for series ${seriesId} returned ${shape}`);
         } catch (e) {
             lastError = e;
-            const causeMsg = e.cause ? ` (cause: ${e.cause.code || e.cause.message || e.cause})` : '';
-            console.warn(`[getSeriesInfo] attempt ${attempt}/${SERIES_INFO_MAX_ATTEMPTS} for series ${seriesId} failed: ${e.message}${causeMsg}`);
+            console.warn(`[getSeriesInfo] attempt ${attempt}/${SERIES_INFO_MAX_ATTEMPTS} for series ${seriesId} failed: ${e.message}${causeSuffix(e)}`);
         }
         if (attempt < SERIES_INFO_MAX_ATTEMPTS) {
             await new Promise(r => setTimeout(r, SERIES_INFO_BACKOFF_MS * attempt));
@@ -2011,6 +2013,14 @@ app.post('/configure', async (req, res) => {
 // Route failures are answered quietly, so the log is where a bug has to look
 // different from a provider outage (audit R6): a programming error keeps its stack,
 // provider and network failures stay one line.
+// fetch hides the real reason in `cause`: the message is a flat 'fetch failed'
+// and the code that says which failure it was — ECONNREFUSED, ENOTFOUND, a TLS
+// error — is one level down. Written once because it was written twice, and the
+// two copies are the log lines an operator compares when a panel starts failing.
+function causeSuffix(e) {
+    return e?.cause ? ` (cause: ${e.cause.code || e.cause.message || e.cause})` : '';
+}
+
 function isProgrammingError(e) {
     if (e instanceof ReferenceError || e instanceof RangeError) return true;
     // fetch reports a network failure as TypeError('fetch failed') with a cause.
@@ -2100,9 +2110,27 @@ function catalogTypesFor(id) {
     return route ? CATALOG_KINDS[route.kind].catalogTypes : null;
 }
 
+// How long one featured order lasts. Seeded on a period rather than on the clock
+// so the shuffle holds still while a client pages through it — but a day was too
+// short (audit L14): Stremio caches catalog pages (max-age 300,
+// stale-while-revalidate 600), so for up to fifteen minutes either side of a
+// boundary a paginated shelf could mix two orders. A week cuts the number of
+// boundaries by 52 without making the shelf feel fixed. It does not remove the
+// boundary — nothing stateless can, since the client holds pages this server has
+// already forgotten — it makes it rare.
+const FEATURED_PERIOD_MS = 7 * 86400000;
+
+// The one place the period is turned into a seed. The comparator and the memo key
+// must read the same function: they used to compute `Math.floor(now / 86400000)`
+// separately, which is two things that have to agree and no way to notice when
+// they stop — a sorted view would outlive the seed it was built from.
+function featuredEpoch(now) {
+    return Math.floor(now / FEATURED_PERIOD_MS);
+}
+
 // Every comparator ends in the item id, making each sort a total order, so a page
 // does not depend on which source served the list (audit L3). `now` is a parameter
-// only for testing the featured shuffle across days.
+// only for testing the featured shuffle across periods.
 function catalogComparator(kind, variant, now = Date.now()) {
     const idOf = s => parseInt(s[kind.idField]) || 0;
     const byId = (a, b) => idOf(a) - idOf(b);
@@ -2114,12 +2142,12 @@ function catalogComparator(kind, variant, now = Date.now()) {
         return (a, b) => ((parseFloat(b.rating) || 0) - (parseFloat(a.rating) || 0)) || byId(a, b);
     }
     if (variant === 'featured') {
-        // Seeded on the day, so the shuffle holds still while paginating. The seed
-        // must enter *before* the multiply: added after, it preserves order and
-        // the shuffle never changed.
-        const daySeed = Math.floor(now / 86400000);
-        // Spread the day across the word so consecutive days differ widely.
-        const dayKey = Math.imul(daySeed, 0x9e3779b1);
+        // Seeded on the period, so the shuffle holds still while paginating. The
+        // seed must enter *before* the multiply: added after, it preserves order
+        // and the shuffle never changed.
+        const periodSeed = featuredEpoch(now);
+        // Spread the seed across the word so consecutive periods differ widely.
+        const dayKey = Math.imul(periodSeed, 0x9e3779b1);
         // XOR then an odd multiplier: a bijection modulo 2^31, so distinct ids
         // cannot collide.
         const hash = s => (Math.imul(idOf(s) ^ dayKey, 2654435761) & 0x7fffffff);
@@ -2301,23 +2329,21 @@ function catalogViewKey(route, selection) {
     return `${catalogVariant(route)}${VIEW_KEY_SEP}${selection}`;
 }
 
-// The featured order is seeded on the day, and a list that stays cached across
-// midnight must not keep yesterday's views alongside today's.
-function catalogDay(now) {
-    return Math.floor(now / 86400000);
-}
+// A list that stays cached across a period boundary must not keep the previous
+// period's views alongside the new ones. featuredEpoch is the same function the
+// comparator seeds from, so the two cannot disagree about when the order changed.
 
-// Today's memo for `source`, or null when there is none and `create` is false.
-// `views` holds sorted orders, keyed by variant and selection; `selections` holds
-// the filtered arrays those orders were computed from, keyed by selection alone —
-// two key spaces that must not share a map, since a selection can itself contain
-// the separator. A filtered selection does not depend on the day, but it costs one
-// filter to let both live and die together.
-function catalogMemoFor(source, day, create) {
+// This period's memo for `source`, or null when there is none and `create` is
+// false. `views` holds sorted orders, keyed by variant and selection; `selections`
+// holds the filtered arrays those orders were computed from, keyed by selection
+// alone — two key spaces that must not share a map, since a selection can itself
+// contain the separator. A filtered selection does not depend on the period, but
+// it costs one filter to let both live and die together.
+function catalogMemoFor(source, epoch, create) {
     let entry = sortedCatalogViews.get(source);
-    if (!entry || entry.day !== day) {
+    if (!entry || entry.epoch !== epoch) {
         if (!create) return null;
-        entry = { day, views: new Map(), selections: new Map() };
+        entry = { epoch, views: new Map(), selections: new Map() };
         sortedCatalogViews.set(source, entry);
     }
     return entry;
@@ -2330,7 +2356,7 @@ function catalogMemoFor(source, day, create) {
 // (audit Perf). Keyed apart from the sorted views because it outlives all of them:
 // three variants over one selection share one filtered array.
 function cachedCatalogSelection(source, selection, now = Date.now()) {
-    const memo = catalogMemoFor(source, catalogDay(now), false);
+    const memo = catalogMemoFor(source, featuredEpoch(now), false);
     return (memo && memo.selections.get(selection)) || null;
 }
 
@@ -2338,7 +2364,7 @@ function cachedCatalogSelection(source, selection, now = Date.now()) {
 // expression that returns. Only ever called with the result of a filter, so it
 // cannot store the source array back into its own memo.
 function rememberCatalogSelection(source, selection, items, now = Date.now()) {
-    catalogMemoFor(source, catalogDay(now), true).selections.set(selection, items);
+    catalogMemoFor(source, featuredEpoch(now), true).selections.set(selection, items);
     return items;
 }
 
@@ -2351,7 +2377,7 @@ function sortedCatalogItems(kind, route, { items, source, selection }, now = Dat
     const comparator = catalogComparator(kind, catalogVariant(route), now);
     if (!comparator) return items;
 
-    const views = catalogMemoFor(source, catalogDay(now), true).views;
+    const views = catalogMemoFor(source, featuredEpoch(now), true).views;
     const key = catalogViewKey(route, selection);
     const hit = views.get(key);
     if (hit) return hit;
@@ -2514,8 +2540,7 @@ app.get('/:config/meta/:type/:id.json', async (req, res) => {
             try {
                 info = await getSeriesInfo(cfg, seriesId);
             } catch (e) {
-                const causeMsg = e.cause ? ` (cause: ${e.cause.code || e.cause.message || e.cause})` : '';
-                console.warn(`[meta] getSeriesInfo(${seriesId}) failed after retries: ${e.message}${causeMsg}`);
+                console.warn(`[meta] getSeriesInfo(${seriesId}) failed after retries: ${e.message}${causeSuffix(e)}`);
             }
             const series = info?.info ?? info ?? {};
 
@@ -3472,14 +3497,55 @@ function createShutdownHandler(server, { timeoutMs = SHUTDOWN_TIMEOUT_MS, exit =
     };
 }
 
+// Liveness alone says only that the process is running, which on this server is
+// nearly always true and nearly never the question: the thread that answers
+// /health is the thread that parses tens of MB of catalog and relays video, so
+// the way this instance fails is by being too busy to answer anything in time.
+// Event-loop delay is the one number that says so.
+//
+// The histogram is reset on every read, so each probe reports the window since
+// the last one — which is what a readiness check is asking. Two consequences:
+// concurrent probes split the window between them, and a long gap between probes
+// widens it. Both are acceptable for a load balancer polling on a fixed interval,
+// and neither can hide a stall, since the peak stays the peak of whatever window
+// it lands in.
+const eventLoopDelay = monitorEventLoopDelay({ resolution: 10 });
+eventLoopDelay.enable();
+
+// Deliberately far above anything healthy. Idle delay is the platform's timer
+// granularity — measured at 15.6 ms on Windows — and a 25 MB catalog parse, the
+// largest block this server does on purpose, is 128 ms. A second is nothing a
+// working instance reaches, which is the point: readiness that flaps under load
+// pulls a busy-but-working instance out of the pool and moves its traffic onto
+// the others, and that is how one slow instance becomes an outage.
+const HEALTH_MAX_EVENT_LOOP_LAG_MS = 1000;
+
 app.get('/health', (req, res) => {
     // Reporting unhealthy while draining is the point: it takes this instance out
     // of the load balancer pool before the process actually goes away, instead of
     // letting it keep receiving requests it is about to drop.
     const draining = isShuttingDown();
-    res.status(draining ? 503 : 200)
+    // An empty window — two probes close enough together that the histogram's
+    // timer has not fired between them — reports `mean` as NaN, which JSON writes
+    // as null. Nothing was measured, so the honest reading is 0; reporting null
+    // would make a probe that arrived early look like a broken metric. Rounded
+    // because this is a measurement, not an identity, and a full float of
+    // nanoseconds in a probe response invites false precision.
+    const ms = (ns) => (Number.isFinite(ns) ? Math.round((ns / 1e6) * 10) / 10 : 0);
+    const lagMs = ms(eventLoopDelay.max);
+    const meanLagMs = ms(eventLoopDelay.mean);
+    eventLoopDelay.reset();
+
+    const stalled = lagMs > HEALTH_MAX_EVENT_LOOP_LAG_MS;
+    const status = draining ? 'shutting_down' : (stalled ? 'stalled' : 'ok');
+    res.status(draining || stalled ? 503 : 200)
         .set('Cache-Control', 'no-store')
-        .json({ status: draining ? 'shutting_down' : 'ok', uptime: process.uptime() });
+        .json({
+            status,
+            uptime: process.uptime(),
+            eventLoopLagMs: lagMs,
+            eventLoopLagMeanMs: meanLagMs
+        });
 });
 
 // A path begins with the config token, which is a bearer credential: it
@@ -3637,6 +3703,8 @@ module.exports = {
     parseCatalogId,
     CATALOG_KINDS,
     catalogComparator,
+    featuredEpoch,
+    FEATURED_PERIOD_MS,
     filterByName,
     titleOf,
     toCatalogMetas,
@@ -3765,5 +3833,6 @@ module.exports = {
     SHUTDOWN_TIMEOUT_MS,
     KEEPALIVE_TIMEOUT_MS,
     HEADERS_TIMEOUT_MS,
-    REQUEST_TIMEOUT_MS
+    REQUEST_TIMEOUT_MS,
+    HEALTH_MAX_EVENT_LOOP_LAG_MS
 };

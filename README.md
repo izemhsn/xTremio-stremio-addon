@@ -115,7 +115,7 @@ the addon's own error handler returns a bare 400/500 and logs the stack server-s
 | Path | Purpose |
 |---|---|
 | `/` | Landing page with project overview and install CTA |
-| `/health` | Health probe. `200 {"status":"ok"}` normally; `503 {"status":"shutting_down"}` once a shutdown signal has been received, so a load balancer drains this instance before it stops serving. |
+| `/health` | Health and readiness probe. `200 {"status":"ok"}` normally; `503 {"status":"shutting_down"}` once a shutdown signal has been received, so a load balancer drains this instance before it stops serving; `503 {"status":"stalled"}` if the event loop was blocked for more than a second since the previous probe. Every response also carries `eventLoopLagMs` (the peak since the last probe) and `eventLoopLagMeanMs`, which are worth scraping whatever the status: this server parses catalogs and relays video on the same thread that answers this route, so event-loop delay is how a busy instance actually degrades. The measurement window is reset on each read, so poll on a fixed interval. |
 | `/configure` | HTML form to enter Xtream credentials and get an install link (includes disclaimer banner) |
 | `/:config/configure` | The same form, opened by Stremio's **Configure** button on an installed addon. Prefills the server URL and username from the token; the password must be entered again |
 | `/manifest.json` | Unconfigured Stremio manifest |

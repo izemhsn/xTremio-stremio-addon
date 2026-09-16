@@ -39,7 +39,8 @@ const {
     categoryStreamsCache,
     vodStreamsCache,
     seriesStreamsCache,
-    liveStreamsCache
+    liveStreamsCache,
+    FEATURED_PERIOD_MS
 } = require('../index.js');
 
 // A view's lifetime is the whole of M-5, and only a collection can show it. The
@@ -50,6 +51,10 @@ const gc = vm.runInNewContext('gc');
 
 const realFetch = global.fetch;
 const DAY_MS = 86400000;
+// One featured order, and so one generation of memoised views. Read from the
+// module: the period was a day and is now a week, and these tests are about
+// crossing the boundary rather than about how long it is.
+const PERIOD_MS = FEATURED_PERIOD_MS;
 
 const CFG_ARGS = { serverUrl: 'http://provider.test:8080', username: 'alice', password: 'secret' };
 const CFG = encodeConfig(CFG_ARGS);
@@ -184,29 +189,34 @@ test('variant and selection separate views over one source; search does not', ()
     assert.deepStrictEqual(viewKeys(items), ['new\nall', 'popular\nall', 'new\ncategory:20']);
 });
 
-test("a new day drops the previous day's views", () => {
+test("a new period drops the previous period's views", () => {
     const items = movies(30);
     const t0 = Date.UTC(2026, 0, 1, 12);
     sortedOf(parseCatalogId('xtremio_movies_featured'), items, { now: t0 });
     sortedOf(parseCatalogId('xtremio_movies_new'), items, { now: t0 });
     assert.equal(viewKeys(items).length, 2);
 
-    // A list can stay cached across midnight; yesterday's featured order must not
-    // stay with it.
-    sortedOf(parseCatalogId('xtremio_movies_featured'), items, { now: t0 + DAY_MS });
+    // A list can stay cached across the boundary; the previous featured order must
+    // not stay with it.
+    sortedOf(parseCatalogId('xtremio_movies_featured'), items, { now: t0 + PERIOD_MS });
     assert.deepStrictEqual(viewKeys(items), ['featured\nall']);
 });
 
-test("the featured shuffle still changes with the day, through the cache", () => {
+test("the featured shuffle still changes with the period, through the cache", () => {
     const route = parseCatalogId('xtremio_movies_featured');
     const items = movies(300);
     const t0 = Date.UTC(2026, 5, 1, 9);
 
-    const today = sortedOf(route, items, { now: t0 }).map(s => s.stream_id);
-    const tomorrow = sortedOf(route, items, { now: t0 + DAY_MS }).map(s => s.stream_id);
+    const now = sortedOf(route, items, { now: t0 }).map(s => s.stream_id);
+    const later = sortedOf(route, items, { now: t0 + PERIOD_MS }).map(s => s.stream_id);
+    const today = now;
+    const tomorrow = later;
 
-    // Same day, same source: the memo must hold the order still while paginating.
+    // Within the period, same source: the memo must hold the order still while
+    // paginating — including a day later, which used to be a different order.
     assert.deepStrictEqual(sortedOf(route, items, { now: t0 + 3600_000 }).map(s => s.stream_id), today);
+    assert.deepStrictEqual(sortedOf(route, items, { now: t0 + DAY_MS }).map(s => s.stream_id), today,
+        'a day is now inside the period, so the order must not move');
 
     // A handful of items land on the same index by coincidence in any
     // permutation — the expected number of fixed points is 1 whatever the list
