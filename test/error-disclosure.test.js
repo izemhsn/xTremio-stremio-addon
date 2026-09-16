@@ -138,3 +138,35 @@ test('a config token is redacted out of a logged path', () => {
     assert.equal(redactConfigInPath('/configure'), '/configure');
     assert.equal(redactConfigInPath('/health'), '/health');
 });
+
+// L13 — the redaction was one greedy run of non-slash characters, which does not
+// stop at the `?`. That both missed tokens and destroyed paths, depending only on
+// where the first slash happened to fall.
+test('a config token in the query string is redacted, and the path survives it', () => {
+    const cfg = encodeConfig({ serverUrl: 'http://provider.test:8080', username: 'alice', password: 'secret' });
+
+    // The route that really takes a token this way.
+    assert.equal(redactConfigInPath(`/configure?config=${cfg}`), '/configure?config=<config>');
+
+    // An early slash used to end the match before it reached the query, and the
+    // token was logged in full.
+    const nested = redactConfigInPath(`/a/b?config=${cfg}`);
+    assert.ok(!nested.includes(cfg), 'the token must not reach the log from a nested path');
+    assert.equal(nested, '/a/b?config=<config>');
+
+    // Other parameters are left alone, and a token is still redacted when it is
+    // not the first of them.
+    assert.equal(
+        redactConfigInPath(`/configure?lang=en&config=${cfg}&next=/x`),
+        '/configure?lang=en&config=<config>&next=/x'
+    );
+
+    // Both halves at once: a tokened path that also carries one in its query.
+    assert.equal(
+        redactConfigInPath(`/${cfg}/configure?config=${cfg}`),
+        '/<config>/configure?config=<config>'
+    );
+
+    // A query with no token is untouched.
+    assert.equal(redactConfigInPath('/catalog.json?skip=100'), '/catalog.json?skip=100');
+});

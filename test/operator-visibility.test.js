@@ -10,6 +10,7 @@ process.env.ALLOW_PRIVATE_NETWORKS = 'true';
 const test = require('node:test');
 const assert = require('node:assert');
 const util = require('node:util');
+const crypto = require('node:crypto');
 
 const {
     app,
@@ -52,6 +53,15 @@ function resetReports() {
     undecodableTokens.secret = 0;
     undecodableTokens.version = 0;
     undecodableTokens.lastReportAt = 0;
+}
+
+// A string with the shape every token version has written — a 12-byte IV, a
+// 16-byte tag, a non-empty ciphertext and a 32-byte MAC — under a version prefix
+// that will not open. Built by hand because sealConfig can only produce the
+// current version, and an older one is exactly what the version counter is for.
+function shapedToken(version) {
+    const b64 = (n) => crypto.randomBytes(n).toString('base64url');
+    return [version, b64(12), b64(16), b64(48), b64(32)].join('.');
 }
 
 let server;
@@ -161,10 +171,44 @@ test('scanner garbage is not counted, and a token from an older version is', () 
     const logged = capture(() => {
         decodeConfig('wp-admin');
         decodeConfig('favicon.ico');
-        decodeConfig('v2.aaa.bbb.ccc.ddd');
+        decodeConfig(shapedToken('v2'));
     });
     assert.equal(undecodableTokens.secret, 0);
     assert.match(logged.join('\n'), /1 from an older token version/);
+});
+
+// L5 — five dot-separated parts under a version prefix was enough to be counted,
+// so a scanner walking made-up paths raised the "CONFIG_SECRET changed" report.
+test('a five-part string that is not token-shaped is not counted (L5)', () => {
+    resetReports();
+    const iv = crypto.randomBytes(12).toString('base64url');
+    const tag = crypto.randomBytes(16).toString('base64url');
+    const ct = crypto.randomBytes(48).toString('base64url');
+    const mac = crypto.randomBytes(32).toString('base64url');
+
+    // With lastReportAt at 0 the first thing counted reports immediately, so an
+    // empty log is the assertion — and it is read from the log rather than from
+    // the counters, which that same report zeroes on its way out.
+    const quiet = capture(() => {
+        decodeConfig('v3.a.b.c.d');                      // the finding's own example
+        decodeConfig('v2.aaa.bbb.ccc.ddd');              // and under an older version
+        decodeConfig(`v3.${'!'.repeat(16)}.${tag}.${ct}.${mac}`);  // right length, not base64url
+        decodeConfig(`v3.${iv}.${tag}..${mac}`);         // nothing to decrypt
+        decodeConfig(`v3.${iv}.${tag}.${ct}.${mac.slice(0, -4)}`); // MAC short of 32 bytes
+    });
+    assert.deepEqual(quiet, [], 'none of these is a token this server could have issued');
+
+    // The positive controls: without them this test would also pass if decodeConfig
+    // had stopped counting altogether.
+    resetReports();
+    const sealedElsewhere = capture(() => {
+        decodeConfig(sealConfig(CFG_ARGS, deriveConfigKeys('a-secret-this-server-never-had-0123456789')));
+    });
+    assert.match(sealedElsewhere.join('\n'), /1 sealed under a secret/);
+
+    resetReports();
+    const olderVersion = capture(() => decodeConfig(shapedToken('v2')));
+    assert.match(olderVersion.join('\n'), /1 from an older token version/);
 });
 
 test('a valid install URL is never reported', () => {

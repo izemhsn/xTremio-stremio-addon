@@ -144,6 +144,9 @@ const HLS_MAC_KEY = HLS_KEY_MATERIAL.subarray(32);
 // has to slice by them and state the tag length explicitly.
 const GCM_IV_BYTES = 12;
 const GCM_TAG_BYTES = 16;
+// The HMAC-SHA256 over a token body. Named because decodeConfig checks it as a
+// length before it checks it as a signature.
+const CONFIG_MAC_BYTES = 32;
 const ALLOW_PRIVATE_NETWORKS = process.env.ALLOW_PRIVATE_NETWORKS === 'true';
 const PUBLIC_URL = process.env.PUBLIC_URL ? normalizeUrl(process.env.PUBLIC_URL) : null;
 
@@ -257,6 +260,20 @@ function signTokenBody(body, key = CONFIG_MAC_KEY) {
     return crypto.createHmac('sha256', key).update(body).digest('base64url');
 }
 
+// base64url as `toString('base64url')` writes it: no padding, no other characters.
+const BASE64URL_RE = /^[A-Za-z0-9_-]+$/;
+
+// One field of a token, decoded only if it really is that field. The charset is
+// checked before the length because `Buffer.from(s, 'base64url')` drops anything
+// outside the alphabet and truncates a trailing partial group, so the length of
+// what it returns says nothing on its own about what went in.
+function decodeTokenPart(part, bytes) {
+    if (typeof part !== 'string' || !BASE64URL_RE.test(part)) return null;
+    const buf = Buffer.from(part, 'base64url');
+    if (bytes === undefined) return buf.length ? buf : null;
+    return buf.length === bytes ? buf : null;
+}
+
 function timingSafeEqualString(a, b) {
     const ab = Buffer.from(a);
     const bb = Buffer.from(b);
@@ -295,11 +312,24 @@ function decodeConfig(encoded) {
     try {
         const parts = encoded.split('.');
         if (parts.length !== 5) return null;
-        if (parts[0] !== CONFIG_TOKEN_VERSION) {
-            if (/^v\d+$/.test(parts[0])) noteUndecodableToken('version');
+        const [version, ivPart, tagPart, ciphertextPart, macPart] = parts;
+        // The shape is what decides whether this is counted at all (audit L5). The
+        // report noteUndecodableToken writes is the operator's signal that
+        // CONFIG_SECRET changed, so it must only count strings this server could
+        // really have issued: `v3.a.b.c.d` is five parts and a version prefix and
+        // nothing else, and counting a scanner's guesses raised that alarm for
+        // traffic that never held a token. Checked before the version, because
+        // every version has written these four fields at these lengths, so a
+        // genuine v2 install URL — whose user does have to reinstall — still counts.
+        const iv = decodeTokenPart(ivPart, GCM_IV_BYTES);
+        const tag = decodeTokenPart(tagPart, GCM_TAG_BYTES);
+        const ciphertext = decodeTokenPart(ciphertextPart);
+        const mac = decodeTokenPart(macPart, CONFIG_MAC_BYTES);
+        if (!iv || !tag || !ciphertext || !mac) return null;
+        if (version !== CONFIG_TOKEN_VERSION) {
+            if (/^v\d+$/.test(version)) noteUndecodableToken('version');
             return null;
         }
-        const [version, ivPart, tagPart, ciphertextPart, macPart] = parts;
         const body = [version, ivPart, tagPart, ciphertextPart].join('.');
         // The current secret first, and the previous one only when that fails, so a
         // rotation costs old install URLs one extra MAC and new ones nothing. The MAC
@@ -317,12 +347,13 @@ function decodeConfig(encoded) {
 
         // authTagLength is explicit: without it setAuthTag accepts a truncated
         // tag, and a short tag is proportionally easier to forge. Unreachable
-        // today because the MAC over the same bytes is checked first, which is
+        // today — the MAC over the same bytes is checked first, and the shape
+        // check above has already refused a tag that is not 16 bytes — which is
         // why this is defence in depth rather than a fix.
-        const decipher = crypto.createDecipheriv('aes-256-gcm', keys.enc, Buffer.from(ivPart, 'base64url'), { authTagLength: GCM_TAG_BYTES });
-        decipher.setAuthTag(Buffer.from(tagPart, 'base64url'));
+        const decipher = crypto.createDecipheriv('aes-256-gcm', keys.enc, iv, { authTagLength: GCM_TAG_BYTES });
+        decipher.setAuthTag(tag);
         const plaintext = Buffer.concat([
-            decipher.update(Buffer.from(ciphertextPart, 'base64url')),
+            decipher.update(ciphertext),
             decipher.final()
         ]).toString('utf8');
         const cfg = validateConfig(JSON.parse(plaintext));
@@ -3818,7 +3849,14 @@ async function relayUpstream(req, res, { upstreamUrl, label, ext, rewriteFor }) 
     // socket forever. The timer is cleared as soon as headers arrive so the
     // body itself can stream for as long as playback needs.
     let headersTimedOut = false;
-    const headerTimer = setTimeout(() => { headersTimedOut = true; abort(); }, PROXY_HEADER_TIMEOUT_MS);
+    let headerTimer = null;
+    // Re-armable, because the deadline bounds one exchange (audit L12). See the
+    // fallback below for why that matters.
+    const armHeaderTimer = () => {
+        clearTimeout(headerTimer);
+        headerTimer = setTimeout(() => { headersTimedOut = true; abort(); }, PROXY_HEADER_TIMEOUT_MS);
+    };
+    armHeaderTimer();
     try {
         // HEAD is passed through, and anything short of a usable response falls
         // back to GET. Do not narrow this to 405/501: the real panel answers HEAD
@@ -3840,6 +3878,14 @@ async function relayUpstream(req, res, { upstreamUrl, label, ext, rewriteFor }) 
         }
 
         if (!upstream) {
+            // The fallback is a second exchange and gets its own deadline (audit
+            // L12). The real panel answers HEAD with a 502 and its CDN drops the
+            // connection, and it can take its time doing either; sharing one timer
+            // left the GET whatever remained of it, which on a slow panel is
+            // nothing at all. Two deadlines rather than one is the honest cost of
+            // trying HEAD first, and only a request that already spent the first
+            // one can pay the second.
+            if (req.method === 'HEAD') armHeaderTimer();
             upstream = await safeFetch(upstreamUrl, {
                 method: 'GET',
                 headers,
@@ -4525,8 +4571,20 @@ app.get('/health', (req, res) => {
 // decrypts to the account's password. Logging one would put working install
 // URLs in the log file, so the first segment is dropped when it is long enough
 // to be a token rather than a route name.
+//
+// The path is not the only place a token appears, though — /configure takes one
+// as a query parameter — so the two halves are redacted separately. One greedy
+// run of non-slash characters read straight through the `?` (audit L13), which
+// both missed tokens and destroyed paths depending only on where the first slash
+// fell: `/a/b?config=<token>` was logged whole, while `/configure?config=<token>`
+// came out as `/<config>`, naming no route at all.
 function redactConfigInPath(path) {
-    return String(path).replace(/^\/[^/]{24,}/, '/<config>');
+    const raw = String(path);
+    const cut = raw.indexOf('?');
+    const pathname = cut === -1 ? raw : raw.slice(0, cut);
+    const query = cut === -1 ? '' : raw.slice(cut);
+    return pathname.replace(/^\/[^/]{24,}/, '/<config>')
+        + query.replace(/([?&]config=)[^&]*/gi, '$1<config>');
 }
 
 // Unknown paths, so Express's default HTML 404 (which names the method and the
@@ -4686,6 +4744,7 @@ module.exports = {
     CACHE_MAX_STREAM_BYTES,
     PLAYLIST_BODY_TIMEOUT_MS,
     PLAYLIST_REWRITE_TIMEOUT_MS,
+    PROXY_HEADER_TIMEOUT_MS,
     MAX_PLAYLIST_ORIGINS,
     signTokenBody,
     rewriteHlsPlaylist,
