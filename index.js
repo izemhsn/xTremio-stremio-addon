@@ -758,6 +758,10 @@ const PLAYLIST_PATH_EXT = /\.m3u8?$/i;
 // panels emit both.
 const HLS_BODY_PREFIX = /^\uFEFF?\s*#EXTM3U/;
 
+// How much of a body has to be in hand to test that prefix: a byte-order mark
+// and a few blank lines, and no more — this is read before anything is relayed.
+const HLS_SNIFF_BYTES = 64;
+
 function hlsTargetExt(target) {
     if (target.playlist) return 'm3u8';
     // Parsed by decodeHlsTarget already, so this cannot throw.
@@ -1443,6 +1447,13 @@ const CACHE_TTL = 30 * 60 * 1000;
 // refresh. Retry those soon instead.
 const CACHE_FAILURE_TTL = 60 * 1000;
 
+// How far through an entry's life a request starts refetching it behind the
+// scenes instead of leaving the next request to pay for it. A cold full list is
+// seconds of work inside a request — 4.8 s for movies and 2.6 s for series
+// against a real account — and every account paid that once per TTL. A fifth of
+// the TTL left to fetch in is ample for a list that takes seconds.
+const CACHE_REFRESH_AHEAD = 0.8;
+
 // Keys must include credentials so two users on the same Xtream host don't
 // share cached catalogs/streams (different accounts can see different content).
 // Keyed by the panel's origin, not the URL as typed: every upstream URL is built
@@ -1825,8 +1836,29 @@ function createStreamListCache() {
         }
     });
     const singleFlight = createSingleFlight();
+    // Background refreshes in flight, keyed like the cache itself. Its own map
+    // rather than the single-flight above: that one is also what a cold miss joins,
+    // and a miss must keep its stale-on-failure fallback, which it would lose by
+    // inheriting a refresh's rejection. The two can therefore both be in flight for
+    // one account — only in the window where a refresh outlives the fifth of the
+    // TTL it was given, and only ever two calls, never more.
+    const refreshing = new Map();
+
+    // Whether a warm entry is old enough to be worth refreshing behind the request
+    // that found it. Only a full-strength entry qualifies: a shorter ttl marks
+    // either an empty list or the stale copy an outage is being served from (audit
+    // L3), and refreshing those would mean fetching on nearly every request rather
+    // than once per TTL. The cooldown bounds it the other way — one attempt per
+    // CACHE_FAILURE_TTL whatever the outcome, so a panel that has started failing
+    // is not asked again by every request that arrives.
+    const shouldRefreshAhead = (entry, now) => Boolean(entry)
+        && entry.ttl === CACHE_TTL
+        && !(entry.refreshedAt && now - entry.refreshedAt < CACHE_FAILURE_TTL)
+        && now - entry.ts >= CACHE_TTL * CACHE_REFRESH_AHEAD;
+
     return {
         map,
+        refreshing,
         get(cfg) {
             const cached = map.get(accountCacheKey(cfg));
             // Per-entry ttl: a stale entry being served through an outage carries
@@ -1844,11 +1876,46 @@ function createStreamListCache() {
                 bytes: estimateBytes(items)
             });
         },
+        // Refetches an entry that is still warm but far enough through its life that
+        // the next request would have paid for it — measured at 4.8 s for a movie
+        // list and 2.6 s for a series list, once per TTL per account, inside the
+        // request that happened to arrive first (audit Perf). Nothing awaits this,
+        // so it can only ever make a later request faster; a failure is swallowed
+        // and leaves the warm entry exactly as it was, to be retried inline once it
+        // really does expire. Triggered by a request and never by a timer, so a list
+        // nobody is asking for is never refreshed and simply ages out.
+        refreshAhead(cfg, fetcher, now = Date.now()) {
+            const key = accountCacheKey(cfg);
+            const entry = map.peek(key);
+            if (!shouldRefreshAhead(entry, now)) return null;
+            const existing = refreshing.get(key);
+            if (existing) return existing;
+
+            entry.refreshedAt = now;
+            const promise = Promise.resolve()
+                .then(fetcher)
+                .then((items) => { this.set(cfg, items); return items; })
+                .catch((e) => {
+                    // Never rethrown: no caller is waiting, and an unhandled
+                    // rejection exits the process.
+                    console.warn(
+                        `[cache] background refresh failed (${e.message}); ` +
+                        'the warm list stands until it expires'
+                    );
+                    return null;
+                })
+                .finally(() => { if (refreshing.get(key) === promise) refreshing.delete(key); });
+            refreshing.set(key, promise);
+            return promise;
+        },
         // Cache-aside read: serves a warm entry, otherwise runs `fetcher` once
         // no matter how many callers arrive while it is in flight.
         load(cfg, fetcher) {
             const cached = this.get(cfg);
-            if (cached) return Promise.resolve(cached);
+            if (cached) {
+                this.refreshAhead(cfg, fetcher);
+                return Promise.resolve(cached);
+            }
             const key = accountCacheKey(cfg);
             return singleFlight(key, async () => {
                 // Re-check: a concurrent flight may have populated it already.
@@ -1931,6 +1998,10 @@ const seriesStreamsCache = createStreamListCache();
 // view may hold a strong reference back to its list. Each source maps to
 // `{ day, views }`; see sortedCatalogItems.
 const sortedCatalogViews = new WeakMap();
+
+// The separator inside view and selection keys. A newline, because no variant
+// and no category id can contain one, so two fields cannot shift into one.
+const VIEW_KEY_SEP = '\n';
 
 // stream_id -> item for a cached live or movie list, so opening a channel or
 // falling back from get_vod_info is a lookup rather than a scan. Keyed by the
@@ -3085,7 +3156,12 @@ function noteDegradedCatalog(cfg, categoryKey, now = Date.now()) {
     return true;
 }
 
-async function selectCatalogSource(cfg, kind, genre) {
+// The filters below are the expensive half of a genre shelf, and their result
+// depends only on the source list and the selection — so it is remembered under
+// the selection and consulted before the filter runs. A remembered selection is
+// also proof that the filter found items, which settles the "has items" question
+// below: an empty result is never remembered (audit Perf).
+async function selectCatalogSource(cfg, kind, genre, now = Date.now()) {
     const cats = await getCategories(cfg);
     const categories = cats[kind.categoryKey] || [];
 
@@ -3118,20 +3194,29 @@ async function selectCatalogSource(cfg, kind, genre) {
     if (kind.matchCategoryName) {
         const genreLower = String(selectedGenre || '').toLowerCase();
         const all = await kind.loadAll(cfg);
+        // The name takes part in the filter below, so it takes part in the selection.
+        const scoped = `${selection}${VIEW_KEY_SEP}${genreLower}`;
+        const remembered = cachedCatalogSelection(all, scoped, now);
+        if (remembered) return { items: remembered, source: all, selection: scoped };
         // An item with any category id is matched by id; only one with none at all
         // falls back to its category name.
         const items = all.filter(s => (hasCategoryIds(s)
             ? inCategories(s, idSet)
             : Boolean(genreLower) && String(s.category_name || '').toLowerCase() === genreLower));
-        // The name takes part in this filter, so it takes part in the selection.
-        if (items.length) return { items, source: all, selection: `${selection}\n${genreLower}` };
+        if (items.length) {
+            return { items: rememberCatalogSelection(all, scoped, items, now), source: all, selection: scoped };
+        }
     } else {
         // Reuse the warm full list when there is one; otherwise a per-category
         // fetch beats pulling 10-50 MB just to filter it down.
         const fullList = kind.listCache.get(cfg);
         if (fullList) {
+            const remembered = cachedCatalogSelection(fullList, selection, now);
+            if (remembered) return { items: remembered, source: fullList, selection };
             const items = fullList.filter(s => inCategories(s, idSet));
-            if (items.length) return { items, source: fullList, selection };
+            if (items.length) {
+                return { items: rememberCatalogSelection(fullList, selection, items, now), source: fullList, selection };
+            }
         }
     }
 
@@ -3143,35 +3228,76 @@ async function selectCatalogSource(cfg, kind, genre) {
     return { items: merged, source: merged, selection };
 }
 
-// The sorted view of one shelf, memoised against the identity of the list it was
-// derived from (see sortedCatalogViews). Returns `items` untouched when the
-// variant has no comparator — the live shelf and any unsorted kind — so nothing
-// is cached for a shelf whose order was never computed in the first place.
-//
-// Under one source, a view is keyed by variant and by `selection` — never by the
-// request's genre string, which would be an unbounded key space. Account and kind
-// are implied by the source.
-function sortedCatalogItems(kind, route, { items, source, selection }, now = Date.now()) {
-    const variant = route.search ? 'new' : route.variant;
-    const comparator = catalogComparator(kind, variant, now);
-    if (!comparator) return items;
+// Search sorts as `new`, so its pages stay stable across refetches.
+function catalogVariant(route) {
+    return route.search ? 'new' : route.variant;
+}
 
-    // The featured order is seeded on the day, and a list that stays cached
-    // across midnight must not keep yesterday's views alongside today's.
-    const day = Math.floor(now / 86400000);
+// Under one source, a sorted view is keyed by variant and by `selection` — never
+// by the request's genre string, which would be an unbounded key space. Account
+// and kind are implied by the source. `variant` never contains a newline, so the
+// selection cannot shift into it.
+function catalogViewKey(route, selection) {
+    return `${catalogVariant(route)}${VIEW_KEY_SEP}${selection}`;
+}
+
+// The featured order is seeded on the day, and a list that stays cached across
+// midnight must not keep yesterday's views alongside today's.
+function catalogDay(now) {
+    return Math.floor(now / 86400000);
+}
+
+// Today's memo for `source`, or null when there is none and `create` is false.
+// `views` holds sorted orders, keyed by variant and selection; `selections` holds
+// the filtered arrays those orders were computed from, keyed by selection alone —
+// two key spaces that must not share a map, since a selection can itself contain
+// the separator. A filtered selection does not depend on the day, but it costs one
+// filter to let both live and die together.
+function catalogMemoFor(source, day, create) {
     let entry = sortedCatalogViews.get(source);
     if (!entry || entry.day !== day) {
-        entry = { day, views: new Map() };
+        if (!create) return null;
+        entry = { day, views: new Map(), selections: new Map() };
         sortedCatalogViews.set(source, entry);
     }
+    return entry;
+}
 
-    // `variant` never contains a newline, so the selection cannot shift into it.
-    const key = `${variant}\n${selection}`;
-    const hit = entry.views.get(key);
+// The items a genre shelf resolved to last time, or null — consulted *before* the
+// filter that would produce them, and creating nothing. Filtering is the expensive
+// half of a genre shelf and its result depends only on the source and the
+// selection, so only the sort was being saved while the filter ran on every page
+// (audit Perf). Keyed apart from the sorted views because it outlives all of them:
+// three variants over one selection share one filtered array.
+function cachedCatalogSelection(source, selection, now = Date.now()) {
+    const memo = catalogMemoFor(source, catalogDay(now), false);
+    return (memo && memo.selections.get(selection)) || null;
+}
+
+// Remembers a filtered selection and returns it, so a call site can do both in the
+// expression that returns. Only ever called with the result of a filter, so it
+// cannot store the source array back into its own memo.
+function rememberCatalogSelection(source, selection, items, now = Date.now()) {
+    catalogMemoFor(source, catalogDay(now), true).selections.set(selection, items);
+    return items;
+}
+
+// The sorted view of one shelf, memoised against the identity of the list it was
+// derived from (see sortedCatalogViews). Returns `items` untouched when the
+// variant has no comparator — the live shelf and any unsorted kind — since there
+// is no order to remember; the filter that produced those items is remembered
+// separately, above.
+function sortedCatalogItems(kind, route, { items, source, selection }, now = Date.now()) {
+    const comparator = catalogComparator(kind, catalogVariant(route), now);
+    if (!comparator) return items;
+
+    const views = catalogMemoFor(source, catalogDay(now), true).views;
+    const key = catalogViewKey(route, selection);
+    const hit = views.get(key);
     if (hit) return hit;
 
     const sorted = [...items].sort(comparator);
-    entry.views.set(key, sorted);
+    views.set(key, sorted);
     return sorted;
 }
 
@@ -3204,6 +3330,9 @@ app.get(['/:config/catalog/:type/:id.json', '/:config/catalog/:type/:id/:extra.j
     try {
         const extra = parseExtra(rawExtraSegment(req));
         const skip = Math.max(0, parseInt(extra.skip) || 0);
+        // One clock for the whole request: the selection memo and the sorted view
+        // are both scoped to the day, and reading it twice could straddle midnight.
+        const now = Date.now();
 
         let selected;
         if (route.search) {
@@ -3213,7 +3342,7 @@ app.get(['/:config/catalog/:type/:id.json', '/:config/catalog/:type/:id/:extra.j
             const all = await kind.loadAll(cfg);
             selected = { items: all, source: all, selection: 'all' };
         } else {
-            selected = await selectCatalogSource(cfg, kind, extra.genre);
+            selected = await selectCatalogSource(cfg, kind, extra.genre, now);
             if (!selected) return res.json({ metas: [] });
         }
 
@@ -3222,7 +3351,7 @@ app.get(['/:config/catalog/:type/:id.json', '/:config/catalog/:type/:id/:extra.j
         // and this way the memoised view does not depend on the search term. The
         // filter stops once it has this page's worth of matches.
         const items = filterByName(
-            sortedCatalogItems(kind, route, selected),
+            sortedCatalogItems(kind, route, selected, now),
             extra.search,
             skip + PAGE_SIZE
         );
@@ -3559,6 +3688,59 @@ async function readTextCapped(body, maxBytes) {
 // ignoring Range. So the header is decided by what the exchange demonstrated.
 const RANGE_UNIT = /^(?:bytes|none)$/i;
 
+// Every HLS playlist starts with this tag, on the first line.
+const HLS_BODY_TAG = '#EXTM3U';
+
+// Whether what has arrived so far begins that tag, cannot, or is still only the
+// start of it. `more` is what makes the sniff below safe on a live stream: a body
+// is ruled out at the first byte that could not belong to the tag.
+function hlsPrefixVerdict(text) {
+    const rest = text.replace(/^\uFEFF?\s*/, '');
+    if (rest.startsWith(HLS_BODY_TAG)) return 'playlist';
+    return HLS_BODY_TAG.startsWith(rest) ? 'more' : 'other';
+}
+
+// Reads only as far as it takes to know whether a body starts with #EXTM3U, and
+// hands back every byte it read so the caller can write them on. The two bounds
+// are both load-bearing on a route that relays live video: it stops at the first
+// byte that rules a playlist out, so a segment that sends one byte and then
+// pauses — a legitimately idle stream this route must never break — is decided
+// immediately; and it never waits past `maxBytes`, so a body of nothing but the
+// whitespace the tag tolerates cannot hold it open either.
+function sniffPlaylistStart(stream, maxBytes = HLS_SNIFF_BYTES) {
+    return new Promise((resolve, reject) => {
+        const chunks = [];
+        const prefix = Buffer.alloc(maxBytes);
+        let filled = 0;
+        const verdict = () => hlsPrefixVerdict(prefix.subarray(0, filled).toString('utf8'));
+        const finish = (err, ended, playlist) => {
+            stream.off('readable', onReadable);
+            stream.off('end', onEnd);
+            stream.off('error', onError);
+            if (err) return reject(err);
+            resolve({ head: Buffer.concat(chunks), ended, playlist });
+        };
+        const onReadable = () => {
+            let chunk;
+            while ((chunk = stream.read()) !== null) {
+                chunks.push(chunk);
+                if (filled < maxBytes) {
+                    filled += chunk.copy(prefix, filled, 0, Math.min(chunk.length, maxBytes - filled));
+                }
+                const so_far = verdict();
+                if (so_far !== 'more') return finish(null, false, so_far === 'playlist');
+                if (filled >= maxBytes) return finish(null, false, false);
+            }
+        };
+        const onEnd = () => finish(null, true, verdict() === 'playlist');
+        const onError = (e) => finish(e, false, false);
+        stream.on('readable', onReadable);
+        stream.once('end', onEnd);
+        stream.once('error', onError);
+        onReadable();
+    });
+}
+
 // Every response that carries provider bytes gets these, in both branches of
 // relayUpstream. The content type is the panel's and is forwarded as sent, so a
 // panel could serve text/html from this origin: `nosniff` stops a body it
@@ -3759,6 +3941,40 @@ async function relayUpstream(req, res, { upstreamUrl, label, ext, rewriteFor }) 
         return res.end(Buffer.from(rewritten, 'utf8'));
     }
 
+    // A playlist can also arrive where only bytes were expected: a segment path and
+    // a content type that says nothing route it straight here, and relaying it
+    // verbatim hands the player the provider's own credential-bearing URLs — the
+    // disclosure the rewrite exists to prevent, on the one path that never looked
+    // (audit L10, confirmed: /live/ID.ts answered with an m3u8 as text/plain).
+    //
+    // Refused, not rewritten. What a body is has to be decided before any of it is
+    // read, because the alternative here is a segment that must stream and keep its
+    // Range support; sniffing stays a confirmation of a body already in hand, never
+    // the thing that routes one. A provider naming a playlist on a segment path is
+    // misbehaving, and 502 says so without leaking anything.
+    let relay = null;
+    if (!mapper && req.method !== 'HEAD' && upstream.status === 200 && upstream.body) {
+        const stream = Readable.fromWeb(upstream.body);
+        try {
+            relay = { stream, ...await sniffPlaylistStart(stream) };
+        } catch (e) {
+            if (!isAbortErr(e)) console.warn(`[proxy] upstream body failed for ${label}: ${e.message}`);
+            stream.destroy();
+            abort();
+            if (!res.headersSent) res.status(502).end('upstream stream failed');
+            return;
+        }
+        if (relay.playlist) {
+            console.warn(
+                `[proxy] refusing to relay a playlist served as ${JSON.stringify(contentType || '')} for ${label}`
+            );
+            stream.destroy();
+            abort();
+            if (!res.headersSent) res.status(502).end('playlist on a segment path');
+            return;
+        }
+    }
+
     res.status(upstream.status);
 
     // Forward headers relevant for seekable playback.
@@ -3804,7 +4020,8 @@ async function relayUpstream(req, res, { upstreamUrl, label, ext, rewriteFor }) 
         return res.end();
     }
 
-    const nodeStream = Readable.fromWeb(upstream.body);
+    // Already wrapped if the sniff ran; the web body can only be taken once.
+    const nodeStream = relay ? relay.stream : Readable.fromWeb(upstream.body);
     nodeStream.on('error', (e) => {
         if (!isAbortErr(e)) {
             console.warn(`[proxy] stream error for ${label}: ${e.message}`);
@@ -3827,6 +4044,8 @@ async function relayUpstream(req, res, { upstreamUrl, label, ext, rewriteFor }) 
         abort();
         nodeStream.destroy();
     });
+    if (relay && relay.head.length) res.write(relay.head);
+    if (relay && relay.ended) return res.end();
     nodeStream.pipe(res);
 }
 
@@ -4450,11 +4669,16 @@ module.exports = {
     toCatalogMetas,
     selectCatalogSource,
     sortedCatalogItems,
+    cachedCatalogSelection,
+    rememberCatalogSelection,
+    catalogViewKey,
     sortedCatalogViews,
     normalizeContainerExt,
     statedContainerExt,
     isNotWebReady,
     normalizeAcceptRanges,
+    hlsPrefixVerdict,
+    sniffPlaylistStart,
     setRelayHeaders,
     CONFIGURE_TIMEOUT_MS,
     CONFIGURE_PROBE_TIMEOUT_MS,
@@ -4526,6 +4750,7 @@ module.exports = {
     categoryStreamsCache,
     CACHE_TTL,
     CACHE_FAILURE_TTL,
+    CACHE_REFRESH_AHEAD,
     PAGE_SIZE,
     BoundedMap,
     sweepCaches,

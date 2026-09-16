@@ -27,7 +27,8 @@ const {
     looksLikePlaylist,
     encodeHlsTarget,
     decodeHlsTarget,
-    signHlsTarget
+    signHlsTarget,
+    hlsPrefixVerdict
 } = require('../index.js');
 
 const realFetch = global.fetch;
@@ -84,6 +85,32 @@ function providerHandler(req, res) {
     if (req.url === `/live/${creds}/5.ts`) {
         res.writeHead(200, { 'Content-Type': 'video/mp2t' });
         return res.end('TS-BYTES-PAYLOAD');
+    }
+
+    // L10 — a panel answering a .ts stream request with a playlist, labelled as
+    // something that is not one. Neither the path nor the content type says
+    // "playlist", so nothing routes it to the rewrite, and its segment URLs carry
+    // the account's credentials exactly like any other Xtream playlist.
+    if (req.url === `/live/${creds}/13.ts`) {
+        const body = [
+            '#EXTM3U',
+            '#EXT-X-TARGETDURATION:8',
+            '#EXTINF:8.000,',
+            `${providerBase}/hls/${creds}/seg1.ts`,
+            ''
+        ].join('\n');
+        res.writeHead(200, {
+            'Content-Type': 'text/plain',
+            'Content-Length': Buffer.byteLength(body)
+        });
+        return res.end(body);
+    }
+
+    // A body shorter than the sniff window, which therefore ends inside it. The
+    // relay has to send exactly these bytes and finish, not wait for more.
+    if (req.url === `/live/${creds}/14.ts`) {
+        res.writeHead(200, { 'Content-Type': 'video/mp2t', 'Content-Length': 3 });
+        return res.end('TSx');
     }
 
     // A panel answering a stream request with an error page, which real ones do.
@@ -689,4 +716,62 @@ test('an html body from the panel is still relayed, just not as a document', asy
     assert.match(res.headers.get('content-type') || '', /text\/html/);
     assert.strictEqual(res.headers.get('x-content-type-options'), 'nosniff');
     assert.strictEqual(res.headers.get('content-security-policy'), 'sandbox');
+});
+
+// --- L10 — a playlist arriving where only bytes were expected ---------------
+//
+// A .ts path says "segment" and the content type said "text/plain", so nothing
+// routed this to the rewrite and the body was relayed exactly as the panel sent
+// it — with /user/pass/ in every segment URL. That is the disclosure the whole
+// rewrite exists to prevent, arriving on the one path that never looks.
+//
+// It is refused rather than rewritten on the spot: deciding what a body is has
+// to happen before any of it is read, because the alternative on this route is a
+// segment that must stream. Sniffing stays a confirmation, never a detector.
+
+test('a playlist served on a .ts path is refused, not relayed', async () => {
+    const res = await get('/proxy/live/13.ts');
+    const body = await res.text();
+
+    assert.ok(!body.includes(PASSWORD), `password leaked in a relayed body:\n${body}`);
+    assert.ok(!body.includes(USERNAME), 'username leaked in a relayed body');
+    assert.strictEqual(res.status, 502);
+});
+
+test('the sniff decides at the first byte that rules a playlist out', () => {
+    // This is what keeps the check off the critical path of a live stream: a
+    // segment is settled by its first byte, never by waiting for a window to fill.
+    assert.strictEqual(hlsPrefixVerdict('G'), 'other', 'an MPEG-TS sync byte');
+    assert.strictEqual(hlsPrefixVerdict('\u0000'), 'other', 'the start of an MP4 box');
+    assert.strictEqual(hlsPrefixVerdict('<html>'), 'other');
+    assert.strictEqual(hlsPrefixVerdict('#EXTINF'), 'other', 'a real tag, but not the first one');
+});
+
+test('the sniff keeps reading only while a playlist is still possible', () => {
+    for (const partial of ['', '#', '#EX', '#EXTM3', '\uFEFF', '\n\n', '\uFEFF  #E']) {
+        assert.strictEqual(hlsPrefixVerdict(partial), 'more', JSON.stringify(partial));
+    }
+    for (const yes of ['#EXTM3U', '#EXTM3U\n#EXT-X-VERSION:3', '\uFEFF#EXTM3U', '\n \n#EXTM3U']) {
+        assert.strictEqual(hlsPrefixVerdict(yes), 'playlist', JSON.stringify(yes));
+    }
+});
+
+test('a body shorter than the sniff window is relayed whole', async () => {
+    // The bytes the sniff read are written on by the caller, and a body that ended
+    // inside them is already complete — piping it afterwards would never end.
+    const res = await get('/proxy/live/14.ts');
+
+    assert.strictEqual(res.status, 200);
+    assert.strictEqual(await res.text(), 'TSx');
+});
+
+test('a byte relay still streams when the sniff cannot fill its window', async () => {
+    // The regression that found this: waiting for a full window stalled forever on
+    // an upstream that sends one byte and then pauses, which is an ordinary live
+    // stream. test/proxy-concurrency.test.js drives exactly that shape and would
+    // hang; this pins the smaller case the same rule covers.
+    const res = await get('/proxy/live/5.ts');
+
+    assert.strictEqual(res.status, 200);
+    assert.strictEqual(await res.text(), 'TS-BYTES-PAYLOAD');
 });

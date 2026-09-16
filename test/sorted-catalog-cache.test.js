@@ -31,6 +31,9 @@ const {
     parseCatalogId,
     catalogComparator,
     sortedCatalogItems,
+    cachedCatalogSelection,
+    rememberCatalogSelection,
+    catalogViewKey,
     sortedCatalogViews,
     catCache,
     categoryStreamsCache,
@@ -216,10 +219,12 @@ test("the featured shuffle still changes with the day, through the cache", () =>
 
 // --- shelves with no comparator -------------------------------------------
 
-test('an unsorted shelf is passed through and caches nothing', () => {
+test('an unsorted shelf is passed through and keeps no order', () => {
     // Live has no recency field and its catalog id carries no variant, so
-    // catalogComparator returns null. Caching an array that was never sorted
-    // would spend memory to remember the identity function.
+    // catalogComparator returns null. There is no order to remember, and caching
+    // an array that was never sorted would spend memory on the identity function.
+    // The filter a live genre shelf does pay for is remembered separately — see
+    // the selection memo below — which is why the two key spaces are separate.
     const route = parseCatalogId('xtremio_live');
     const items = [{ stream_id: 3 }, { stream_id: 1 }];
     const out = sortedCatalogItems(CATALOG_KINDS.live, route, { items, source: items, selection: 'all' });
@@ -473,4 +478,140 @@ test('a search paginates with skip, without overlap and in one order', async () 
     const ids = pages.flatMap(idsOf);
     assert.equal(new Set(ids).size, 250, 'the pages overlap or drop matches');
     assert.deepStrictEqual(ids, [...ids].sort((a, b) => b - a), 'newest first across page boundaries');
+});
+
+// --- the selection memo (audit Perf) ---------------------------------------
+//
+// The sort was memoised but the filter that fed it was not, so every page of a
+// genre shelf re-ran a filter over the whole list to produce items the memo was
+// about to discard. The filter's result depends only on the source and the
+// selection — not on the variant, and not on the day — so it is remembered under
+// the selection, beside the sorted orders rather than among them.
+
+test('a filtered selection is remembered apart from any order', () => {
+    const source = movies(5);
+    const items = source.filter(s => s.stream_id % 2 === 0);
+
+    assert.strictEqual(cachedCatalogSelection(source, 'category:20'), null);
+    assert.strictEqual(rememberCatalogSelection(source, 'category:20', items), items,
+        'it returns what it stored, so a call site can do both in one expression');
+    assert.strictEqual(cachedCatalogSelection(source, 'category:20'), items);
+
+    // Scoped to the selection, not to the source as a whole.
+    assert.strictEqual(cachedCatalogSelection(source, 'category:21'), null);
+    // And kept out of the sorted-view key space, which a selection could collide
+    // with: a live selection contains the same separator a view key uses.
+    assert.deepStrictEqual(viewKeys(source), []);
+});
+
+test('cachedCatalogSelection creates nothing when there is none', () => {
+    // It runs before the filter, on every request, so it must not be what starts
+    // an entry — empty ones would make the WeakMap grow with misses.
+    const source = movies(3);
+
+    assert.strictEqual(cachedCatalogSelection(source, 'category:20'), null);
+    assert.equal(sortedCatalogViews.has(source), false);
+});
+
+// Counts the filters run over one cached list without changing its identity: the
+// WeakMap key has to stay the very array the list cache holds.
+function countFilters(list) {
+    const calls = { n: 0 };
+    const real = Array.prototype.filter;
+    Object.defineProperty(list, 'filter', {
+        configurable: true,
+        value(...args) { calls.n++; return real.apply(this, args); }
+    });
+    return calls;
+}
+
+const viewKeyFor = (id, selection) => catalogViewKey(parseCatalogId(id), selection);
+// Warming the full list is a search request, which leaves a sorted view of its own.
+const SEARCH_VIEW = () => viewKeyFor('xtremio_search_movies', 'all');
+
+test('a genre shelf filters once, whatever is asked of it afterwards', async () => {
+    stubProvider();
+    clearCaches();
+    provided = movies(250);
+
+    await getCatalog('xtremio_search_movies', 'search=Movie');
+    const full = vodStreamsCache.get(CFG_ARGS);
+    assert.ok(full, 'the full list should be warm');
+    const filters = countFilters(full);
+
+    const page1 = await getCatalog('xtremio_movies_new', 'genre=Action&skip=0');
+    const page2 = await getCatalog('xtremio_movies_new', 'genre=Action&skip=100');
+    // A different variant is a different order over the same filtered selection,
+    // which is exactly why the two are remembered separately.
+    const page3 = await getCatalog('xtremio_movies_popular', 'genre=Action&skip=0');
+
+    assert.equal(page1.metas.length, 100);
+    assert.equal(page2.metas.length, 100);
+    assert.equal(page3.metas.length, 100);
+    assert.equal(
+        filters.n, 1,
+        `the whole list was filtered ${filters.n} times for three pages of one selection`
+    );
+    assert.deepStrictEqual(
+        viewKeys(full).slice().sort(),
+        [
+            SEARCH_VIEW(),
+            viewKeyFor('xtremio_movies_new', 'category:20'),
+            viewKeyFor('xtremio_movies_popular', 'category:20')
+        ].sort()
+    );
+});
+
+test('a refetched list is filtered again, not answered from the old selection', async () => {
+    stubProvider();
+    clearCaches();
+    provided = movies(250);
+
+    await getCatalog('xtremio_search_movies', 'search=Movie');
+    const first = vodStreamsCache.get(CFG_ARGS);
+    const filters = countFilters(first);
+    await getCatalog('xtremio_movies_new', 'genre=Action');
+    await getCatalog('xtremio_movies_new', 'genre=Action');
+    assert.equal(filters.n, 1);
+
+    // A refetch replaces the array, and identity is what invalidates the memo.
+    vodStreamsCache.map.clear();
+    provided = movies(120);
+    await getCatalog('xtremio_search_movies', 'search=Movie');
+    const second = vodStreamsCache.get(CFG_ARGS);
+    assert.notStrictEqual(second, first, 'the test needs a genuinely new array');
+
+    const refilters = countFilters(second);
+    const page = await getCatalog('xtremio_movies_new', 'genre=Action');
+    assert.equal(refilters.n, 1, 'the new list has to be filtered on its own');
+    assert.equal(page.metas.length, 100);
+    assert.equal(filters.n, 1, 'and the old array was not touched again');
+});
+
+test('the selection memo does not mask the empty-category fallback', async () => {
+    // Load-bearing: a warm full list serves a genre only when it has items for it,
+    // because a provider has answered the unscoped call with a list missing a
+    // category its scoped call returns. An empty filter result is never
+    // remembered, so the fallback is reached again on the next request rather
+    // than answered from a remembered nothing.
+    const listed = CATS.movies;
+    CATS.movies = [...listed, { category_id: 21, category_name: 'Drama' }];
+    try {
+        stubProvider();
+        clearCaches();
+        provided = movies(250);
+
+        await getCatalog('xtremio_search_movies', 'search=Movie');
+        const full = vodStreamsCache.get(CFG_ARGS);
+        const filters = countFilters(full);
+
+        await getCatalog('xtremio_movies_new', 'genre=Drama');
+        await getCatalog('xtremio_movies_new', 'genre=Drama');
+
+        assert.equal(filters.n, 2, 'a category with nothing in the warm list is re-checked');
+        assert.strictEqual(cachedCatalogSelection(full, 'category:21'), null);
+        assert.deepStrictEqual(viewKeys(full), [SEARCH_VIEW()], 'no order was kept for it either');
+    } finally {
+        CATS.movies = listed;
+    }
 });

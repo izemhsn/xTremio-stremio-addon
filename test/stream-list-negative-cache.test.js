@@ -18,6 +18,7 @@ const {
     sweepCaches,
     CACHE_TTL,
     CACHE_FAILURE_TTL,
+    CACHE_REFRESH_AHEAD,
     CACHE_STALE_MAX_AGE_MS
 } = require('../index.js');
 
@@ -194,4 +195,108 @@ test('repeated failures extend the stale copy only up to the cap', async () => {
         entry.ts + entry.ttl - Date.now() <= CACHE_FAILURE_TTL,
         'and what is left of the window is shorter than a full retry interval'
     );
+});
+
+// --- refresh-ahead (audit Perf) --------------------------------------------
+//
+// A cold full list is seconds of work inside the request that happens to arrive
+// first — 4.8 s for movies and 2.6 s for series against a real account — and
+// every account paid it once per TTL, forever. A request that finds an entry far
+// enough through its life now refetches behind itself, so the entry is replaced
+// before anyone waits on it.
+
+const keyOf = () => [...vodStreamsCache.map.keys()][0];
+const settleRefresh = () => vodStreamsCache.refreshing.get(keyOf());
+
+// Ages the one cached entry so it sits `ms` past its refresh point.
+function agePastRefresh(ms = 1000) {
+    const entry = onlyEntry();
+    entry.ts -= Math.ceil(CACHE_TTL * CACHE_REFRESH_AHEAD) + ms;
+    return entry.ts;
+}
+
+test('a request past the refresh point is served warm and refetched behind it', async () => {
+    stubFetch([LIST]);
+    assert.deepEqual(await getAllVodStreams(cfg), LIST);
+    const before = agePastRefresh();
+
+    const NEXT = [...LIST, { stream_id: '3', name: 'Gamma' }];
+    stubFetch([NEXT]);
+    const served = await getAllVodStreams(cfg);
+    assert.deepEqual(served, LIST, 'the request is answered warm, not made to wait for the refetch');
+
+    const refresh = settleRefresh();
+    assert.ok(refresh, 'and a refresh was started behind it');
+    await refresh;
+
+    const after = onlyEntry();
+    assert.deepEqual(after.data, NEXT, 'which replaced the list');
+    assert.ok(after.ts > before, 'and re-stamped its age, so the next TTL starts now');
+    assert.equal(calls, 1, 'one upstream call, none of it inside a request');
+});
+
+test('an entry short of the refresh point is left alone', async () => {
+    stubFetch([LIST]);
+    await getAllVodStreams(cfg);
+
+    // Just inside the point, so this pins the threshold rather than the idea.
+    onlyEntry().ts -= Math.floor(CACHE_TTL * CACHE_REFRESH_AHEAD) - 1000;
+    stubFetch([LIST]);
+    await getAllVodStreams(cfg);
+
+    assert.equal(calls, 0, 'nothing was refetched');
+    assert.equal(vodStreamsCache.refreshing.size, 0);
+});
+
+test('the stale copy an outage is being served from is never refreshed ahead', async () => {
+    stubFetch([LIST]);
+    await getAllVodStreams(cfg);
+
+    // What L3 leaves behind: ts says the data is old, and the ttl was extended
+    // deliberately to keep serving it. The age rule alone would fire here on every
+    // single request, which is why the ttl has to be part of the test.
+    const entry = onlyEntry();
+    entry.ts -= CACHE_TTL;
+    entry.ttl = CACHE_TTL + 5 * 60 * 1000;
+
+    stubFetch([LIST]);
+    await getAllVodStreams(cfg);
+
+    assert.equal(calls, 0, 'a failing panel is not asked again by every request');
+    assert.equal(vodStreamsCache.refreshing.size, 0);
+});
+
+test('a failed refresh leaves the warm list exactly as it was, and is not retried at once', async () => {
+    stubFetch([LIST]);
+    await getAllVodStreams(cfg);
+    const before = agePastRefresh();
+
+    stubFetch([new Error('panel down')]);
+    assert.deepEqual(await getAllVodStreams(cfg), LIST, 'the request never sees the failure');
+    // Nothing awaits a refresh, so a rejection here would reach the process.
+    await settleRefresh();
+
+    const after = onlyEntry();
+    assert.deepEqual(after.data, LIST);
+    assert.equal(after.ts, before, 'a failure must not re-stamp the age of old data');
+    assert.equal(calls, 1);
+
+    // The cooldown: the next request does not start another attempt.
+    stubFetch([new Error('panel down')]);
+    assert.deepEqual(await getAllVodStreams(cfg), LIST);
+    assert.equal(calls, 0, 'one attempt per failure window, not one per request');
+});
+
+test('requests that arrive together share one refresh', async () => {
+    stubFetch([LIST]);
+    await getAllVodStreams(cfg);
+    agePastRefresh();
+
+    stubFetch([LIST]);
+    await Promise.all([getAllVodStreams(cfg), getAllVodStreams(cfg), getAllVodStreams(cfg)]);
+    assert.equal(vodStreamsCache.refreshing.size, 1, 'three requests, one refresh');
+
+    await settleRefresh();
+    assert.equal(calls, 1);
+    assert.equal(vodStreamsCache.refreshing.size, 0, 'and it clears itself when it settles');
 });
