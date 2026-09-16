@@ -32,6 +32,10 @@ const {
 } = require('../index.js');
 
 const INDEX = require.resolve('../index.js');
+// The token crypto lives in its own module now. The source-level assertion below
+// has to read the file the derivation is actually written in, not the barrel that
+// re-exports it.
+const CONFIG_TOKEN_SRC = require.resolve('../src/config-token.js');
 const realFetch = global.fetch;
 const CFG = encodeConfig({ serverUrl: 'http://provider.test:8080', username: 'alice', password: 'secret' });
 
@@ -84,7 +88,7 @@ test('the two keys are independent', () => {
     // label leaves tokens round-tripping exactly as before — so this is asserted
     // against the source. The keys themselves are deliberately not exported:
     // handing a test any function of them would also hand an attacker an oracle.
-    const src = require('node:fs').readFileSync(INDEX, 'utf8');
+    const src = require('node:fs').readFileSync(CONFIG_TOKEN_SRC, 'utf8');
     const enc = /const CONFIG_ENC_KEY = deriveConfigKey\('([^']+)'\)/.exec(src);
     const mac = /const CONFIG_MAC_KEY = deriveConfigKey\('([^']+)'\)/.exec(src);
     assert.ok(enc && mac, 'both keys must be derived through deriveConfigKey');

@@ -8,6 +8,94 @@ const net = require('net');
 // from the same undici major.
 const { Agent: UndiciAgent } = require('undici');
 
+// The address tables the SSRF guard refuses. Pure, and the one part of the guard
+// with a test file of its own, so it is the first thing to leave index.js.
+const {
+    isPrivateIp,
+    ipv6ToBytes,
+    ipv6MatchesPrefix,
+    IPV4_PRIVATE_CIDRS,
+    IPV6_PRIVATE_PREFIXES,
+    IPV6_EMBEDDED_IPV4
+} = require('./src/net/private-ip.js');
+
+// Entry-count and byte bounds, and the one LRU order they all share.
+const { BoundedMap, CacheBudget, weightOf } = require('./src/cache/bounded-map.js');
+
+// Which panels this instance will serve, and how a host is named.
+const {
+    hostnameOf,
+    parseHostList,
+    panelHostAllowed,
+    noteRefusedPanel,
+    ALLOWED_PANEL_HOSTS,
+    refusedPanelHostsLogged,
+    REFUSED_PANEL_LOG_MAX
+} = require('./src/panel-allowlist.js');
+
+// The install-token crypto and the CONFIG_SECRET policy. Required here, near the
+// top, because its keys are derived from the environment at load time.
+const {
+    CONFIG_TOKEN_VERSION,
+    RAW_CONFIG_SECRET,
+    CONFIG_SECRET,
+    CONFIG_SECRET_MIN_BYTES,
+    IS_PRODUCTION,
+    SCRYPT_PARAMS,
+    deriveConfigKey,
+    deriveConfigKeys,
+    CONFIG_ENC_KEY,
+    CONFIG_MAC_KEY,
+    CURRENT_CONFIG_KEYS,
+    PREVIOUS_CONFIG_KEYS,
+    notePreviousSecretUse,
+    UNDECODABLE_REPORT_INTERVAL_MS,
+    undecodableTokens,
+    noteUndecodableToken,
+    HLS_ENC_KEY,
+    HLS_MAC_KEY,
+    GCM_IV_BYTES,
+    GCM_TAG_BYTES,
+    CONFIG_MAC_BYTES,
+    configSecretProblems,
+    enforceConfigSecretPolicy,
+    validateConfig,
+    signTokenBody,
+    decodeTokenPart,
+    timingSafeEqualString,
+    encodeConfig,
+    sealConfig,
+    decodeConfig
+} = require('./src/config-token.js');
+
+// Signing, encrypting and rewriting playlists. No DNS and no Express: the mapper
+// that vets a target before signing is built here and passed in.
+const {
+    HLS_SIGNATURE_TTL_MS,
+    HLS_KIND_PLAYLIST,
+    HLS_KIND_SEGMENT,
+    HLS_SNIFF_BYTES,
+    HLS_BODY_PREFIX,
+    HLS_CONTENT_TYPES,
+    HLS_PLAYLIST_URI_TAGS,
+    HLS_STREAM_INF_TAG,
+    HLS_URI_ATTR,
+    PLAYLIST_PATH_EXT,
+    MAX_PLAYLIST_BYTES,
+    signHlsTarget,
+    hlsTargetAad,
+    encodeHlsTarget,
+    decodeHlsTarget,
+    looksLikePlaylist,
+    hlsTargetExt,
+    rewriteHlsPlaylist
+} = require('./src/hls/playlist.js');
+
+// HTML escaping, and the /configure page that depends on it.
+const { escapeHtml } = require('./src/html.js');
+const { renderConfigPage } = require('./src/pages/configure.js');
+const { renderLandingPage } = require('./src/pages/landing.js');
+
 const app = express();
 // Free stack fingerprinting for anyone who can reach the port.
 app.disable('x-powered-by');
@@ -52,137 +140,12 @@ const ADDON_VERSION = require('./package.json').version;
 const LOG_REQUESTS = process.env.LOG_REQUESTS === 'true';
 // v3, not v2: the key derivation below changed, so tokens issued by an older
 // build no longer decode. That is a deliberate break — see the README.
-const CONFIG_TOKEN_VERSION = 'v3';
-const RAW_CONFIG_SECRET = process.env.CONFIG_SECRET || process.env.XTREMIO_CONFIG_SECRET;
-const CONFIG_SECRET = RAW_CONFIG_SECRET
-    ? Buffer.from(RAW_CONFIG_SECRET, 'utf8')
-    : crypto.randomBytes(32);
-const CONFIG_SECRET_MIN_BYTES = 32;
-const IS_PRODUCTION = process.env.NODE_ENV === 'production';
-
-// scrypt rather than a bare hash: every install URL carries ciphertext and a MAC,
-// enough to test candidate secrets offline, and a single hash makes each guess
-// free. N=32768/r=8 costs ~80 ms and 32 MB per guess. The salts are fixed,
-// per-purpose labels because the keys must be re-derivable from the secret alone.
-const SCRYPT_PARAMS = { N: 32768, r: 8, p: 1, maxmem: 96 * 1024 * 1024 };
-
-function deriveConfigKey(label, bytes = 32, secret = CONFIG_SECRET) {
-    return crypto.scryptSync(secret, `xtremio-${label}-${CONFIG_TOKEN_VERSION}`, bytes, SCRYPT_PARAMS);
-}
-
-const CONFIG_ENC_KEY = deriveConfigKey('config-enc');
-const CONFIG_MAC_KEY = deriveConfigKey('config-mac');
-const CURRENT_CONFIG_KEYS = { enc: CONFIG_ENC_KEY, mac: CONFIG_MAC_KEY };
-
-function deriveConfigKeys(secret) {
-    const material = Buffer.from(String(secret), 'utf8');
-    return {
-        enc: deriveConfigKey('config-enc', 32, material),
-        mac: deriveConfigKey('config-mac', 32, material)
-    };
-}
-
-// Rotation (audit S11): install URLs sealed under the previous secret keep decoding
-// while users reinstall, and every new one is sealed under the current secret. Only
-// the config-token keys are derived for it — HLS links are re-minted on every
-// playlist fetch.
-const RAW_CONFIG_SECRET_PREVIOUS = process.env.CONFIG_SECRET_PREVIOUS || '';
-const PREVIOUS_CONFIG_KEYS = RAW_CONFIG_SECRET_PREVIOUS && RAW_CONFIG_SECRET_PREVIOUS !== RAW_CONFIG_SECRET
-    ? deriveConfigKeys(RAW_CONFIG_SECRET_PREVIOUS)
-    : null;
-if (RAW_CONFIG_SECRET_PREVIOUS && !PREVIOUS_CONFIG_KEYS) {
-    console.warn('[security] CONFIG_SECRET_PREVIOUS is the same as CONFIG_SECRET, so it has no effect');
-}
-
-// Once per process: enough to say CONFIG_SECRET_PREVIOUS is still load-bearing, and a
-// line an operator can watch for across restarts before removing it.
-let previousSecretUseNoted = false;
-function notePreviousSecretUse() {
-    if (previousSecretUseNoted) return;
-    previousSecretUseNoted = true;
-    console.warn(
-        '[security] an install URL sealed under CONFIG_SECRET_PREVIOUS was used; ' +
-        'keep it set until this stops appearing after restarts'
-    );
-}
-
-// Install URLs shaped like this server's tokens that will not open (audit R6). The
-// routes degrade them quietly for the user, so this is what tells the operator that
-// CONFIG_SECRET changed. Reported in aggregate at most once per interval, and only
-// for well-formed tokens, so scanners do not raise it.
-const UNDECODABLE_REPORT_INTERVAL_MS = 5 * 60 * 1000;
-const undecodableTokens = { secret: 0, version: 0, lastReportAt: 0 };
-
-function noteUndecodableToken(reason, now = Date.now()) {
-    undecodableTokens[reason] += 1;
-    if (now - undecodableTokens.lastReportAt < UNDECODABLE_REPORT_INTERVAL_MS) return;
-    const findings = [];
-    if (undecodableTokens.secret) {
-        findings.push(
-            `${undecodableTokens.secret} sealed under a secret this server does not have — ` +
-            'if this follows a restart, CONFIG_SECRET changed or was not set (see CONFIG_SECRET_PREVIOUS)'
-        );
-    }
-    if (undecodableTokens.version) {
-        findings.push(`${undecodableTokens.version} from an older token version, whose users must reinstall`);
-    }
-    console.warn(`[config] install URLs refused since the last report: ${findings.join('; ')}`);
-    undecodableTokens.secret = 0;
-    undecodableTokens.version = 0;
-    undecodableTokens.lastReportAt = now;
-}
-
-// HLS link keys are separate from the config-token pair, so no change to either
-// message format can make a value valid in one replayable in the other. One 64-byte
-// derivation split in two, because scrypt's cost is the mixing, not the length.
-const HLS_KEY_MATERIAL = deriveConfigKey('hls', 64);
-const HLS_ENC_KEY = HLS_KEY_MATERIAL.subarray(0, 32);
-const HLS_MAC_KEY = HLS_KEY_MATERIAL.subarray(32);
-
-// GCM's standard nonce and tag sizes, shared by the config token and the HLS
-// target payload. Both are named rather than inlined because the decrypt side
-// has to slice by them and state the tag length explicitly.
-const GCM_IV_BYTES = 12;
-const GCM_TAG_BYTES = 16;
-// The HMAC-SHA256 over a token body. Named because decodeConfig checks it as a
-// length before it checks it as a signature.
-const CONFIG_MAC_BYTES = 32;
+// The token crypto, its key derivation and the CONFIG_SECRET policy now live in
+// src/config-token.js; the names are imported at the top of this file.
 const ALLOW_PRIVATE_NETWORKS = process.env.ALLOW_PRIVATE_NETWORKS === 'true';
 const PUBLIC_URL = process.env.PUBLIC_URL ? normalizeUrl(process.env.PUBLIC_URL) : null;
 
-// What is wrong with the configured secret, if anything. Split out from the
-// enforcement below so the policy can be tested without exiting the process.
-// `raw` is required rather than defaulted: a default would make an explicit
-// `configSecretProblems(undefined)` silently check the real environment instead
-// of the missing-secret case the caller meant.
-function configSecretProblems(raw) {
-    const problems = [];
-    if (!raw) {
-        problems.push('CONFIG_SECRET is not set, so a random one was generated at boot — every install URL will break on restart.');
-        return problems;
-    }
-    const bytes = Buffer.byteLength(raw, 'utf8');
-    if (bytes < CONFIG_SECRET_MIN_BYTES) {
-        problems.push(`CONFIG_SECRET is ${bytes} bytes; ${CONFIG_SECRET_MIN_BYTES} or more are required. A short secret can be brute-forced offline from a single install URL.`);
-    }
-    return problems;
-}
-
-// Warn in development, refuse to start in production. Being strict everywhere
-// would break local development and the test suite for a risk that only matters
-// once real credentials are involved; being lax everywhere is how a placeholder
-// secret reaches production unnoticed.
-function enforceConfigSecretPolicy({ raw = RAW_CONFIG_SECRET, production = IS_PRODUCTION, log = console, exit = (code) => process.exit(code) } = {}) {
-    const problems = configSecretProblems(raw);
-    if (!problems.length) return true;
-    for (const problem of problems) log.warn(`[security] ${problem}`);
-    if (production) {
-        log.error('[security] Refusing to start with NODE_ENV=production. Generate a secret with: node -e "console.log(require(\'crypto\').randomBytes(32).toString(\'hex\'))"');
-        exit(1);
-        return false;
-    }
-    return true;
-}
+// configSecretProblems and enforceConfigSecretPolicy moved with the crypto.
 
 // The other half of that policy, for the other thing a deployment can get wrong
 // silently. SAFE_HOST below only checks the *shape* of the host an install link
@@ -242,135 +205,10 @@ function getBaseUrl(req) {
     return `${safeProto}://${safeHost}`;
 }
 
-// null and undefined become ''; every other value, 0 and false included, is
-// stringified as itself.
-function escapeHtml(str) {
-    return String(str ?? '').replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;').replace(/'/g, '&#039;');
-}
+// escapeHtml moved to src/html.js, shared by both page renderers.
 
-function validateConfig(cfg) {
-    if (!cfg || typeof cfg !== 'object') return null;
-    const { serverUrl, username, password } = cfg;
-    if (typeof serverUrl !== 'string' || typeof username !== 'string' || typeof password !== 'string') return null;
-    if (!serverUrl || !username || !password) return null;
-    return { serverUrl, username, password };
-}
-
-function signTokenBody(body, key = CONFIG_MAC_KEY) {
-    return crypto.createHmac('sha256', key).update(body).digest('base64url');
-}
-
-// base64url as `toString('base64url')` writes it: no padding, no other characters.
-const BASE64URL_RE = /^[A-Za-z0-9_-]+$/;
-
-// One field of a token, decoded only if it really is that field. The charset is
-// checked before the length because `Buffer.from(s, 'base64url')` drops anything
-// outside the alphabet and truncates a trailing partial group, so the length of
-// what it returns says nothing on its own about what went in.
-function decodeTokenPart(part, bytes) {
-    if (typeof part !== 'string' || !BASE64URL_RE.test(part)) return null;
-    const buf = Buffer.from(part, 'base64url');
-    if (bytes === undefined) return buf.length ? buf : null;
-    return buf.length === bytes ? buf : null;
-}
-
-function timingSafeEqualString(a, b) {
-    const ab = Buffer.from(a);
-    const bb = Buffer.from(b);
-    return ab.length === bb.length && crypto.timingSafeEqual(ab, bb);
-}
-
-function encodeConfig(cfg) {
-    return sealConfig(cfg, CURRENT_CONFIG_KEYS);
-}
-
-// Seals under an explicit key set. encodeConfig passes the current one; nothing in
-// production seals under the previous one, which is only ever used to open.
-function sealConfig(cfg, keys) {
-    const clean = validateConfig(cfg);
-    if (!clean) throw new Error('Invalid config');
-
-    const iv = crypto.randomBytes(GCM_IV_BYTES);
-    const cipher = crypto.createCipheriv('aes-256-gcm', keys.enc, iv);
-    const ciphertext = Buffer.concat([
-        cipher.update(JSON.stringify(clean), 'utf8'),
-        cipher.final()
-    ]);
-    const tag = cipher.getAuthTag();
-    const body = [
-        CONFIG_TOKEN_VERSION,
-        iv.toString('base64url'),
-        tag.toString('base64url'),
-        ciphertext.toString('base64url')
-    ].join('.');
-    return `${body}.${signTokenBody(body, keys.mac)}`;
-}
-
-function decodeConfig(encoded) {
-    if (!encoded) return null;
-    if (typeof encoded !== 'string' || encoded.length > 4096) return null;
-    try {
-        const parts = encoded.split('.');
-        if (parts.length !== 5) return null;
-        const [version, ivPart, tagPart, ciphertextPart, macPart] = parts;
-        // The shape is what decides whether this is counted at all (audit L5). The
-        // report noteUndecodableToken writes is the operator's signal that
-        // CONFIG_SECRET changed, so it must only count strings this server could
-        // really have issued: `v3.a.b.c.d` is five parts and a version prefix and
-        // nothing else, and counting a scanner's guesses raised that alarm for
-        // traffic that never held a token. Checked before the version, because
-        // every version has written these four fields at these lengths, so a
-        // genuine v2 install URL — whose user does have to reinstall — still counts.
-        const iv = decodeTokenPart(ivPart, GCM_IV_BYTES);
-        const tag = decodeTokenPart(tagPart, GCM_TAG_BYTES);
-        const ciphertext = decodeTokenPart(ciphertextPart);
-        const mac = decodeTokenPart(macPart, CONFIG_MAC_BYTES);
-        if (!iv || !tag || !ciphertext || !mac) return null;
-        if (version !== CONFIG_TOKEN_VERSION) {
-            if (/^v\d+$/.test(version)) noteUndecodableToken('version');
-            return null;
-        }
-        const body = [version, ivPart, tagPart, ciphertextPart].join('.');
-        // The current secret first, and the previous one only when that fails, so a
-        // rotation costs old install URLs one extra MAC and new ones nothing. The MAC
-        // that verifies decides the decryption key: a MAC from one secret over a
-        // ciphertext from the other does not open.
-        const keys = timingSafeEqualString(signTokenBody(body), macPart)
-            ? CURRENT_CONFIG_KEYS
-            : (PREVIOUS_CONFIG_KEYS && timingSafeEqualString(signTokenBody(body, PREVIOUS_CONFIG_KEYS.mac), macPart)
-                ? PREVIOUS_CONFIG_KEYS
-                : null);
-        if (!keys) {
-            noteUndecodableToken('secret');
-            return null;
-        }
-
-        // authTagLength is explicit: without it setAuthTag accepts a truncated
-        // tag, and a short tag is proportionally easier to forge. Unreachable
-        // today — the MAC over the same bytes is checked first, and the shape
-        // check above has already refused a tag that is not 16 bytes — which is
-        // why this is defence in depth rather than a fix.
-        const decipher = crypto.createDecipheriv('aes-256-gcm', keys.enc, iv, { authTagLength: GCM_TAG_BYTES });
-        decipher.setAuthTag(tag);
-        const plaintext = Buffer.concat([
-            decipher.update(ciphertext),
-            decipher.final()
-        ]).toString('utf8');
-        const cfg = validateConfig(JSON.parse(plaintext));
-        if (cfg && keys === PREVIOUS_CONFIG_KEYS) notePreviousSecretUse();
-        // Policy rather than crypto, but checked here so that no route can decode a
-        // token without it. A token for an unlisted panel still decrypts — one
-        // minted before ALLOWED_PANEL_HOSTS was set, or while it was empty — and a
-        // route that honoured it would relay for a panel the operator never allowed.
-        if (cfg && !panelHostAllowed(cfg.serverUrl)) {
-            noteRefusedPanel(cfg.serverUrl);
-            return null;
-        }
-        return cfg;
-    } catch {
-        return null;
-    }
-}
+// validateConfig, signTokenBody, decodeTokenPart, timingSafeEqualString,
+// encodeConfig, sealConfig and decodeConfig moved with the crypto.
 
 async function getManifest(cfg = null) {
     const catalogs = [];
@@ -488,72 +326,9 @@ function normalizeUrl(url) {
     return url;
 }
 
-// The hostname a host-list entry or a server URL names, or null. Forgiving about
-// spelling, because an operator pastes what they have: a bare hostname, `host:port`
-// and a whole URL all name the same host. A bare IPv6 address is bracketed the way
-// URL writes a hostname, and URL does the lowercasing, so this compares equal to
-// `new URL(x).hostname` for the same host.
-function hostnameOf(value) {
-    const raw = String(value || '').trim();
-    if (!raw) return null;
-    const bareIpv6 = /^[0-9a-f:]+$/i.test(raw) && raw.split(':').length > 2;
-    const candidate = bareIpv6 ? `[${raw}]` : raw;
-    let hostname;
-    try {
-        hostname = new URL(/^[a-z][a-z0-9+.-]*:\/\//i.test(candidate) ? candidate : `http://${candidate}`).hostname;
-    } catch {
-        return null;
-    }
-    // URL accepts characters no real host has — `new URL('http://*.x.test')` parses,
-    // with `*.x.test` as its hostname. Kept, a `*.provider.com` entry would look like
-    // it covered every subdomain while matching nothing, which is the silent failure
-    // parseHostList exists to refuse. URL has already lowercased the name and turned
-    // an internationalized one into its xn-- form, so this is the whole alphabet.
-    if (/^\[[0-9a-f:.]+\]$/.test(hostname) || /^[a-z0-9._-]+$/.test(hostname)) return hostname;
-    return null;
-}
-
-// A comma-separated host list from the environment. An entry that names no host —
-// a `*.` wildcard, say — is dropped and said so at boot, rather than quietly
-// allowing nothing while looking like it allows something.
-function parseHostList(value, name) {
-    const hosts = new Set();
-    for (const entry of String(value || '').split(',')) {
-        if (!entry.trim()) continue;
-        const host = hostnameOf(entry);
-        if (host) hosts.add(host);
-        else console.warn(`[config] ${name}: ignoring ${JSON.stringify(entry.trim())}, which names no single host`);
-    }
-    return hosts;
-}
-
-// Which Xtream panels this instance will serve (audit S3). Empty means any, which
-// leaves the server usable as a relay through a fake panel; nothing stateless can
-// tell such a panel from a real one, but a list of the real ones can. Set, it is
-// enforced at /configure, on server_info origins and in decodeConfig, since any one
-// point alone leaves a way round. Matched by exact hostname; a listed panel is
-// trusted, including wherever it redirects.
-const ALLOWED_PANEL_HOSTS = parseHostList(process.env.ALLOWED_PANEL_HOSTS, 'ALLOWED_PANEL_HOSTS');
-
-function panelHostAllowed(serverUrl) {
-    if (!ALLOWED_PANEL_HOSTS.size) return true;
-    const host = hostnameOf(serverUrl);
-    return host !== null && ALLOWED_PANEL_HOSTS.has(host);
-}
-
-// A refused token is logged once per host rather than once per request. An install
-// URL that stopped working when the list was set fires every catalog, meta and
-// stream request Stremio makes, and one line per host is enough to say why. Bounded,
-// because the hosts come from tokens rather than from this server's configuration.
-const refusedPanelHostsLogged = new Set();
-const REFUSED_PANEL_LOG_MAX = 1000;
-
-function noteRefusedPanel(serverUrl) {
-    const host = hostnameOf(serverUrl) || '(unparseable)';
-    if (refusedPanelHostsLogged.has(host) || refusedPanelHostsLogged.size >= REFUSED_PANEL_LOG_MAX) return;
-    refusedPanelHostsLogged.add(host);
-    console.warn(`[config] refusing an install URL for ${JSON.stringify(host)}, which is not in ALLOWED_PANEL_HOSTS`);
-}
+// hostnameOf, parseHostList, ALLOWED_PANEL_HOSTS, panelHostAllowed and
+// noteRefusedPanel moved to src/panel-allowlist.js. Required at the top of the
+// file, because decodeConfig enforces the panel list and so depends on it.
 
 function buildUrl(base, pathname, params = {}) {
     const url = new URL(pathname, base);
@@ -657,368 +432,14 @@ const PLAYLIST_BODY_TIMEOUT_MS = Math.max(1000, Number(process.env.PLAYLIST_BODY
 const MAX_PLAYLIST_ORIGINS = Math.max(1, Number(process.env.MAX_PLAYLIST_ORIGINS) || 32);
 const PLAYLIST_REWRITE_TIMEOUT_MS = Math.max(1000, Number(process.env.PLAYLIST_REWRITE_TIMEOUT_MS) || 15000);
 
-// --- HLS playlist proxying -------------------------------------------------
-//
-// An Xtream playlist names its segments by absolute URLs with the account's
-// credentials in the path, so playlists are rewritten: every URI becomes a link
-// back through this server. Each link's target is HMAC-signed (its own key, and an
-// `hls:` prefix) so the proxy is not an open relay, and encrypted so the
-// credentials cannot be read from a query string in a log. The signature and the
-// GCM associated data both cover the config token and an expiry, so a link is
-// bound to one account and dies. None of the signed fields can contain a `:`, so
-// concatenating them is unambiguous.
-const HLS_SIGNATURE_TTL_MS = Math.max(60 * 1000, Number(process.env.HLS_SIGNATURE_TTL_MS) || 60 * 60 * 1000);
+// The HLS signing, encryption and rewrite moved to src/hls/playlist.js. The
+// mapper that vets a target before signing it stays here, with the SSRF guard —
+// rewriteHlsPlaylist takes it as an argument, which is what lets that module be a
+// leaf.
 
-function signHlsTarget(payload, configToken = '', expiresAt = 0) {
-    return crypto.createHmac('sha256', HLS_MAC_KEY)
-        .update(`hls:${configToken}:${expiresAt}:${payload}`)
-        .digest('base64url');
-}
-
-// The same three fields the MAC covers, in the same order, bound to the
-// ciphertext instead of concatenated with it. `expiresAt` is stringified here
-// because the query carries it as a string and the decrypt side must associate
-// the identical bytes.
-function hlsTargetAad(configToken, expiresAt) {
-    return Buffer.from(`hls:${configToken}:${expiresAt}`, 'utf8');
-}
-
-// The plaintext is one kind byte and then the URL. The kind is what the
-// playlist said the target was — see HLS_PLAYLIST_URI_TAGS — and the proxy route
-// needs it before the body arrives: a nested playlist must be buffered and
-// rewritten in turn, while a segment must keep its Range support and stream.
-// It rides inside the ciphertext rather than beside it as another query field,
-// so it is covered by the GCM tag and the MAC with nothing further to sign.
-const HLS_KIND_PLAYLIST = 'p';
-const HLS_KIND_SEGMENT = 's';
-
-function encodeHlsTarget(absoluteUrl, configToken = '', now = Date.now(), playlist = false) {
-    const expiresAt = now + HLS_SIGNATURE_TTL_MS;
-    const iv = crypto.randomBytes(GCM_IV_BYTES);
-    const cipher = crypto.createCipheriv('aes-256-gcm', HLS_ENC_KEY, iv);
-    cipher.setAAD(hlsTargetAad(configToken, String(expiresAt)));
-    const plaintext = (playlist ? HLS_KIND_PLAYLIST : HLS_KIND_SEGMENT) + absoluteUrl;
-    const ciphertext = Buffer.concat([cipher.update(plaintext, 'utf8'), cipher.final()]);
-    // iv | tag | ciphertext in one field: the lengths are fixed, so the decrypt
-    // side slices rather than splitting, and the payload stays a single
-    // separator-free base64url string the way the signed string requires.
-    const payload = Buffer.concat([iv, cipher.getAuthTag(), ciphertext]).toString('base64url');
-    return { u: payload, s: signHlsTarget(payload, configToken, expiresAt), e: String(expiresAt) };
-}
-
-// Returns `{ url, playlist }` only when the signature verifies for this config
-// token and the expiry has not lapsed, so a caller cannot point this server at a
-// host of their choosing even holding a valid config token of their own.
-function decodeHlsTarget(payload, signature, expiry, configToken = '', now = Date.now()) {
-    if (typeof payload !== 'string' || typeof signature !== 'string') return null;
-    if (payload.length > 4096) return null;
-
-    // Parsed strictly: `Number('12e9')` and `Number(' 12 ')` both succeed, and
-    // an expiry that round-trips differently to the string that was signed
-    // would verify against a value it does not equal.
-    const expiresAt = typeof expiry === 'string' && /^\d{1,15}$/.test(expiry) ? Number(expiry) : NaN;
-    if (!Number.isSafeInteger(expiresAt)) return null;
-
-    // Signature first, then the clock, then the decrypt: the MAC is the cheapest
-    // of the three and rejects a forged link before any key schedule is set up,
-    // the same order the config token uses.
-    if (!timingSafeEqualString(signHlsTarget(payload, configToken, expiry), signature)) return null;
-    if (expiresAt <= now) return null;
-
-    try {
-        const raw = Buffer.from(payload, 'base64url');
-        // Strictly greater: the nonce and tag alone are a well-formed payload
-        // carrying an empty URL, which no minting path produces.
-        if (raw.length <= GCM_IV_BYTES + GCM_TAG_BYTES) return null;
-        const decipher = crypto.createDecipheriv(
-            'aes-256-gcm',
-            HLS_ENC_KEY,
-            raw.subarray(0, GCM_IV_BYTES),
-            { authTagLength: GCM_TAG_BYTES }
-        );
-        decipher.setAuthTag(raw.subarray(GCM_IV_BYTES, GCM_IV_BYTES + GCM_TAG_BYTES));
-        decipher.setAAD(hlsTargetAad(configToken, expiry));
-        const plaintext = Buffer.concat([
-            decipher.update(raw.subarray(GCM_IV_BYTES + GCM_TAG_BYTES)),
-            decipher.final()
-        ]).toString('utf8');
-
-        const kind = plaintext[0];
-        if (kind !== HLS_KIND_PLAYLIST && kind !== HLS_KIND_SEGMENT) return null;
-
-        const url = new URL(plaintext.slice(1));
-        if (!['http:', 'https:'].includes(url.protocol)) return null;
-        return { url: url.toString(), playlist: kind === HLS_KIND_PLAYLIST };
-    } catch {
-        return null;
-    }
-}
-
-const HLS_CONTENT_TYPES = /^(application\/(vnd\.apple\.mpegurl|x-mpegurl)|audio\/(mpegurl|x-mpegurl))/i;
-
-// The extension is the hint that matters: providers commonly return
-// text/plain or octet-stream for a playlist, so content-type alone would miss
-// them — and a missed playlist is relayed verbatim, with the provider's
-// credential-bearing URLs still in the body. `hlsTargetExt` is what supplies an
-// extension on the sub-resource route, where the request carries no file name.
-// A body that then turns out not to be a playlist is refused rather than
-// rewritten; see the EXTM3U check in relayUpstream.
-function looksLikePlaylist(ext, contentType) {
-    if (String(ext || '').toLowerCase() === 'm3u8') return true;
-    return HLS_CONTENT_TYPES.test(String(contentType || ''));
-}
-
-// What the sub-resource route should expect of a signed target, decided before
-// any of the body arrives — it has to be, because the streaming path forwards
-// Range and relays bytes through untouched.
-//
-// Two things say "playlist" ahead of the body. The capability itself, when the
-// URI sat on a tag that can only name one, is the reliable half: it comes from
-// the playlist's own structure rather than from anything the provider labelled.
-// A path ending in .m3u8 covers the rest — a playlist reached by a link this
-// server did not mint, or one whose tag context said nothing.
-//
-// Sniffing the body for #EXTM3U is deliberately not a third signal here. The
-// decision has to be made before reading anything, and the alternative to a
-// playlist on this route is a segment that may be gigabytes; buffering one to
-// find out is exactly what the streaming path exists to avoid.
-const PLAYLIST_PATH_EXT = /\.m3u8?$/i;
-
-// Every HLS playlist starts with this tag; the spec requires it on the first
-// line. A byte-order mark and leading blank lines are tolerated because real
-// panels emit both.
-const HLS_BODY_PREFIX = /^\uFEFF?\s*#EXTM3U/;
-
-// How much of a body has to be in hand to test that prefix: a byte-order mark
-// and a few blank lines, and no more — this is read before anything is relayed.
-const HLS_SNIFF_BYTES = 64;
-
-function hlsTargetExt(target) {
-    if (target.playlist) return 'm3u8';
-    // Parsed by decodeHlsTarget already, so this cannot throw.
-    return PLAYLIST_PATH_EXT.test(new URL(target.url).pathname) ? 'm3u8' : null;
-}
-
-// Playlists are kilobytes; anything far larger is not one. Bounded because the
-// rewrite has to buffer the whole body, unlike the streaming path.
-const MAX_PLAYLIST_BYTES = 4 * 1024 * 1024;
-
-// URI="..." appears on EXT-X-KEY, EXT-X-MAP, EXT-X-MEDIA, EXT-X-PART and
-// friends; those are sub-resources exactly like segment lines and leak the
-// same credentials if left alone.
-const HLS_URI_ATTR = /URI="([^"]*)"/gi;
-
-// Which lines name a *playlist* rather than a segment or a key. The distinction
-// is carried into the signed link, because the route that later fetches the
-// target cannot recover it: a variant playlist need not end in .m3u8 and is
-// routinely served as text/plain, and one relayed as if it were a segment goes
-// to the player unrewritten, credentials and all.
-// HLS states it unambiguously here instead. EXT-X-MEDIA and EXT-X-RENDITION-
-// REPORT name Media Playlists, EXT-X-I-FRAME-STREAM-INF an I-frame playlist,
-// and the URI *line* following an EXT-X-STREAM-INF is a Variant Stream's
-// playlist. Every other URI — EXT-X-KEY, EXT-X-MAP, EXT-X-PART, a plain segment
-// line — is a segment or a key, and must keep its Range support.
-const HLS_PLAYLIST_URI_TAGS = /^#EXT-X-(MEDIA|I-FRAME-STREAM-INF|RENDITION-REPORT)[:\s]/i;
-const HLS_STREAM_INF_TAG = /^#EXT-X-STREAM-INF[:\s]/i;
-
-// `toProxyUrl` maps one absolute upstream URL to a URL on this server.
-// Anything that will not resolve, or is not http(s), is left untouched rather
-// than dropped: a malformed line is the provider's business, and removing it
-// would silently corrupt the playlist.
-// `toProxyUrl` may be async — the mapper used in production resolves DNS to
-// check the target before signing it — so this is async throughout.
-async function rewriteHlsPlaylist(text, baseUrl, toProxyUrl, { deadline = null } = {}) {
-    const mapUri = async (raw, playlist) => {
-        // Checked here rather than around the whole pass because this is the only
-        // point that awaits: a timer cannot interrupt an await chain, so the loop
-        // has to look. Throwing rather than emitting a partly-rewritten playlist
-        // is deliberate — the un-rewritten lines are the provider's own URLs, and
-        // those carry the account credentials this rewrite exists to hide.
-        if (deadline !== null && Date.now() > deadline) {
-            const err = new Error('playlist rewrite deadline exceeded');
-            err.code = 'PLAYLIST_REWRITE_TIMEOUT';
-            throw err;
-        }
-        const uri = String(raw).trim();
-        if (!uri) return null;
-        let absolute;
-        try {
-            absolute = new URL(uri, baseUrl);
-        } catch {
-            return null;
-        }
-        if (!['http:', 'https:'].includes(absolute.protocol)) return null;
-        const mapped = await toProxyUrl(absolute.toString(), Boolean(playlist));
-        if (mapped) return mapped;
-        // The mapper refused this target. Leaving the line would hand the player
-        // the provider's credential-bearing URL, and dropping it is unsafe (a
-        // dropped EXT-X-KEY URI makes encrypted segments look plaintext), so the
-        // whole playlist is refused.
-        const err = new Error('playlist names a target this server will not proxy');
-        err.code = 'PLAYLIST_TARGET_REFUSED';
-        throw err;
-    };
-
-    // replace() cannot await, so URI attributes are walked by hand. The regex is
-    // built per call rather than shared: awaiting mid-scan would otherwise let a
-    // concurrent rewrite move lastIndex out from under this one.
-    const rewriteUriAttrs = async (body, playlist) => {
-        const scanner = new RegExp(HLS_URI_ATTR.source, HLS_URI_ATTR.flags);
-        const parts = [];
-        let cursor = 0;
-        let match;
-        while ((match = scanner.exec(body)) !== null) {
-            const mapped = await mapUri(match[1], playlist);
-            parts.push(body.slice(cursor, match.index), mapped ? `URI="${mapped}"` : match[0]);
-            cursor = match.index + match[0].length;
-        }
-        parts.push(body.slice(cursor));
-        return parts.join('');
-    };
-
-    const out = [];
-    // Set by an EXT-X-STREAM-INF and consumed by the next URI line, which is the
-    // one place a playlist's kind is stated by position rather than by the tag
-    // the URI sits on. Not cleared by the tags and comments that may sit in
-    // between: the spec says the URI line follows immediately, and erring toward
-    // "playlist" costs a buffered fetch, while erring the other way relays a
-    // playlist to the player with the provider's credentials still in it.
-    let nextUriIsPlaylist = false;
-
-    for (const line of text.split('\n')) {
-        // Preserve CRLF exactly: some players are strict about the line ending.
-        const cr = line.endsWith('\r') ? '\r' : '';
-        const body = cr ? line.slice(0, -1) : line;
-
-        if (!body.trim()) {
-            out.push(line);
-            continue;
-        }
-        if (body.startsWith('#')) {
-            out.push(await rewriteUriAttrs(body, HLS_PLAYLIST_URI_TAGS.test(body)) + cr);
-            if (HLS_STREAM_INF_TAG.test(body)) nextUriIsPlaylist = true;
-            continue;
-        }
-
-        const mapped = await mapUri(body, nextUriIsPlaylist);
-        nextUriIsPlaylist = false;
-        out.push(mapped ? mapped + cr : line);
-    }
-    return out.join('\n');
-}
-
-function ipv4ToLong(ip) {
-    return ip.split('.').reduce((acc, part) => ((acc << 8) + Number(part)) >>> 0, 0);
-}
-
-// Both families are matched as numeric CIDR prefixes. IPv6 used to be matched
-// by string prefix, which is where the gaps were: `fe80:` catches only the
-// first /64 of a range that spans fe80–febf, and nothing at all looked inside
-// the transition formats that embed an IPv4 address.
-const IPV4_PRIVATE_CIDRS = [
-    ['0.0.0.0', 8],          // "this network"
-    ['10.0.0.0', 8],         // RFC 1918
-    ['100.64.0.0', 10],      // carrier-grade NAT
-    ['127.0.0.0', 8],        // loopback
-    ['169.254.0.0', 16],     // link-local, and the cloud metadata endpoint
-    ['172.16.0.0', 12],      // RFC 1918
-    ['192.0.0.0', 24],       // IETF protocol assignments
-    ['192.168.0.0', 16],     // RFC 1918
-    ['198.18.0.0', 15],      // benchmarking
-    ['224.0.0.0', 3]         // multicast, reserved and broadcast, to the end
-].map(([address, bits]) => ({ network: ipv4ToLong(address), mask: bits === 0 ? 0 : (0xffffffff << (32 - bits)) >>> 0 }));
-
-// Expands to the full 16 bytes. `net.isIP` has already validated the syntax, so
-// this only has to handle the shapes it accepts: one optional `::` run, and an
-// optional trailing dotted quad standing in for the last two groups.
-function ipv6ToBytes(input) {
-    const ip = String(input || '').split('%')[0];   // drop any zone id
-    if (net.isIP(ip) !== 6) return null;
-
-    const halves = ip.split('::');
-    const toGroups = (part) => {
-        if (!part) return [];
-        const groups = [];
-        for (const chunk of part.split(':')) {
-            if (chunk.includes('.')) {
-                const quad = chunk.split('.').map(Number);
-                groups.push((quad[0] << 8) | quad[1], (quad[2] << 8) | quad[3]);
-            } else {
-                groups.push(parseInt(chunk, 16));
-            }
-        }
-        return groups;
-    };
-
-    const head = toGroups(halves[0]);
-    const tail = halves.length === 2 ? toGroups(halves[1]) : [];
-    const groups = halves.length === 2
-        ? [...head, ...Array(8 - head.length - tail.length).fill(0), ...tail]
-        : head;
-    if (groups.length !== 8) return null;
-
-    const bytes = Buffer.alloc(16);
-    groups.forEach((group, i) => bytes.writeUInt16BE(group & 0xffff, i * 2));
-    return bytes;
-}
-
-function ipv6MatchesPrefix(bytes, prefixBytes, bits) {
-    const whole = bits >> 3;
-    for (let i = 0; i < whole; i++) {
-        if (bytes[i] !== prefixBytes[i]) return false;
-    }
-    const spare = bits & 7;
-    if (spare === 0) return true;
-    const mask = (0xff << (8 - spare)) & 0xff;
-    return (bytes[whole] & mask) === (prefixBytes[whole] & mask);
-}
-
-const IPV6_PRIVATE_PREFIXES = [
-    // ::/96 covers the unspecified address, loopback, and the deprecated
-    // IPv4-compatible form (audit L4). Unlike the wrappers below it is blocked
-    // whole rather than judged by the IPv4 it embeds: RFC 4291 deprecated the
-    // format outright, so nothing legitimate is reached through it, while
-    // `::127.0.0.1` is loopback on any host that still accepts one.
-    ['::', 96],
-    ['64:ff9b:1::', 48],     // local-use NAT64 (RFC 8215) — local by definition
-    ['2001::', 32],          // Teredo, a tunnel into someone else's network
-    ['fc00::', 7],           // unique local (fc00–fdff)
-    ['fe80::', 10],          // link-local (fe80–febf) — the old check saw 1/64 of this
-    ['fec0::', 10],          // site-local, deprecated but still routed on some networks
-    ['ff00::', 8]            // multicast
-].map(([prefix, bits]) => ({ bytes: ipv6ToBytes(prefix), bits }));
-
-// Formats that carry an IPv4 address inside an IPv6 one. Each is decided by the
-// address it embeds rather than blocked outright: a 6to4 address wrapping a
-// public IPv4 is itself public, and refusing those would break real providers.
-// `64:ff9b::7f00:1` is the one that matters — on a NAT64 network it reaches
-// 127.0.0.1, and the old check let it straight through.
-const IPV6_EMBEDDED_IPV4 = [
-    ['::ffff:0:0', 96, 12],  // v4-mapped
-    ['64:ff9b::', 96, 12],   // NAT64 (RFC 6052)
-    ['2002::', 16, 2]        // 6to4 (RFC 3056)
-].map(([prefix, bits, offset]) => ({ bytes: ipv6ToBytes(prefix), bits, offset }));
-
-function isPrivateIp(ip) {
-    if (net.isIP(ip) === 4) {
-        const n = ipv4ToLong(ip);
-        return IPV4_PRIVATE_CIDRS.some(({ network, mask }) => ((n & mask) >>> 0) === network);
-    }
-
-    const bytes = ipv6ToBytes(ip);
-    // Not an address at all. Refuse it: everything reaching here comes from
-    // dns.lookup or from a literal that net.isIP already accepted, so an
-    // unparseable value means something unexpected — and "unexpected" is not a
-    // reason to allow an outbound connection.
-    if (!bytes) return true;
-
-    for (const { bytes: prefix, bits, offset } of IPV6_EMBEDDED_IPV4) {
-        if (ipv6MatchesPrefix(bytes, prefix, bits)) {
-            return isPrivateIp(Array.from(bytes.subarray(offset, offset + 4)).join('.'));
-        }
-    }
-    return IPV6_PRIVATE_PREFIXES.some(({ bytes: prefix, bits }) => ipv6MatchesPrefix(bytes, prefix, bits));
-}
+// Moved to src/net/private-ip.js: it is pure, has its own test file, and the
+// tables are the part most likely to be edited on its own. Required at the top
+// of the file; re-exported below so the suite still reaches it through index.js.
 
 // --- DNS pinning -----------------------------------------------------------
 //
@@ -1501,187 +922,9 @@ function accountCacheKey(cfg) {
     }
     return JSON.stringify([server, cfg.username, cfg.password]);
 }
-
-// One memory budget shared by every data cache (CACHE_MAX_MB, audit R2): the
-// per-cache bounds do not add up to any figure of memory. LRU across all caches in
-// one order. Entries are tracked by object identity, so caches sharing a key string
-// cannot collide, and by the weight they were added with, so the total cannot drift.
-class CacheBudget {
-    constructor(maxBytes) {
-        this.maxBytes = maxBytes;
-        this.totalBytes = 0;
-        this.order = new Map(); // entry -> { owner, key, bytes }
-    }
-
-    add(entry, owner, key) {
-        const bytes = weightOf(entry);
-        this.order.set(entry, { owner, key, bytes });
-        this.totalBytes += bytes;
-    }
-
-    touch(entry) {
-        const ref = this.order.get(entry);
-        if (!ref) return;
-        this.order.delete(entry);
-        this.order.set(entry, ref);
-    }
-
-    remove(entry) {
-        const ref = this.order.get(entry);
-        if (!ref) return;
-        this.order.delete(entry);
-        this.totalBytes -= ref.bytes;
-    }
-
-    // Evicts oldest-first until the total fits, never the entry just written.
-    // Eviction goes through the owning cache, so its own total and its onEvict
-    // report stay right; the size check afterwards is what guarantees the loop
-    // ends even if an owner were ever to fail to release its entry.
-    enforce(keep) {
-        while (this.totalBytes > this.maxBytes) {
-            let victim = null;
-            for (const [entry, ref] of this.order) {
-                if (entry !== keep) {
-                    victim = ref;
-                    break;
-                }
-            }
-            if (!victim) break;
-            const before = this.order.size;
-            victim.owner.evict(victim.key, 'global budget');
-            if (this.order.size === before) break;
-        }
-    }
-}
-
-// An LRU Map bounded by entry count, optionally by weight (`maxBytes`, from each
-// entry's `bytes`) and by age (`sweep`). Map iterates in insertion order, so
-// re-inserting on read makes the first key the least recently used. `onEvict`
-// reports what was dropped and why. `ledger` charges entries to a shared
-// CacheBudget; opt-in, so a test's map does not compete with the real caches.
-class BoundedMap extends Map {
-    constructor({ maxEntries, maxAgeMs = null, maxBytes = null, onEvict = null, ledger = null }) {
-        super();
-        this.maxEntries = maxEntries;
-        this.maxAgeMs = maxAgeMs;
-        this.maxBytes = maxBytes;
-        this.onEvict = onEvict;
-        this.ledger = ledger;
-        this.totalBytes = 0;
-    }
-
-    get(key) {
-        const entry = super.get(key);
-        if (entry === undefined) return undefined;
-        // Touch: delete + re-insert moves this key to the most-recent end.
-        super.delete(key);
-        super.set(key, entry);
-        if (this.ledger) this.ledger.touch(entry);
-        return entry;
-    }
-
-    // Read without disturbing LRU order. vetHlsOrigin uses it to check an entry
-    // is still the one it wrote, and tests use it to inspect a cache without
-    // changing what is evicted next.
-    peek(key) {
-        return super.get(key);
-    }
-
-    set(key, value) {
-        // An entry larger than the whole shared budget is not stored at all:
-        // keeping it would evict every other account's data and still not fit.
-        // What it would have replaced goes too.
-        if (this.ledger && weightOf(value) > this.ledger.maxBytes) {
-            this.delete(key);
-            console.warn(
-                `[cache] not caching a ${Math.round(weightOf(value) / 1048576)} MB entry: larger than the ` +
-                `whole CACHE_MAX_MB budget (${Math.round(this.ledger.maxBytes / 1048576)} MB). It will be ` +
-                'fetched again on every request; raise CACHE_MAX_MB if a real provider sends lists this large'
-            );
-            return this;
-        }
-
-        const replaced = super.get(key);
-        if (replaced) {
-            this.totalBytes -= weightOf(replaced);
-            if (this.ledger) this.ledger.remove(replaced);
-        }
-        super.delete(key);
-        super.set(key, value);
-        this.totalBytes += weightOf(value);
-        if (this.ledger) this.ledger.add(value, this, key);
-
-        // Never evict what was just written, even when a single entry is larger
-        // than the whole budget: refusing to cache it at all would mean
-        // refetching it on every request, which is worse than being over.
-        while (this.size > 1 && (this.size > this.maxEntries || this.overBudget())) {
-            // Map keys iterate oldest-first; the first is the LRU victim.
-            const oldest = this.keys().next();
-            if (oldest.done || oldest.value === key) break;
-            this.evict(oldest.value, this.size > this.maxEntries ? 'entry count' : 'byte budget');
-        }
-        if (this.ledger) this.ledger.enforce(value);
-        return this;
-    }
-
-    overBudget() {
-        return this.maxBytes !== null && this.totalBytes > this.maxBytes;
-    }
-
-    evict(key, reason) {
-        const entry = super.get(key);
-        super.delete(key);
-        this.totalBytes -= weightOf(entry);
-        if (this.ledger) this.ledger.remove(entry);
-        if (this.onEvict) this.onEvict(key, entry, reason);
-        return entry;
-    }
-
-    delete(key) {
-        if (super.has(key)) {
-            const entry = super.get(key);
-            this.totalBytes -= weightOf(entry);
-            if (this.ledger) this.ledger.remove(entry);
-        }
-        return super.delete(key);
-    }
-
-    // Releases only this map's share of a shared budget, not the whole of it.
-    clear() {
-        if (this.ledger) for (const entry of super.values()) this.ledger.remove(entry);
-        this.totalBytes = 0;
-        return super.clear();
-    }
-
-    // Drops entries past maxAgeMs. Caches whose expired entries are still
-    // useful (see catCache) pass a deliberately generous age, or none at all.
-    //
-    // An entry carrying its own ttl longer than maxAgeMs is reclaimed on that
-    // instead: the stale-on-failure path extends one deliberately so the list
-    // keeps being served through an outage, and sweeping it on the map's age
-    // silently undid that a few minutes later (audit L3). A *shorter* per-entry
-    // ttl never shortens the sweep — those entries stop being served on their
-    // own ttl and are reclaimed here on the map's, exactly as before — so this
-    // only ever keeps an entry that something deliberately asked to keep.
-    sweep(now = Date.now()) {
-        if (!this.maxAgeMs) return 0;
-        let dropped = 0;
-        for (const [key, entry] of this) {
-            const maxAge = Math.max(this.maxAgeMs, typeof entry?.ttl === 'number' ? entry.ttl : 0);
-            if (entry && typeof entry.ts === 'number' && entry.ts <= now - maxAge) {
-                super.delete(key);
-                this.totalBytes -= weightOf(entry);
-                if (this.ledger) this.ledger.remove(entry);
-                dropped++;
-            }
-        }
-        return dropped;
-    }
-}
-
-function weightOf(entry) {
-    return typeof entry?.bytes === 'number' ? entry.bytes : 0;
-}
+// BoundedMap, CacheBudget and weightOf moved to src/cache/bounded-map.js — the
+// bounding primitives, with no TTL or upstream knowledge. estimateBytes stays
+// here, beside the reader whose byte count it reads.
 
 // What a cached value costs in memory — estimated heap, not serialized size (`{}`
 // serializes to 2 bytes and occupies 56). The weights are readJsonCapped's.
@@ -2579,222 +1822,8 @@ async function validateXtremioCredentials(serverUrl, username, password) {
         }
     }
 }
-
-// `nonce` comes from setPrivateHeaders and is the only thing that lets this
-// page's one script run under its CSP. Rendering without one (a caller that
-// forgot, or a test) still produces a working page — only the click-to-copy
-// convenience goes quiet, since the link is selectable text either way.
-function renderConfigPage({ serverUrl = '', username = '', password = '', status = null, baseUrl = `http://localhost:${PORT}`, nonce = '' }) {
-    // Base64 contains nothing escapeHtml touches, so this is identical to the
-    // value in the header — it just keeps the rule that every interpolation on
-    // this page goes through escapeHtml, with no exception to remember.
-    const safeNonce = escapeHtml(nonce);
-    const safeServerUrl = escapeHtml(serverUrl);
-    const safeUsername = escapeHtml(username);
-    const safePassword = escapeHtml(password);
-    let statusHtml = '';
-    if (status) {
-        if (status.valid) {
-            const encoded = encodeConfig({ serverUrl, username, password });
-            const installUrl = escapeHtml(`stremio://${baseUrl.replace(/^https?:\/\//, '')}/${encoded}/manifest.json`);
-            const httpUrl = escapeHtml(`${baseUrl}/${encoded}/manifest.json`);
-            // The connection was downgraded to http and that choice is now baked
-            // into the install token, so say so plainly rather than letting the
-            // green "Connected!" banner imply everything is fine.
-            const downgradeHtml = status.downgrade ? `
-                    <div class="status-banner status-warning">
-                        <svg fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2.5" d="M12 9v4m0 4h.01M10.29 3.86L1.82 18a2 2 0 001.71 3h16.94a2 2 0 001.71-3L13.71 3.86a2 2 0 00-3.42 0z"/></svg>
-                        <span class="status-text">
-                            <strong>Connected over http, not https.</strong>
-                            ${status.downgrade.source === 'fallback'
-                                ? 'The https connection failed, so http was used instead.'
-                                : 'Your provider asked for http even though https worked.'}
-                            Your username and password will be sent in cleartext on every request, and this choice is saved into the install link below.
-                            ${status.downgrade.source === 'fallback'
-                                ? 'If your provider does support https, fix the URL and configure again.'
-                                : ''}
-                        </span>
-                    </div>` : '';
-            statusHtml = `
-                <div class="status-section">
-                    <div class="status-banner status-success">
-                        <svg fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="3" d="M5 13l4 4L19 7"/></svg>
-                        <span class="status-text">Connected! Welcome, ${escapeHtml(status.userInfo.username || username)}</span>
-                    </div>${downgradeHtml}
-                    <a href="${installUrl}" class="btn full install-link">
-                        <svg fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M4 16v1a3 3 0 003 3h10a3 3 0 003-3v-1m-4-4l-4 4m0 0l-4-4m4 4V4"/></svg>
-                        Install in Stremio
-                    </a>
-                    <div class="copy-block">
-                        <p id="copy-label" class="copy-label" data-idle="Or copy this link to install:">Or copy this link to install:</p>
-                        <input type="text" id="copy-input" class="copy-input" value="${httpUrl}" readonly title="Click to copy install link" />
-                    </div>
-                </div>
-                <script nonce="${safeNonce}">
-                (function () {
-                    var input = document.getElementById('copy-input');
-                    var label = document.getElementById('copy-label');
-                    if (!input || !label) return;
-                    var timer = null;
-
-                    function report(copied) {
-                        label.textContent = copied ? '✓ Copied to clipboard!' : 'Press Ctrl+C to copy';
-                        label.style.color = copied ? '#2e7d32' : '#555';
-                        clearTimeout(timer);
-                        timer = setTimeout(function () {
-                            label.textContent = label.dataset.idle;
-                            label.style.color = '#555';
-                        }, 2000);
-                    }
-
-                    function copyViaSelection() {
-                        // execCommand is deprecated but stays as the fallback rather
-                        // than the other way round: navigator.clipboard exists only on
-                        // secure origins, and this addon is most often reached over
-                        // plain http on a LAN, where it is undefined.
-                        try { return document.execCommand('copy'); } catch (e) { return false; }
-                    }
-
-                    input.addEventListener('click', function () {
-                        input.select();
-                        if (navigator.clipboard && navigator.clipboard.writeText) {
-                            navigator.clipboard.writeText(input.value).then(function () {
-                                report(true);
-                            }, function () {
-                                report(copyViaSelection());
-                            });
-                        } else {
-                            report(copyViaSelection());
-                        }
-                    });
-                })();
-                </script>`;
-        } else {
-            statusHtml = `
-                <div class="status-section">
-                    <div class="status-banner status-error">
-                        <svg fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="3" d="M6 18L18 6M6 6l12 12"/></svg>
-                        <span class="status-text">${escapeHtml(status.error)}</span>
-                    </div>
-                </div>`;
-        }
-    }
-
-    return `<!DOCTYPE html>
-    <html><head>
-        <title>xTremio Configuration</title>
-        <meta name="viewport" content="width=device-width, initial-scale=1.0">
-        <style>
-            * { box-sizing: border-box; margin: 0; padding: 0; }
-            body {
-                font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Oxygen, Ubuntu, sans-serif;
-                min-height: 100vh; display: flex; align-items: center; justify-content: center;
-                background: linear-gradient(135deg, #1a1a2e 0%, #16213e 50%, #0f3460 100%);
-                padding: 20px;
-            }
-            .card {
-                background: #fff; border-radius: 16px;
-                box-shadow: 0 20px 60px rgba(0,0,0,0.3);
-                max-width: 420px; width: 100%; overflow: hidden;
-            }
-            .header {
-                background: linear-gradient(135deg, #7c4dff 0%, #5c6bc0 100%);
-                padding: 30px; text-align: center;
-            }
-            .header h1 { color: #fff; font-size: 24px; font-weight: 600; }
-            .header p { color: rgba(255,255,255,0.8); font-size: 14px; margin-top: 8px; }
-            .btn {
-                display: inline-flex; align-items: center; gap: 10px;
-                padding: 14px 32px;
-                background: linear-gradient(135deg, #7c4dff 0%, #5c6bc0 100%);
-                color: #fff; text-decoration: none; border: none;
-                border-radius: 10px; font-size: 16px; font-weight: 600; cursor: pointer;
-                transition: transform 0.2s, box-shadow 0.2s;
-            }
-            .btn:hover { transform: translateY(-2px); box-shadow: 0 8px 25px rgba(124,77,255,0.4); }
-            .btn:active { transform: translateY(0); }
-            .btn svg { width: 20px; height: 20px; }
-            .form-container { padding: 30px; }
-            .input-group { margin-bottom: 20px; }
-            .input-group label { display: block; font-size: 13px; font-weight: 600; color: #333; margin-bottom: 8px; }
-            .input-wrapper { position: relative; }
-            .input-wrapper svg { position: absolute; left: 14px; top: 50%; transform: translateY(-50%); width: 18px; height: 18px; color: #999; }
-            .input-wrapper input { width: 100%; padding: 14px 14px 14px 44px; border: 2px solid #e0e0e0; border-radius: 10px; font-size: 15px; transition: border-color 0.2s, box-shadow 0.2s; }
-            .input-wrapper input:focus { outline: none; border-color: #7c4dff; box-shadow: 0 0 0 3px rgba(124,77,255,0.1); }
-            .input-wrapper input::placeholder { color: #aaa; }
-            .btn.full { width: 100%; justify-content: center; }
-            .status-section { padding: 0 30px 30px; text-align: center; }
-            .status-banner { padding: 16px; border-radius: 10px; display: flex; align-items: center; gap: 12px; margin-bottom: 16px; }
-            .status-banner svg { width: 22px; height: 22px; flex-shrink: 0; }
-            .status-banner .status-text { font-size: 14px; font-weight: 500; text-align: left; }
-            .status-success { background: #e8f5e9; color: #2e7d32; }
-            .status-error { background: #ffebee; color: #c62828; }
-            .status-warning { background: #fff8e1; color: #8a5a00; }
-            .status-warning .status-text { line-height: 1.5; }
-            .install-link { margin-top: 4px; }
-            .copy-block { margin-top: 16px; }
-            .copy-label { font-size: 13px; color: #555; margin-bottom: 8px; font-weight: 600; text-align: left; }
-            .copy-input { width: 100%; padding: 12px; border: 2px solid #e0e0e0; border-radius: 10px; font-size: 14px; color: #333; background: #f9f9f9; cursor: pointer; text-align: center; transition: border-color 0.2s; }
-            .copy-input:hover { border-color: #7c4dff; }
-            .disclaimer {
-                background: #fff8e1;
-                border: 1px solid #ffe082;
-                color: #5d4037;
-                border-radius: 10px;
-                padding: 12px 14px;
-                font-size: 12px;
-                line-height: 1.5;
-                margin-bottom: 22px;
-            }
-            .disclaimer strong { color: #ef6c00; display: block; margin-bottom: 4px; font-size: 13px; }
-            .disclaimer ul { margin: 6px 0 0 18px; padding: 0; }
-            .disclaimer li { margin-bottom: 3px; }
-        </style>
-    </head><body>
-        <div class="card">
-            <div class="header">
-                <h1>xTremio Addon</h1>
-                <p>Configure your credentials</p>
-            </div>
-            <div class="form-container">
-                <div class="disclaimer">
-                    <strong>⚠ Disclaimer</strong>
-                    This addon is a technical gateway only. It does <b>not</b> host, store, or provide any media content.
-                    <ul>
-                        <li>You must have a valid, legally obtained Xtream Codes account.</li>
-                        <li>You are solely responsible for the content accessed through your provider.</li>
-                        <li>Credentials are encrypted into your install URL &mdash; keep it private, do not share it.</li>
-                    </ul>
-                </div>
-                <form method="POST" action="/configure">
-                    <div class="input-group">
-                        <label>Server URL</label>
-                        <div class="input-wrapper">
-                            <svg fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M21 12a9 9 0 01-9 9m9-9a9 9 0 00-9-9m9 9H3m9 9a9 9 0 01-9-9m9 9c1.657 0 3-4.03 3-9s-1.343-9-3-9m0 18c-1.657 0-3-4.03-3-9s1.343-9 3-9m-9 9a9 9 0 019-9"/></svg>
-                            <input type="url" name="serverUrl" value="${safeServerUrl}" placeholder="http://example.com:port" required />
-                        </div>
-                    </div>
-                    <div class="input-group">
-                        <label>Username</label>
-                        <div class="input-wrapper">
-                            <svg fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M16 7a4 4 0 11-8 0 4 4 0 018 0zM12 14a7 7 0 00-7 7h14a7 7 0 00-7-7z"/></svg>
-                            <input type="text" name="username" value="${safeUsername}" placeholder="Enter username" required />
-                        </div>
-                    </div>
-                    <div class="input-group">
-                        <label>Password</label>
-                        <div class="input-wrapper">
-                            <svg fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M12 15v2m-6 4h12a2 2 0 002-2v-6a2 2 0 00-2-2H6a2 2 0 00-2 2v6a2 2 0 002 2zm10-10V7a4 4 0 00-8 0v4h8z"/></svg>
-                            <input type="password" name="password" value="${safePassword}" placeholder="Enter password" required />
-                        </div>
-                    </div>
-                    <button type="submit" class="btn full">Save & Install</button>
-                </form>
-            </div>
-            ${statusHtml}
-        </div>
-    </body></html>`;
-}
+// renderConfigPage moved to src/pages/configure.js. The route that serves it,
+// and setPrivateHeaders which mints its CSP nonce, stay here.
 
 // The configure page echoes a submitted password and embeds the install token, so
 // it is kept out of caches and Referer headers, and cannot be framed (it is a
@@ -4377,123 +3406,9 @@ app.all('/:config/proxy/hls', async (req, res) => {
     });
 });
 
-app.get('/', (req, res) => {
-    res.send(`<!DOCTYPE html>
-<html lang="en">
-<head>
-    <meta charset="UTF-8">
-    <title>xTremio &mdash; Stremio Addon</title>
-    <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <meta name="description" content="Stremio addon that exposes any Xtream Codes IPTV provider as Live TV, Movies and Series.">
-    <style>
-        * { box-sizing: border-box; margin: 0; padding: 0; }
-        body {
-            font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
-            min-height: 100vh;
-            display: flex;
-            align-items: center;
-            justify-content: center;
-            background: linear-gradient(135deg, #1a1a2e 0%, #16213e 50%, #0f3460 100%);
-            color: #fff;
-            padding: 20px;
-            text-align: center;
-        }
-        .wrap { max-width: 560px; width: 100%; }
-        .logo {
-            display: inline-flex;
-            align-items: center;
-            justify-content: center;
-            width: 72px; height: 72px;
-            background: linear-gradient(135deg, #7c4dff 0%, #5c6bc0 100%);
-            border-radius: 20px;
-            margin-bottom: 24px;
-            box-shadow: 0 10px 30px rgba(124,77,255,0.4);
-        }
-        .logo svg { width: 38px; height: 38px; color: #fff; }
-        h1 { font-size: 36px; font-weight: 700; margin-bottom: 12px; letter-spacing: -0.5px; }
-        .tagline { font-size: 17px; color: rgba(255,255,255,0.75); margin-bottom: 36px; line-height: 1.5; }
-        .features {
-            display: grid;
-            grid-template-columns: repeat(3, 1fr);
-            gap: 12px;
-            margin-bottom: 36px;
-        }
-        .feature {
-            background: rgba(255,255,255,0.06);
-            border: 1px solid rgba(255,255,255,0.1);
-            border-radius: 12px;
-            padding: 16px 10px;
-            font-size: 13px;
-            color: rgba(255,255,255,0.85);
-        }
-        .feature b { display: block; color: #fff; font-size: 14px; margin-bottom: 4px; }
-        .btn {
-            display: inline-flex; align-items: center; gap: 10px;
-            padding: 16px 36px;
-            background: linear-gradient(135deg, #7c4dff 0%, #5c6bc0 100%);
-            color: #fff; text-decoration: none;
-            border-radius: 12px;
-            font-size: 16px; font-weight: 600;
-            transition: transform 0.2s, box-shadow 0.2s;
-            box-shadow: 0 8px 20px rgba(124,77,255,0.3);
-        }
-        .btn:hover { transform: translateY(-2px); box-shadow: 0 12px 30px rgba(124,77,255,0.5); }
-        .btn svg { width: 20px; height: 20px; }
-        .links {
-            margin-top: 28px;
-            font-size: 14px;
-            color: rgba(255,255,255,0.6);
-        }
-        .links a {
-            color: rgba(255,255,255,0.85);
-            text-decoration: none;
-            border-bottom: 1px solid rgba(255,255,255,0.3);
-            padding-bottom: 1px;
-        }
-        .links a:hover { color: #fff; border-bottom-color: #fff; }
-        .footer {
-            margin-top: 40px;
-            font-size: 12px;
-            color: rgba(255,255,255,0.4);
-            line-height: 1.6;
-        }
-        @media (max-width: 520px) {
-            h1 { font-size: 28px; }
-            .features { grid-template-columns: 1fr; }
-        }
-    </style>
-</head>
-<body>
-    <div class="wrap">
-        <div class="logo">
-            <svg fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M15 10l4.553-2.276A1 1 0 0121 8.618v6.764a1 1 0 01-1.447.894L15 14M5 18h8a2 2 0 002-2V8a2 2 0 00-2-2H5a2 2 0 00-2 2v8a2 2 0 002 2z"/></svg>
-        </div>
-        <h1>xTremio</h1>
-        <p class="tagline">A Stremio addon that turns your Xtream Codes IPTV provider into browseable Live TV, Movies, and Series catalogs.</p>
-
-        <div class="features">
-            <div class="feature"><b>Live TV</b>Watch your channels</div>
-            <div class="feature"><b>Movies &amp; Series</b>Full VOD catalog</div>
-            <div class="feature"><b>Global Search</b>Across everything</div>
-        </div>
-
-        <a href="/configure" class="btn">
-            <svg fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M13 10V3L4 14h7v7l9-11h-7z"/></svg>
-            Install Addon
-        </a>
-
-        <div class="links">
-            <a href="https://github.com/izemhsn/xTremio-stremio-addon" target="_blank" rel="noopener">View on GitHub</a>
-        </div>
-
-        <div class="footer">
-            This is a self-hosted technical gateway. No media is hosted here.<br>
-            You must supply your own legally obtained Xtream Codes account.
-        </div>
-    </div>
-</body>
-</html>`);
-});
+// The page itself is in src/pages/landing.js; it is static, so the route is just
+// the send.
+app.get('/', (req, res) => res.send(renderLandingPage()));
 
 // --- Server lifecycle ---
 // This process is a streaming proxy, not a plain JSON API: a single request can
