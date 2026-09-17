@@ -161,7 +161,10 @@ test('each copy of the body is released before the next is allocated', () => {
     // heap either way. The shape is the guarantee, so the shape is what is
     // pinned: chunks emptied before the stringify, buffer dropped before the
     // parse. Written as one expression again, this would silently regress.
-    const src = require('node:fs').readFileSync(require.resolve('../index.js'), 'utf8');
+    // Source-level, because nothing observable from outside the function can tell
+    // the two shapes apart — a GC that happens not to run leaves the same heap
+    // either way. So it has to read the file readJsonCapped is written in.
+    const src = require('node:fs').readFileSync(require.resolve('../src/upstream/read-capped.js'), 'utf8');
     const body = src.slice(src.indexOf('async function readJsonCapped'));
     const fn = body.slice(0, body.indexOf('\n}\n'));
 

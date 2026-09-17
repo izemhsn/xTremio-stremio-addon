@@ -13,7 +13,16 @@ process.env.CONFIG_SECRET = 'test-secret-for-unit-tests';
 const test = require('node:test');
 const assert = require('node:assert');
 
-const { resolveHostAddresses, assertSafeOutboundUrl, dnsPins, dnsFallback, DNS_TIMEOUT_MS } = require('../index.js');
+const {
+    resolveHostAddresses,
+    assertSafeOutboundUrl,
+    dnsPins,
+    dnsFallback,
+    DNS_TIMEOUT_MS,
+    DNS_SERVERS,
+    parseDnsServers,
+    makeDnsResolver
+} = require('../index.js');
 
 // Stands in for dns.Resolver: answers per family, or never answers at all.
 function fakeResolver({ v4 = [], v6 = [], hang = false } = {}) {
@@ -204,4 +213,57 @@ test('localhost names are refused by name, without a lookup', async () => {
         await assert.rejects(() => assertSafeOutboundUrl(url, { resolve }), (e) => e.code === 'OUTBOUND_BLOCKED', url);
     }
     assert.equal(lookups, 0);
+});
+
+// --- DNS_SERVERS -----------------------------------------------------------
+//
+// c-ares works out its own nameserver list and can get it wrong where the OS
+// resolver works: one Windows host gave it only 127.0.0.1, so every lookup failed
+// with ECONNREFUSED and /configure called every panel unreachable. The
+// DNS_RESOLVER_UNUSABLE fallback keeps that host serving; this is how an operator
+// fixes it properly.
+
+test('DNS_SERVERS accepts every spelling c-ares does', () => {
+    const quiet = { warn() {} };
+    assert.deepEqual(
+        parseDnsServers('8.8.8.8, 1.1.1.1:53 ,2001:4860:4860::8888,[2001:4860:4860::8844]:53', 'DNS_SERVERS', quiet),
+        ['8.8.8.8', '1.1.1.1:53', '2001:4860:4860::8888', '[2001:4860:4860::8844]:53']
+    );
+    // Validation is c-ares' own, not a regular expression of ours, so the rule
+    // cannot drift from what setServers will actually take.
+    assert.deepEqual(parseDnsServers('', 'DNS_SERVERS', quiet), []);
+    assert.deepEqual(parseDnsServers(undefined, 'DNS_SERVERS', quiet), []);
+});
+
+test('a bad DNS_SERVERS entry is dropped with a warning, not taken and not fatal', () => {
+    // Three outcomes were possible and two are wrong: taking it silently leaves a
+    // resolver pointed at nothing, and refusing to boot turns one typo into an
+    // outage. The good entries must survive the bad one.
+    const lines = [];
+    const log = { warn: (m) => lines.push(m) };
+    assert.deepEqual(
+        parseDnsServers('8.8.8.8,nonsense,1.2.3.4.5,1.1.1.1', 'DNS_SERVERS', log),
+        ['8.8.8.8', '1.1.1.1']
+    );
+    assert.equal(lines.length, 2, `expected one warning per bad entry, got ${JSON.stringify(lines)}`);
+    assert.match(lines[0], /DNS_SERVERS: ignoring "nonsense"/);
+    assert.match(lines[1], /"1\.2\.3\.4\.5"/);
+});
+
+test('makeDnsResolver points the resolver at the configured servers', () => {
+    assert.deepEqual(makeDnsResolver(DNS_TIMEOUT_MS, ['8.8.8.8', '1.1.1.1']).getServers(), ['8.8.8.8', '1.1.1.1']);
+
+    // Empty means leave c-ares to its own discovery, which is the default and what
+    // works on most hosts — not "no servers", which would break every lookup.
+    assert.ok(makeDnsResolver(DNS_TIMEOUT_MS, []).getServers().length >= 0);
+    assert.deepEqual(DNS_SERVERS, [], 'the suite runs with DNS_SERVERS unset');
+});
+
+test('every resolver this module makes goes through makeDnsResolver', () => {
+    // A setting that reached some lookups and missed others would be worse than
+    // not having it: the host it exists for would still fail, intermittently.
+    const src = require('node:fs').readFileSync(require.resolve('../src/net/safe-fetch.js'), 'utf8');
+    const constructions = src.match(/new dns\.Resolver\(/g) || [];
+    assert.equal(constructions.length, 2,
+        'expected exactly two: makeDnsResolver itself, and the validation probe in parseDnsServers');
 });

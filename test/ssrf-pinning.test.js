@@ -40,6 +40,10 @@ const {
 
 const realFetch = global.fetch;
 const INDEX = require.resolve('../index.js');
+// The guard and the pin live here now. The two assertions below read source
+// rather than behaviour — the properties they pin are invisible from outside —
+// so they have to name the file the code is actually written in.
+const SAFE_FETCH_SRC = require.resolve('../src/net/safe-fetch.js');
 
 // A literal address, so nothing here depends on DNS or on being online.
 const PUBLIC_IP = '93.184.216.34';
@@ -138,7 +142,7 @@ test('the fetch-time check still refuses those targets too', async () => {
 test('assertSafeOutboundUrl is the only thing that can pin an address', () => {
     // Not a style point: an address in this map is treated as vetted, so
     // anything else writing to it would be handing out the exemption.
-    const src = fs.readFileSync(INDEX, 'utf8');
+    const src = fs.readFileSync(SAFE_FETCH_SRC, 'utf8');
     const writes = src.match(/pinResolvedAddresses\(/g) || [];
     assert.equal(writes.length, 2, 'expected one definition and exactly one call site');
     assert.match(src, /if \(!directIp\) pinResolvedAddresses\(hostname, addresses\);/);
@@ -150,7 +154,7 @@ test('safeFetch connects through the pinning dispatcher', () => {
     // against the source, and against the dispatcher actually existing when the
     // guard is on.
     assert.ok(PINNED_DISPATCHER, 'the guard is on, so there must be a dispatcher');
-    const src = fs.readFileSync(INDEX, 'utf8');
+    const src = fs.readFileSync(SAFE_FETCH_SRC, 'utf8');
     assert.match(src, /PINNED_DISPATCHER \? \{ dispatcher: PINNED_DISPATCHER \} : \{\}/);
 });
 

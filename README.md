@@ -45,6 +45,7 @@ gave you a URL with a path in it, the panel host is usually the same URL without
 | `LOG_REQUESTS` | `false` | Set to `true` to log a line for every meta and stream request and every call to the Xtream provider. Failures and warnings are logged either way. |
 | `ALLOW_PRIVATE_NETWORKS` | `false` | Set to `true` to let the addon reach private/loopback addresses. Needed only for an Xtream server on your LAN during development — it disables the SSRF guard, so never enable it on a public deployment. |
 | `DNS_TIMEOUT_MS` | `5000` | Deadline for resolving an Xtream host during the SSRF check. Lookups run off Node's thread pool and are cancelled at the deadline, so a panel on a domain whose nameserver never answers cannot stall other users' playback; a host resolved within the last minute is not looked up again. These lookups do not read `/etc/hosts`, so a panel hostname must resolve in DNS. Minimum 500. |
+| `DNS_SERVERS` | *(empty)* | Comma-separated nameservers for the built-in resolver, e.g. `8.8.8.8,1.1.1.1`. An entry may be an address, `address:port`, or `[v6address]:port`. Empty — the default — lets the resolver work the list out for itself, which is right on most hosts. Set it when it gets that wrong: it discovers nameservers independently of the OS, and on some hosts (one Windows machine found only `127.0.0.1`) every lookup then fails with `ECONNREFUSED` and `/configure` reports every panel unreachable. You will see a one-off `[dns] the built-in resolver cannot reach its nameservers` warning in that case; the server keeps working by falling back to the OS resolver, but that resolver cannot be cancelled, so a slow nameserver can delay other requests until you set this. An entry that is not an IP address is dropped with a warning at boot rather than taken or treated as fatal. |
 | `TRUST_PROXY` | `false` | How many reverse proxies you control sit in front of the addon: `true` for one, or the number. Their forwarded headers then identify the client — for the `/configure` rate limit and the per-client relay cap — and give install links their scheme and host when `PUBLIC_URL` is not set. The client is read from the **right** of `X-Forwarded-For`, counting in by this many hops, because a proxy appends the address it saw and everything to its left was written by the client; count every proxy that appends (a CDN in front of nginx is `2`). Left off, forwarded headers are ignored entirely and the socket address is used — behind a proxy, every user then shares one bucket. Turned on with no proxy in front, a client can choose its own address. IPv6 clients are grouped by /64, so one subscriber is one client. |
 | `CONFIGURE_RATE_LIMIT` | `10` | Maximum `POST /configure` attempts per client per window. |
 | `CONFIGURE_RATE_WINDOW_MS` | `60000` | Length of that window, in milliseconds. |
@@ -249,7 +250,19 @@ An instance anyone can reach, where anyone can configure their own provider, nee
 
 ```
 .
-├── index.js        Single-file Express server (routes, caches, Xtream client)
+├── index.js        Express server — routes, caches, Xtream client, proxy relay
+├── src/            Modules index.js re-exports, so requiring index.js gets everything
+│   ├── helpers.js          URL, id and value coercions
+│   ├── config-token.js     Install-token crypto and the CONFIG_SECRET policy
+│   ├── panel-allowlist.js  Which Xtream panels this instance will serve
+│   ├── html.js             escapeHtml, shared by both pages
+│   ├── net/                SSRF guard, private-IP ranges, DNS pinning, safeFetch
+│   ├── upstream/           Capped body reading and byte weighing
+│   ├── cache/              BoundedMap, the shared budget, cache-aside primitives
+│   ├── catalog/            Catalog ids, ordering, filtering, the sorted-view memo
+│   ├── hls/                Playlist signing, encryption and rewriting
+│   ├── routes/             Request-level helpers
+│   └── pages/              The /configure and landing pages
 ├── test/           Unit tests — node:test, run with `npm test`
 ├── package.json
 ├── README.md

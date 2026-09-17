@@ -15,6 +15,9 @@ const {
     vodStreamsCache,
     liveStreamsCache,
     seriesStreamsCache,
+    hlsOriginVetCache,
+    vodInfoCache,
+    categoryStreamsCache,
     accountCacheKey,
     CACHE_TTL,
     CACHE_MAX_ACCOUNTS,
@@ -187,6 +190,44 @@ test('sweepCaches reclaims expired entries across every cache', () => {
     assert.strictEqual(vodStreamsCache.map.size, 0);
     assert.strictEqual(liveStreamsCache.map.size, 0);
     assert.strictEqual(seriesStreamsCache.map.size, 0);
+});
+
+// sweepCaches used to name all eight caches in a hand-written sum. A cache left
+// off it was not a visible bug: the map still evicted on write, so it only failed
+// to reclaim memory while nothing new arrived — a leak with no symptom until the
+// process was large. Registration at construction is what replaced that, and this
+// is the assertion the old shape could not have.
+test('every live cache is swept, without sweepCaches naming any of them', () => {
+    const live = [
+        ['catCache', catCache],
+        ['seriesInfoCache', seriesInfoCache],
+        ['hlsOriginVetCache', hlsOriginVetCache],
+        ['vodInfoCache', vodInfoCache.map],
+        ['categoryStreamsCache', categoryStreamsCache.map],
+        ['liveStreamsCache', liveStreamsCache.map],
+        ['vodStreamsCache', vodStreamsCache.map],
+        ['seriesStreamsCache', seriesStreamsCache.map]
+    ];
+
+    // Each one gets an entry old enough for its own rule — catCache sweeps on the
+    // 24-hour stale window, not the TTL — and the sweep must account for all of
+    // them in one call.
+    const now = Date.now();
+    const ancient = now - CACHE_STALE_MAX_AGE_MS - 1;
+    for (const [, map] of live) map.set('sweep-probe', { data: null, ts: ancient });
+
+    const dropped = sweepCaches(now);
+    assert.ok(dropped >= live.length, `swept ${dropped}, expected at least ${live.length}`);
+    for (const [name, map] of live) {
+        assert.equal(map.has('sweep-probe'), false, `${name} was not visited by the sweep`);
+    }
+
+    // And the sum is gone from the source: a list that names caches is exactly the
+    // thing a new cache gets left out of.
+    const src = require('node:fs').readFileSync(require.resolve('../index.js'), 'utf8');
+    const body = src.slice(src.indexOf('function sweepCaches'), src.indexOf('function startCacheSweeper'));
+    assert.equal((body.match(/Cache\.sweep\(|Cache\.map\.sweep\(/g) || []).length, 0,
+        'sweepCaches is naming caches again');
 });
 
 test('a fresh entry is left alone by the sweeper', () => {

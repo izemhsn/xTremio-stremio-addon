@@ -99,6 +99,125 @@ const { escapeHtml } = require('./src/html.js');
 const { renderConfigPage } = require('./src/pages/configure.js');
 const { renderLandingPage } = require('./src/pages/landing.js');
 
+// Pure value helpers — URL and id shapes, and the coercions that make a
+// provider's untyped JSON safe to render.
+const {
+    asString,
+    normalizeUrl,
+    buildUrl,
+    buildXtremioApiUrl,
+    isNumericId,
+    getPrefixedNumericId,
+    parseEpisodeId,
+    ID_PREFIX_TYPES,
+    typeMatchesId,
+    statedContainerExt,
+    normalizeContainerExt,
+    isNotWebReady,
+    toIsoDate,
+    titleOf,
+    ratingOf,
+    splitList,
+    youtubeTrailers,
+    pickBackdrop
+} = require('./src/helpers.js');
+
+// The SSRF guard and the DNS pin that makes it binding. Every outbound request
+// for a user-supplied URL goes through safeFetch; never call bare fetch.
+const {
+    ALLOW_PRIVATE_NETWORKS,
+    DNS_TIMEOUT_MS,
+    DNS_PIN_TTL_MS,
+    DNS_PIN_MAX_HOSTS,
+    DNS_RESOLVER_UNUSABLE,
+    DNS_SERVERS,
+    parseDnsServers,
+    makeDnsResolver,
+    dnsFallback,
+    dnsPins,
+    resolveHostAddresses,
+    pinResolvedAddresses,
+    pinnedLookup,
+    pinnedLookupError,
+    PINNED_DISPATCHER,
+    UNDICI_INTEROPERABLE_MAJORS,
+    warnOnUndiciMismatch,
+    blockedOutbound,
+    assertSafeOutboundUrl,
+    discardBody,
+    safeFetch
+} = require('./src/net/safe-fetch.js');
+
+// Reading an upstream body under a byte cap and a parsed-shape cap, and the
+// weighing the caches charge against CACHE_MAX_MB.
+const {
+    MAX_UPSTREAM_BYTES,
+    MAX_PARSED_TO_BODY_RATIO,
+    PARSED_WEIGHT,
+    parsedSizeEstimates,
+    readJsonCapped,
+    readTextCapped,
+    estimateBytes,
+    weighJson
+} = require('./src/upstream/read-capped.js');
+
+// The cache TTLs, the shared byte budget, and the cache-aside primitives. The
+// cache instances themselves stay below, beside the upstream calls they front.
+const {
+    CACHE_TTL,
+    CACHE_FAILURE_TTL,
+    CACHE_REFRESH_AHEAD,
+    CACHE_MAX_ACCOUNTS,
+    CACHE_MAX_STREAM_ACCOUNTS,
+    CACHE_MAX_STREAM_BYTES,
+    CACHE_MAX_SERIES_INFO,
+    CACHE_MAX_VOD_INFO,
+    CACHE_MAX_CATEGORY_LISTS,
+    CACHE_MAX_BYTES,
+    CACHE_BUDGET,
+    CACHE_STALE_MAX_AGE_MS,
+    accountCacheKey,
+    registerSweepable,
+    sweepRegistered,
+    createSingleFlight,
+    createStreamListCache,
+    createKeyedCache
+} = require('./src/cache/layers.js');
+
+// Reading a catalog request's `extra` segment, and the cache hints on the answer.
+const {
+    EXTRA_KEYS,
+    decodeExtraPart,
+    parseExtra,
+    rawExtraSegment,
+    PAGE_SIZE,
+    withCacheHints
+} = require('./src/routes/extras.js');
+
+// Ordering, filtering and paginating a shelf, and the identity-keyed memo that
+// keeps a list from being re-sorted per page. CATALOG_KINDS stays below, with the
+// loaders and list caches it names.
+const {
+    sortedCatalogViews,
+    VIEW_KEY_SEP,
+    CATALOG_VARIANTS,
+    parseCatalogId,
+    FEATURED_PERIOD_MS,
+    featuredEpoch,
+    catalogComparator,
+    filterByName,
+    toCatalogMetas,
+    hasCategoryIds,
+    inCategories,
+    uniqueById,
+    catalogVariant,
+    catalogViewKey,
+    catalogMemoFor,
+    cachedCatalogSelection,
+    rememberCatalogSelection,
+    sortedCatalogItems
+} = require('./src/catalog/shelf.js');
+
 const app = express();
 // Free stack fingerprinting for anyone who can reach the port.
 app.disable('x-powered-by');
@@ -145,7 +264,7 @@ const LOG_REQUESTS = process.env.LOG_REQUESTS === 'true';
 // build no longer decode. That is a deliberate break — see the README.
 // The token crypto, its key derivation and the CONFIG_SECRET policy now live in
 // src/config-token.js; the names are imported at the top of this file.
-const ALLOW_PRIVATE_NETWORKS = process.env.ALLOW_PRIVATE_NETWORKS === 'true';
+// ALLOW_PRIVATE_NETWORKS moved with the guard it disables (src/net/safe-fetch.js).
 const PUBLIC_URL = process.env.PUBLIC_URL ? normalizeUrl(process.env.PUBLIC_URL) : null;
 
 // configSecretProblems and enforceConfigSecretPolicy moved with the crypto.
@@ -315,105 +434,7 @@ app.get('/:config/manifest.json', async (req, res) => {
     res.json(await getManifest(cfg));
 });
 
-// Query and body values arrive as string, array, object or undefined depending
-// on what the client sent. Anything that is not a string is treated as absent
-// rather than coerced: `String(['a','b'])` would silently accept "a,b".
-function asString(value) {
-    return typeof value === 'string' ? value : '';
-}
-
-function normalizeUrl(url) {
-    url = String(url || '').trim().replace(/\/+$/, '');
-    if (!url) throw new Error('serverUrl is required');
-    if (!/^https?:\/\//.test(url)) url = 'http://' + url;
-    return url;
-}
-
-// hostnameOf, parseHostList, ALLOWED_PANEL_HOSTS, panelHostAllowed and
-// noteRefusedPanel moved to src/panel-allowlist.js. Required at the top of the
-// file, because decodeConfig enforces the panel list and so depends on it.
-
-function buildUrl(base, pathname, params = {}) {
-    const url = new URL(pathname, base);
-    for (const [key, value] of Object.entries(params)) {
-        if (value !== undefined && value !== null) {
-            url.searchParams.set(key, String(value));
-        }
-    }
-    return url.toString();
-}
-
-function buildXtremioApiUrl(cfg, action, params = {}) {
-    return buildUrl(normalizeUrl(cfg.serverUrl), '/player_api.php', {
-        username: cfg.username,
-        password: cfg.password,
-        action,
-        ...params
-    });
-}
-
-function isNumericId(value) {
-    return /^\d+$/.test(String(value || ''));
-}
-
-function getPrefixedNumericId(id, prefix) {
-    if (!String(id || '').startsWith(prefix)) return null;
-    const value = id.slice(prefix.length);
-    return isNumericId(value) ? value : null;
-}
-
-function parseEpisodeId(id) {
-    if (!String(id || '').startsWith('xtremio_episode_')) return null;
-    const parts = id.slice('xtremio_episode_'.length).split(':');
-    if (parts.length !== 3 || !parts.every(isNumericId)) return null;
-    return { seriesId: parts[0], seasonNum: parts[1], episodeId: parts[2] };
-}
-
-// Stremio's `:type` path segment is advisory here — every route dispatches on
-// the id prefix instead — but without a check a mismatched pair (say
-// type=XT-Movies with a live id) is happily served under the wrong type.
-// Series are declared under `XT-Series` in the manifest's catalog list yet emit
-// `series` metas, so both spellings are accepted wherever a series is involved.
-const ID_PREFIX_TYPES = {
-    'xtremio_episode_': ['series', 'XT-Series'],
-    'xtremio_series_': ['series', 'XT-Series'],
-    'xtremio_movie_': ['XT-Movies'],
-    'xtremio_live_': ['Live TV']
-};
-
-function typeMatchesId(type, id) {
-    const str = String(id || '');
-    const prefix = Object.keys(ID_PREFIX_TYPES).find(p => str.startsWith(p));
-    // An id we do not recognise is left to the route, which already answers it
-    // with the empty payload rather than an error.
-    if (!prefix) return true;
-    return ID_PREFIX_TYPES[prefix].includes(String(type));
-}
-
-// Catalog ids are not item ids and overlap their prefixes (`xtremio_series_new`
-// starts with `xtremio_series_`), so catalogs are matched separately — see
-// `catalogTypesFor`, which lives with the catalog table further down.
-
-// The container the provider named, or null when it named none usable. The
-// stream route needs that difference: a guessed extension must not be cached.
-function statedContainerExt(ext) {
-    const clean = String(ext || '').trim();
-    return /^[A-Za-z0-9]+$/.test(clean) ? clean : null;
-}
-
-function normalizeContainerExt(ext) {
-    return statedContainerExt(ext) || 'mp4';
-}
-
-// Per Stremio SDK: notWebReady must be true when the URL is http:// or
-// the file is not an MP4 container. Without this, the player may stop
-// after a short period (e.g. ~1 min) and Stremio treats it as "ended",
-// returning to details (movies) or auto-advancing (series episodes).
-function isNotWebReady(url, ext) {
-    const isHttps = /^https:\/\//i.test(url);
-    const isMp4 = String(ext || '').toLowerCase() === 'mp4';
-    return !(isHttps && isMp4);
-}
+// URL, id and container helpers moved to src/helpers.js.
 
 // Browser-like UA — many Xtream CDNs reject or shortchange non-browser UAs.
 const PROXY_USER_AGENT = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0 Safari/537.36';
@@ -444,348 +465,11 @@ const PLAYLIST_REWRITE_TIMEOUT_MS = Math.max(1000, Number(process.env.PLAYLIST_R
 // tables are the part most likely to be edited on its own. Required at the top
 // of the file; re-exported below so the suite still reaches it through index.js.
 
-// --- DNS pinning -----------------------------------------------------------
-//
-// Vetting an address and then calling fetch() resolves the hostname twice:
-// once in assertSafeOutboundUrl, once inside the HTTP client, independently.
-// A record with a near-zero TTL can answer the first lookup with a public
-// address and the second with 169.254.169.254 — the check passes and the
-// connection lands inside the network anyway. Since the proxy relays upstream
-// bodies back to the caller, winning that race is not blind SSRF but full
-// response exfiltration.
-//
-// So the addresses that passed the check are remembered here and handed to the
-// connector, which performs no lookup of its own. The hostname itself is left
-// alone in the URL and the TLS options, so SNI and certificate validation still
-// happen against the real name rather than a bare IP.
-const DNS_PIN_TTL_MS = 60 * 1000;
-const DNS_PIN_MAX_HOSTS = 1000;
-const dnsPins = new Map();
+// The SSRF guard, the DNS pinning that makes it binding, and safeFetch moved to
+// src/net/safe-fetch.js.
 
-function pinResolvedAddresses(hostname, addresses) {
-    const now = Date.now();
-    // Every pin is (re-)inserted with the same TTL, so insertion order is expiry
-    // order and the sweep can stop at the first live one. A pin expired out of
-    // order is still refused on read by pinnedLookup.
-    for (const [host, entry] of dnsPins) {
-        if (entry.expiresAt > now) break;
-        dnsPins.delete(host);
-    }
-    // Re-inserting rather than updating in place keeps insertion order equal to
-    // recency, so the eviction below drops the least recently vetted host.
-    dnsPins.delete(hostname);
-    while (dnsPins.size >= DNS_PIN_MAX_HOSTS) {
-        dnsPins.delete(dnsPins.keys().next().value);
-    }
-    dnsPins.set(hostname, {
-        addresses: addresses.map(({ address, family }) => ({ address, family: family || net.isIP(address) })),
-        expiresAt: now + DNS_PIN_TTL_MS
-    });
-}
-
-function pinnedLookupError(hostname) {
-    return Object.assign(new Error(`No vetted address pinned for ${hostname}`), {
-        code: 'ENOTFOUND',
-        hostname
-    });
-}
-
-// Fails closed. An unpinned hostname means the connector is resolving something
-// assertSafeOutboundUrl never approved, which is exactly the case this exists
-// to stop — falling back to a real lookup here would reopen the race.
-function pinnedLookup(hostname, options, callback) {
-    const entry = dnsPins.get(hostname);
-    if (!entry || entry.expiresAt <= Date.now()) {
-        return callback(pinnedLookupError(hostname));
-    }
-
-    const wanted = options?.family;
-    const matches = (wanted === 4 || wanted === 6)
-        ? entry.addresses.filter((a) => a.family === wanted)
-        : entry.addresses;
-    if (!matches.length) return callback(pinnedLookupError(hostname));
-
-    // Node asks for every address when happy-eyeballs is on, one otherwise.
-    if (options?.all) return callback(null, matches.map(({ address, family }) => ({ address, family })));
-    return callback(null, matches[0].address, matches[0].family);
-}
-
-// One agent for the process. Pooling is safe because every pinned address has
-// already passed the private-address check, so a reused connection is no less
-// vetted than a fresh one. Null when ALLOW_PRIVATE_NETWORKS is set: the check
-// is off, so there is nothing to pin against.
-const PINNED_DISPATCHER = ALLOW_PRIVATE_NETWORKS
-    ? null
-    : new UndiciAgent({ connect: { lookup: pinnedLookup } });
-
-// The pinned dispatcher comes from the undici dependency and fetch() from Node's
-// bundled undici, and not every pairing works. Measured: 6 and 7 interoperate with
-// the fetch in Node 20.18.1, 22 and 24; an undici 8 dispatcher fails every request
-// on 22 and 24. Only pairings outside the measured set warn (audit D2). The versions
-// are parameters so each branch can be tested.
-const UNDICI_INTEROPERABLE_MAJORS = new Set(['6', '7']);
-
-function warnOnUndiciMismatch(log = console, {
-    pinned = Boolean(PINNED_DISPATCHER),
-    bundled = process.versions.undici,
-    dependency = require('undici/package.json').version
-} = {}) {
-    if (!pinned) return true;
-    const bundledMajor = String(bundled || '').split('.')[0];
-    const dependencyMajor = String(dependency || '').split('.')[0];
-    if (!bundledMajor || bundledMajor === dependencyMajor) return true;
-    if (UNDICI_INTEROPERABLE_MAJORS.has(bundledMajor) && UNDICI_INTEROPERABLE_MAJORS.has(dependencyMajor)) return true;
-    log.warn(
-        `Node bundles undici ${bundled} but this app's connection agent comes from undici ${dependency}. ` +
-        'That pairing has not been verified and outbound requests may fail — an undici 8 agent used with an ' +
-        'older fetch fails every request with "invalid onRequestStart method". Align the undici dependency ' +
-        'with the runtime.'
-    );
-    return false;
-}
-
-// A refusal by policy — this scheme or address is never allowed — as opposed to a
-// lookup that failed and may succeed next time. vetHlsOrigin remembers the first
-// kind and retries the second.
-function blockedOutbound(message) {
-    return Object.assign(new Error(message), { code: 'OUTBOUND_BLOCKED' });
-}
-
-// DNS resolution for the SSRF check, with a deadline (audit S6). dns.lookup runs on
-// libuv's four-thread pool and cannot be cancelled, so one dead nameserver stalled
-// everyone's relays. c-ares runs off the pool, one resolver per lookup, cancelled
-// at the deadline. It does not read /etc/hosts, hence the localhost check in
-// assertSafeOutboundUrl.
-const DNS_TIMEOUT_MS = Math.max(500, Number(process.env.DNS_TIMEOUT_MS) || 5000);
-
-// c-ares reads the nameserver list itself and can get it wrong where the OS works
-// (one Windows host gave it only 127.0.0.1). These codes mean the resolver itself is
-// unusable, so only they fall back to the OS resolver, under the same deadline. A
-// timeout never falls back: that is the stall S6 removed.
-const DNS_RESOLVER_UNUSABLE = new Set(['ECONNREFUSED', 'ELOADIPHLPAPI', 'EADDRGETNETWORKPARAMS']);
-const dnsFallback = { warned: false };  // an object, so a test can reset it
-
-async function resolveHostAddresses(hostname, {
-    timeoutMs = DNS_TIMEOUT_MS,
-    makeResolver = () => new dns.Resolver({ timeout: timeoutMs, tries: 2 }),
-    lookup = (host) => dns.lookup(host, { all: true, verbatim: true }),
-    log = console
-} = {}) {
-    const resolver = makeResolver();
-    let timer;
-    const deadline = new Promise((_, reject) => {
-        timer = setTimeout(() => {
-            try { resolver.cancel(); } catch {}
-            reject(Object.assign(
-                new Error(`DNS lookup for ${hostname} timed out after ${timeoutMs}ms`),
-                { code: 'ETIMEOUT', hostname }
-            ));
-        }, timeoutMs);
-    });
-    // allSettled attaches a handler to both, so the one still pending when the
-    // deadline wins cannot surface later as an unhandled rejection.
-    const families = Promise.allSettled([
-        resolver.resolve4(hostname).then(list => list.map(address => ({ address, family: 4 }))),
-        resolver.resolve6(hostname).then(list => list.map(address => ({ address, family: 6 })))
-    ]);
-    try {
-        const results = await Promise.race([families, deadline]);
-        const addresses = results.flatMap(r => (r.status === 'fulfilled' ? r.value : []));
-        if (addresses.length) return addresses;
-        // Neither family answered. A host with no record of one family (ENODATA) is
-        // ordinary, so the other family's error is the one that says why.
-        const errors = results.map(r => r.reason).filter(Boolean);
-        const failure = errors.find(e => e.code !== 'ENODATA') || errors[0]
-            || Object.assign(new Error(`No addresses for ${hostname}`), { code: 'ENOTFOUND', hostname });
-        if (!DNS_RESOLVER_UNUSABLE.has(failure.code)) throw failure;
-
-        if (!dnsFallback.warned) {
-            dnsFallback.warned = true;
-            let servers = '';
-            try { servers = ` (it was configured with ${resolver.getServers().join(', ') || 'no servers'})`; } catch {}
-            log.warn(
-                `[dns] the built-in resolver cannot reach its nameservers: ${failure.code}${servers}. ` +
-                'Falling back to the operating system resolver, which works but cannot be cancelled, ' +
-                'so a slow nameserver can delay other requests. Fix the host DNS configuration to restore it.'
-            );
-        }
-        return await Promise.race([lookup(hostname), deadline]);
-    } finally {
-        clearTimeout(timer);
-    }
-}
-
-async function assertSafeOutboundUrl(inputUrl, { resolve = resolveHostAddresses } = {}) {
-    const url = new URL(inputUrl);
-    if (!['http:', 'https:'].includes(url.protocol)) {
-        throw blockedOutbound(`Blocked unsupported outbound protocol: ${url.protocol}`);
-    }
-    if (ALLOW_PRIVATE_NETWORKS) return url;
-
-    const hostname = url.hostname.replace(/^\[|\]$/g, '');
-    // RFC 6761 reserves these names for loopback. The resolver above would not answer
-    // for them at all, so without this they would fail as unresolvable instead of
-    // being refused as what they are.
-    if (/(^|\.)localhost\.?$/i.test(hostname)) {
-        throw blockedOutbound(`Blocked private outbound address for ${hostname}`);
-    }
-    const directIp = net.isIP(hostname) ? [{ address: hostname }] : null;
-    // A host vetted within the pin window is not resolved again (audit P4), which
-    // keeps the resolver off the relay hot path. Only vetted addresses are pinned,
-    // and reuse does not extend the pin.
-    const pinned = directIp ? null : dnsPins.get(hostname);
-    if (pinned && pinned.expiresAt > Date.now()) return url;
-    const addresses = directIp || await resolve(hostname);
-    if (!addresses.length) throw new Error(`Could not resolve outbound host: ${hostname}`);
-
-    for (const { address } of addresses) {
-        if (isPrivateIp(address)) {
-            throw blockedOutbound(`Blocked private outbound address for ${hostname}`);
-        }
-    }
-    // A literal address needs no pin: the connector recognises it and never
-    // calls lookup, so there is no second resolution to disagree with.
-    if (!directIp) pinResolvedAddresses(hostname, addresses);
-    return url;
-}
-
-// A response whose body is never read still owns a connection: undici keeps it
-// out of the pool until the body is consumed or cancelled, so dropping one on
-// the floor holds a socket until GC gets round to it. Every path that abandons
-// a response goes through here. A body with a reader already attached is
-// locked and cannot be cancelled — those paths abort the request instead, which
-// tears the connection down rather than trying to return it to the pool.
-function discardBody(res) {
-    try {
-        const body = res?.body;
-        if (body && !body.locked) body.cancel().catch(() => {});
-    } catch {}
-}
-
-// `onFinalUrl` reports the URL that actually produced the returned response,
-// after any redirects. HLS playlists carry relative URIs that must be resolved
-// against *that* URL, not the one we asked for — a provider's /live/... request
-// typically lands on a CDN path several segments deep, so resolving against the
-// original would point every segment at the wrong host. Response.url is not
-// relied on here because redirects are followed manually, one fetch each.
-async function safeFetch(inputUrl, options = {}, { maxRedirects = 3, onFinalUrl } = {}) {
-    let url = await assertSafeOutboundUrl(inputUrl);
-    for (let redirects = 0; redirects <= maxRedirects; redirects++) {
-        // The dispatcher is what makes the check above binding: assertSafeOutboundUrl
-        // pins the addresses it approved, and this connects to those and nothing
-        // else. Every redirect hop re-checks and re-pins before its own fetch.
-        const res = await fetch(url, {
-            ...options,
-            redirect: 'manual',
-            ...(PINNED_DISPATCHER ? { dispatcher: PINNED_DISPATCHER } : {})
-        });
-        if (![301, 302, 303, 307, 308].includes(res.status)) {
-            onFinalUrl?.(url.toString());
-            return res;
-        }
-
-        const location = res.headers.get('location');
-        if (!location) {
-            onFinalUrl?.(url.toString());
-            return res;
-        }
-        // The redirect's own body is never read. Explicit hygiene: undici was
-        // measured closing the abandoned socket either way, but this states the
-        // intent instead of depending on that behaviour.
-        discardBody(res);
-        if (redirects === maxRedirects) throw new Error('Too many redirects');
-
-        url = await assertSafeOutboundUrl(new URL(location, url).toString());
-    }
-}
-
-// The upstream host is supplied by the user and reachable before any
-// authentication, so an unbounded res.json() lets a hostile or broken provider
-// stream until the process runs out of memory. Large providers legitimately
-// return tens of MB for get_vod_streams, so the cap is generous but finite.
-const MAX_UPSTREAM_BYTES = Math.max(1, Number(process.env.MAX_UPSTREAM_MB) || 64) * 1024 * 1024;
-
-// What a JSON body will cost once parsed, estimated from its bytes as they arrive.
-// Shape matters more than size: a 16 MB realistic list retained 18 MB of heap, a
-// 16 MB [{},{},…] body 341 MB. The structural bytes are weighed by what the value
-// behind them costs — `{` 56, `[` 32, `,` 8 — plus half a byte per body byte. Fitted
-// across eleven shapes: 0.78-1.27x of real heap for realistic bodies, at or above it
-// for hostile ones. Counted inside strings too; over-counting is the safe side.
-const PARSED_WEIGHT = new Uint8Array(256);
-PARSED_WEIGHT[0x7b] = 56; // {
-PARSED_WEIGHT[0x5b] = 32; // [
-PARSED_WEIGHT[0x2c] = 8;  // ,
-
-// How large a body may be *estimated* to parse to, relative to its byte cap. Real
-// bodies estimate at 1.0-1.3x and hit the byte cap first; a hostile one is refused
-// mid-download. Keep it above what real bodies estimate at.
-const MAX_PARSED_TO_BODY_RATIO = 2;
-
-// The estimate each parsed payload arrived with, so the caches can weigh it from
-// every byte of its body rather than from a sample. Keyed by the parsed value, so
-// an entry lives exactly as long as the value does.
-const parsedSizeEstimates = new WeakMap();
-
-// `onChunk` is called once per chunk read, which is how xtremioGet's idle deadline
-// knows the download is still moving.
-async function readJsonCapped(res, label, maxBytes = MAX_UPSTREAM_BYTES, { onChunk = null } = {}) {
-    // Trust a declared length to reject early, before reading a single byte.
-    const declared = Number(res.headers?.get?.('content-length'));
-    if (Number.isFinite(declared) && declared > maxBytes) {
-        throw new Error(`${label} response too large: ${declared} bytes exceeds ${maxBytes}`);
-    }
-    // A stub or a body-less response has nothing to meter; fall back.
-    if (!res.body || typeof res.body.getReader !== 'function') return res.json();
-
-    const reader = res.body.getReader();
-    const chunks = [];
-    let total = 0;
-    let structural = 0;
-    const maxParsedBytes = maxBytes * MAX_PARSED_TO_BODY_RATIO;
-    // Yield to the event loop once per megabyte. With a buffered body, read()
-    // resolves as microtasks, so without this the count ran as one block merged
-    // with the parse (a 25 MB list's longest stall: 247 ms without, 128 ms with).
-    const YIELD_EVERY_BYTES = 1024 * 1024;
-    let nextYieldAt = YIELD_EVERY_BYTES;
-    for (;;) {
-        const { done, value } = await reader.read();
-        if (done) break;
-        total += value.byteLength;
-        if (total > maxBytes) {
-            // Stop pulling from the socket rather than finishing the download.
-            await reader.cancel().catch(() => {});
-            throw new Error(`${label} response exceeded ${maxBytes} bytes`);
-        }
-        // Checked per chunk, like the byte cap, so a hostile body is refused before
-        // the rest of it arrives rather than after JSON.parse has inflated it.
-        for (let i = 0; i < value.length; i++) structural += PARSED_WEIGHT[value[i]];
-        if (structural + total / 2 > maxParsedBytes) {
-            await reader.cancel().catch(() => {});
-            throw new Error(
-                `${label} response is shaped to parse to more than ${Math.round(maxParsedBytes / 1048576)} MB ` +
-                `after ${total} bytes; refusing it before parsing`
-            );
-        }
-        // Kept as the Uint8Array it arrived as: Buffer.concat accepts those, and
-        // Buffer.from(value) copied every chunk of the body a second time.
-        chunks.push(value);
-        if (onChunk) onChunk();
-        if (total >= nextYieldAt) {
-            nextYieldAt = total + YIELD_EVERY_BYTES;
-            await new Promise((resolve) => setImmediate(resolve));
-        }
-    }
-    // Four statements, not one expression: each step copies the body, and dropping
-    // each reference as the next copy appears keeps one copy alive at parse time
-    // instead of three (measured ~3x -> ~1x on a 21 MB body).
-    let buf = Buffer.concat(chunks);
-    chunks.length = 0;
-    const text = buf.toString('utf8');
-    buf = null;
-    const data = JSON.parse(text);
-    if (data !== null && typeof data === 'object') parsedSizeEstimates.set(data, structural + total / 2);
-    return data;
-}
+// The byte and parsed-shape caps, and readJsonCapped, moved to
+// src/upstream/read-capped.js.
 
 // Three deadlines for one upstream call (audit R5): headers, an idle deadline every
 // chunk resets so a slow but moving download completes, and an overall one so a
@@ -831,193 +515,22 @@ async function xtremioGet(cfg, action, params = {}, { timeoutMs = UPSTREAM_HEADE
     }
 }
 
-function toIsoDate(s) {
-    if (!s) return undefined;
-    const d = new Date(s);
-    return isNaN(d.getTime()) ? undefined : d.toISOString();
-}
+// toIsoDate, titleOf, ratingOf, splitList, youtubeTrailers and pickBackdrop moved
+// to src/helpers.js with the rest of the pure value handling.
 
-// A provider's title is not reliably a string: PHP's JSON_NUMERIC_CHECK sends 1917
-// and 300 as numbers. Strings and finite numbers count; anything else is no title.
-function titleOf(value) {
-    if (typeof value === 'string') return value;
-    return typeof value === 'number' && Number.isFinite(value) ? String(value) : '';
-}
-
-// Xtream sends `rating: "0"` — or 0, or "" — for a title nobody has rated, and
-// the string "0" is truthy, so Stremio showed a rating of 0 rather than none.
-// Anything that is not a positive number is no rating at all.
-function ratingOf(value) {
-    if (typeof value !== 'string' && typeof value !== 'number') return undefined;
-    const n = Number(value);
-    return Number.isFinite(n) && n > 0 ? String(n) : undefined;
-}
-
-// Xtream providers return `cast`/`genre` as either a comma-separated string or an array.
-function splitList(value) {
-    if (!value) return [];
-    if (Array.isArray(value)) return value.map(v => String(v).trim()).filter(Boolean);
-    return String(value).split(',').map(v => v.trim()).filter(Boolean);
-}
-
-// Stremio has no `trailer` meta field: a trailer is an entry in `trailers`,
-// `{ source, type }`, where source is the YouTube video id — so the old key was
-// simply ignored and the button never appeared (audit L2). Panels put either a
-// bare id or a watch/share URL in `youtube_trailer`, and both are accepted.
-// Anything that does not reduce to an id is dropped rather than passed on: a
-// trailer button that cannot play is worse than no button.
-const YOUTUBE_ID = /^[A-Za-z0-9_-]{11}$/;
-
-function youtubeTrailers(value) {
-    const raw = String(value || '').trim();
-    if (!raw) return undefined;
-    let id = raw;
-    if (raw.includes('/')) {
-        id = '';
-        // Panels store these without a scheme as often as with one.
-        for (const candidate of [raw, `https://${raw}`]) {
-            try {
-                const url = new URL(candidate);
-                id = url.searchParams.get('v') || url.pathname.split('/').filter(Boolean).pop() || '';
-                break;
-            } catch { /* not a URL in this spelling; try the next */ }
-        }
-    }
-    return YOUTUBE_ID.test(id) ? [{ source: id, type: 'Trailer' }] : undefined;
-}
-
-// `backdrop_path` can be an array of URLs or a single URL string.
-function pickBackdrop(value) {
-    if (!value) return undefined;
-    if (Array.isArray(value)) return value[0] || undefined;
-    return String(value) || undefined;
-}
-
-// All in-memory caches share the same TTL.
-const CACHE_TTL = 30 * 60 * 1000;
-
-// A category fetch that partly or wholly failed must not be held for the full
-// TTL: one transient upstream blip would otherwise leave the user with empty
-// catalogs and an empty genre list for 30 minutes, with no way to force a
-// refresh. Retry those soon instead.
-const CACHE_FAILURE_TTL = 60 * 1000;
-
-// How far through an entry's life a request starts refetching it behind the
-// scenes instead of leaving the next request to pay for it. A cold full list is
-// seconds of work inside a request — 4.8 s for movies and 2.6 s for series
-// against a real account — and every account paid that once per TTL. A fifth of
-// the TTL left to fetch in is ample for a list that takes seconds.
-const CACHE_REFRESH_AHEAD = 0.8;
-
-// Keys must include credentials so two users on the same Xtream host don't
-// share cached catalogs/streams (different accounts can see different content).
-// Keyed by the panel's origin, not the URL as typed: every upstream URL is built
-// from an absolute path, so `http://PANEL.x:80/a?b` reaches the same account as
-// `http://panel.x`, and keying on the spelling gave one account a fresh relay
-// budget and a second copy of its lists per variant (audit M1). JSON rather than
-// a separator, which a username or password could contain (audit L11).
-function accountCacheKey(cfg) {
-    let server = cfg.serverUrl;
-    try {
-        server = new URL(normalizeUrl(cfg.serverUrl)).origin;
-    } catch {
-        // Unparseable: no request can reach it either, so the raw string is as good a key.
-    }
-    return JSON.stringify([server, cfg.username, cfg.password]);
-}
+// The cache TTLs, the shared CACHE_BUDGET and accountCacheKey moved to
+// src/cache/layers.js.
 // BoundedMap, CacheBudget and weightOf moved to src/cache/bounded-map.js — the
 // bounding primitives, with no TTL or upstream knowledge. estimateBytes stays
 // here, beside the reader whose byte count it reads.
 
-// What a cached value costs in memory — estimated heap, not serialized size (`{}`
-// serializes to 2 bytes and occupies 56). The weights are readJsonCapped's.
-function estimateBytes(value) {
-    // A payload read from upstream was weighed from every byte of its body, which
-    // no sample can match, and a sample's positions can be steered.
-    if (value !== null && typeof value === 'object') {
-        const measured = parsedSizeEstimates.get(value);
-        if (measured !== undefined) return Math.round(measured);
-    }
-
-    // Everything else is sampled: serializing a whole list would double peak
-    // memory to measure memory.
-    if (!Array.isArray(value)) {
-        try {
-            return Math.round(weighJson(JSON.stringify(value)));
-        } catch {
-            return 0;
-        }
-    }
-    if (!value.length) return 0;
-
-    const step = Math.max(1, Math.floor(value.length / 20));
-    let sampled = 0;
-    let counted = 0;
-    for (let i = 0; i < value.length; i += step) {
-        try {
-            sampled += weighJson(JSON.stringify(value[i]));
-        } catch {
-            // A circular or unserializable item tells us nothing; skip it.
-        }
-        counted++;
-    }
-    if (!counted) return 0;
-    // Plus the list's own slots (the commas the streamed estimate counts), so the
-    // two paths agree.
-    return Math.round((sampled / counted) * value.length + PARSED_WEIGHT[0x2c] * value.length);
-}
-
-// The streaming estimate, applied to text already in hand.
-function weighJson(text) {
-    if (typeof text !== 'string') return 0;
-    let structural = 0;
-    for (let i = 0; i < text.length; i++) {
-        const c = text.charCodeAt(i);
-        if (c < 256) structural += PARSED_WEIGHT[c];
-    }
-    return structural + text.length / 2;
-}
-
-// Category lists are small (a few KB per account), so the bound here is about
-// account count, not bytes.
-const CACHE_MAX_ACCOUNTS = Math.max(1, Number(process.env.CACHE_MAX_ACCOUNTS) || 100);
-
-// How many accounts' full stream lists to hold, per kind. Memory is bounded in
-// bytes, so this only stops many tiny entries accumulating; a low count was a churn
-// cliff (audit R3). A worker-thread parse was measured and is worse: structured
-// clone deserializes on the main thread anyway.
-const CACHE_MAX_STREAM_ACCOUNTS = Math.max(1, Number(process.env.CACHE_MAX_STREAM_ACCOUNTS) || 64);
-
-// Stream list budget *per kind*, in estimated heap (see estimateBytes).
-const CACHE_MAX_STREAM_BYTES = Math.max(1, Number(process.env.CACHE_MAX_STREAM_MB) || 64) * 1024 * 1024;
-
-// One entry per series *per account* — the only dimension that grows without
-// bound for a single user just browsing.
-const CACHE_MAX_SERIES_INFO = Math.max(1, Number(process.env.CACHE_MAX_SERIES_INFO) || 500);
-
-// Same dimension for movies. A vod_info payload is a single item's metadata —
-// kilobytes, not megabytes — so this bound is about entry count, not size.
-const CACHE_MAX_VOD_INFO = Math.max(1, Number(process.env.CACHE_MAX_VOD_INFO) || 500);
-
-// Per-category stream lists: one entry per category per account.
-const CACHE_MAX_CATEGORY_LISTS = Math.max(1, Number(process.env.CACHE_MAX_CATEGORY_LISTS) || 100);
-
-// The shared ceiling across every data cache; see CacheBudget. 256 MB is three
-// 64 MB stream budgets plus room for the small caches.
-const CACHE_MAX_BYTES = Math.max(1, Number(process.env.CACHE_MAX_MB) || 256) * 1024 * 1024;
-const CACHE_BUDGET = new CacheBudget(CACHE_MAX_BYTES);
-
-// getCategories intentionally serves expired categories when a refresh fails
-// (stale beats empty — see CACHE_FAILURE_TTL), so age-sweeping catCache on the
-// normal TTL would destroy that fallback. This hard age only reclaims accounts
-// that have genuinely stopped being used.
-const CACHE_STALE_MAX_AGE_MS = 24 * 60 * 60 * 1000;
-
-const catCache = new BoundedMap({
+// estimateBytes and weighJson moved with the reader whose byte count they read.
+// The per-cache bounds moved with them.
+const catCache = registerSweepable(new BoundedMap({
     maxEntries: CACHE_MAX_ACCOUNTS,
     maxAgeMs: CACHE_STALE_MAX_AGE_MS,
     ledger: CACHE_BUDGET
-});
+}));
 
 const categoriesSingleFlight = createSingleFlight();
 
@@ -1065,220 +578,15 @@ async function refreshCategories(cfg, key) {
     return entry;
 }
 
-// Deduplicates concurrent misses for the same key. Stremio opens many catalog
-// requests in parallel on install, and without this each one fires its own
-// multi-megabyte upstream fetch for a list the others are already loading.
-function createSingleFlight() {
-    const pending = new Map();
-    return function singleFlight(key, fn) {
-        const existing = pending.get(key);
-        if (existing) return existing;
-        // Errors are not cached: the entry is dropped either way, so the next
-        // caller retries rather than inheriting a stale rejection.
-        const promise = Promise.resolve().then(fn).finally(() => pending.delete(key));
-        pending.set(key, promise);
-        return promise;
-    };
-}
-
-// Stream list caches - populated on first fetch, reused for catalogs, search and meta
-function createStreamListCache() {
-    // Swept on the normal TTL, not on CACHE_STALE_MAX_AGE_MS like catCache:
-    // these are by far the largest entries, so reclaiming an abandoned one
-    // matters most. The one entry that must outlive that is the stale copy an
-    // outage is being served from, and it says so itself by carrying a longer
-    // ttl, which sweep() honours (audit L3).
-    const map = new BoundedMap({
-        maxEntries: CACHE_MAX_STREAM_ACCOUNTS,
-        maxAgeMs: CACHE_TTL,
-        maxBytes: CACHE_MAX_STREAM_BYTES,
-        ledger: CACHE_BUDGET,
-        // Evicting an unexpired list means the bounds are too tight for the load;
-        // the advice names the bound that did it.
-        onEvict(key, entry, reason) {
-            // Against the entry's own ttl, so evicting the stale copy an outage
-            // is being served from still reports — that is when the bounds bite
-            // hardest and when losing the list hurts most.
-            const inUseFor = Math.max(CACHE_TTL, entry?.ttl || 0);
-            if (entry && entry.ts > Date.now() - inUseFor) {
-                const knob = reason === 'global budget'
-                    ? 'CACHE_MAX_MB'
-                    : 'CACHE_MAX_STREAM_ACCOUNTS or CACHE_MAX_STREAM_MB';
-                console.warn(
-                    `[cache] evicted a live stream list on ${reason} ` +
-                    `(${Math.round((entry.bytes || 0) / 1024 / 1024)} MB); ` +
-                    `raise ${knob} if this repeats`
-                );
-            }
-        }
-    });
-    const singleFlight = createSingleFlight();
-    // Background refreshes in flight, keyed like the cache itself. Its own map
-    // rather than the single-flight above: that one is also what a cold miss joins,
-    // and a miss must keep its stale-on-failure fallback, which it would lose by
-    // inheriting a refresh's rejection. The two can therefore both be in flight for
-    // one account — only in the window where a refresh outlives the fifth of the
-    // TTL it was given, and only ever two calls, never more.
-    const refreshing = new Map();
-
-    // Whether a warm entry is old enough to be worth refreshing behind the request
-    // that found it. Only a full-strength entry qualifies: a shorter ttl marks
-    // either an empty list or the stale copy an outage is being served from (audit
-    // L3), and refreshing those would mean fetching on nearly every request rather
-    // than once per TTL. The cooldown bounds it the other way — one attempt per
-    // CACHE_FAILURE_TTL whatever the outcome, so a panel that has started failing
-    // is not asked again by every request that arrives.
-    const shouldRefreshAhead = (entry, now) => Boolean(entry)
-        && entry.ttl === CACHE_TTL
-        && !(entry.refreshedAt && now - entry.refreshedAt < CACHE_FAILURE_TTL)
-        && now - entry.ts >= CACHE_TTL * CACHE_REFRESH_AHEAD;
-
-    return {
-        map,
-        refreshing,
-        get(cfg) {
-            const cached = map.get(accountCacheKey(cfg));
-            // Per-entry ttl: a stale entry being served through an outage carries
-            // a short one, so it is retried in a minute rather than in half an hour.
-            if (cached && cached.ts > Date.now() - (cached.ttl || CACHE_TTL)) return cached.data;
-            return null;
-        },
-        set(cfg, items) {
-            // An empty list is also something real providers return transiently, so
-            // it is held for CACHE_FAILURE_TTL rather than the full TTL.
-            map.set(accountCacheKey(cfg), {
-                data: items,
-                ts: Date.now(),
-                ttl: items.length ? CACHE_TTL : CACHE_FAILURE_TTL,
-                bytes: estimateBytes(items)
-            });
-        },
-        // Refetches an entry that is still warm but far enough through its life that
-        // the next request would have paid for it — measured at 4.8 s for a movie
-        // list and 2.6 s for a series list, once per TTL per account, inside the
-        // request that happened to arrive first (audit Perf). Nothing awaits this,
-        // so it can only ever make a later request faster; a failure is swallowed
-        // and leaves the warm entry exactly as it was, to be retried inline once it
-        // really does expire. Triggered by a request and never by a timer, so a list
-        // nobody is asking for is never refreshed and simply ages out.
-        refreshAhead(cfg, fetcher, now = Date.now()) {
-            const key = accountCacheKey(cfg);
-            const entry = map.peek(key);
-            if (!shouldRefreshAhead(entry, now)) return null;
-            const existing = refreshing.get(key);
-            if (existing) return existing;
-
-            entry.refreshedAt = now;
-            const promise = Promise.resolve()
-                .then(fetcher)
-                .then((items) => { this.set(cfg, items); return items; })
-                .catch((e) => {
-                    // Never rethrown: no caller is waiting, and an unhandled
-                    // rejection exits the process.
-                    console.warn(
-                        `[cache] background refresh failed (${e.message}); ` +
-                        'the warm list stands until it expires'
-                    );
-                    return null;
-                })
-                .finally(() => { if (refreshing.get(key) === promise) refreshing.delete(key); });
-            refreshing.set(key, promise);
-            return promise;
-        },
-        // Cache-aside read: serves a warm entry, otherwise runs `fetcher` once
-        // no matter how many callers arrive while it is in flight.
-        load(cfg, fetcher) {
-            const cached = this.get(cfg);
-            if (cached) {
-                this.refreshAhead(cfg, fetcher);
-                return Promise.resolve(cached);
-            }
-            const key = accountCacheKey(cfg);
-            return singleFlight(key, async () => {
-                // Re-check: a concurrent flight may have populated it already.
-                const warm = this.get(cfg);
-                if (warm) return warm;
-                try {
-                    const items = await fetcher();
-                    this.set(cfg, items);
-                    return items;
-                } catch (e) {
-                    // A stale list beats an empty shelf, for as long as the copy is
-                    // worth serving. `ts` is never re-stamped, so it keeps saying how
-                    // old the data really is; only the ttl moves, and only far enough
-                    // to schedule the next retry. Past CACHE_STALE_MAX_AGE_MS — the
-                    // same window catCache gives its own stale fallback — the copy is
-                    // abandoned and the failure is answered as one, so a provider that
-                    // is gone for good does not leave a day-old lineup on the shelf.
-                    const stale = map.get(key);
-                    if (!stale || !Array.isArray(stale.data) || !stale.data.length) throw e;
-                    const age = Date.now() - stale.ts;
-                    if (age >= CACHE_STALE_MAX_AGE_MS) throw e;
-                    stale.ttl = Math.min(age + CACHE_FAILURE_TTL, CACHE_STALE_MAX_AGE_MS);
-                    console.warn(
-                        `[cache] upstream list failed (${e.message}); serving ${stale.data.length} ` +
-                        `stale items, retrying in ${CACHE_FAILURE_TTL / 1000}s`
-                    );
-                    return stale.data;
-                }
-            });
-        }
-    };
-}
-
-// Cache-aside read with single-flight over a BoundedMap of `{ data, ts }` — the
-// plain case; the older caches keep bespoke forms for their extra behaviour.
-// `ttlFor(data)` shortens one entry's lifetime, capped at `ttl`. `ledger` weighs
-// each entry and charges it to that CacheBudget.
-function createKeyedCache({ maxEntries, ttl = CACHE_TTL, ttlFor = null, ledger = null }) {
-    const map = new BoundedMap({ maxEntries, maxAgeMs: ttl, ledger });
-    const singleFlight = createSingleFlight();
-    // Returns the entry, not the value: a legitimately null payload must still
-    // read as a hit rather than sending every caller back upstream.
-    const liveEntry = (key) => {
-        const entry = map.get(key);
-        return entry && entry.ts > Date.now() - (entry.ttl ?? ttl) ? entry : null;
-    };
-    return {
-        map,
-        get(key) {
-            const entry = liveEntry(key);
-            return entry ? entry.data : null;
-        },
-        load(key, fetcher) {
-            const hit = liveEntry(key);
-            if (hit) return Promise.resolve(hit.data);
-            return singleFlight(key, async () => {
-                // Re-check: a concurrent flight may have populated it already.
-                const warm = liveEntry(key);
-                if (warm) return warm.data;
-                const data = await fetcher();
-                map.set(key, {
-                    data,
-                    ts: Date.now(),
-                    ttl: ttlFor ? Math.min(ttl, ttlFor(data)) : ttl,
-                    ...(ledger ? { bytes: estimateBytes(data) } : {})
-                });
-                return data;
-            });
-        }
-    };
-}
+// createSingleFlight, createStreamListCache and createKeyedCache moved to
+// src/cache/layers.js. The cache *instances* stay here, beside the upstream calls
+// they front.
 
 const liveStreamsCache = createStreamListCache();
 const vodStreamsCache = createStreamListCache();
 const seriesStreamsCache = createStreamListCache();
 
-// Sorted catalog views, so paginating a shelf does not re-sort the whole list per
-// page. A WeakMap keyed by the cached array a view was sorted from: a refetch
-// invalidates it at once, and an evicted list takes its views with it. Nothing in a
-// view may hold a strong reference back to its list. Each source maps to
-// `{ day, views }`; see sortedCatalogItems.
-const sortedCatalogViews = new WeakMap();
-
-// The separator inside view and selection keys. A newline, because no variant
-// and no category id can contain one, so two fields cannot shift into one.
-const VIEW_KEY_SEP = '\n';
+// The sorted-view memo and its key separator moved to src/catalog/shelf.js.
 
 // stream_id -> item for a cached live or movie list, so opening a channel or
 // falling back from get_vod_info is a lookup rather than a scan. Keyed by the
@@ -1306,10 +614,13 @@ function findStreamById(list, streamId) {
 // every segment request.
 const HLS_ORIGIN_VET_TTL_MS = DNS_PIN_TTL_MS;
 const HLS_ORIGIN_VET_MAX = 512;
-const hlsOriginVetCache = new BoundedMap({
+// No ledger: this holds promises about hostnames, not bytes of provider data, so
+// it is bounded by count and age alone. Swept all the same, which is why
+// registration is not tied to the budget.
+const hlsOriginVetCache = registerSweepable(new BoundedMap({
     maxEntries: HLS_ORIGIN_VET_MAX,
     maxAgeMs: HLS_ORIGIN_VET_TTL_MS
-});
+}));
 
 // Returns a promise for whether this origin may be signed. The promise itself is
 // cached, so concurrent rewrites naming the same host share one resolution
@@ -1342,70 +653,8 @@ function getAllLiveStreams(cfg) {
     return liveStreamsCache.load(cfg, () => getStreams(cfg, 'get_live_streams'));
 }
 
-// The keys this addon declares in its manifest `extra` blocks. Nothing else is
-// a pair separator's right-hand side, which is what makes the split below safe.
-const EXTRA_KEYS = ['skip', 'genre', 'search'];
-
-// A pair boundary is a separator followed by one of those keys and its '='; a '&'
-// anywhere else belongs to a value ("Kids & Family"). Separator and '=' are matched
-// raw or escaped, since clients escape different amounts of the segment.
-const EXTRA_KEY_ALT = EXTRA_KEYS.join('|');
-const EXTRA_PAIR_SPLIT = new RegExp(`(?:&|%26)(?=(?:${EXTRA_KEY_ALT})(?:=|%3D))`, 'i');
-const EXTRA_KEY_HEAD = new RegExp(`^(${EXTRA_KEY_ALT})(?:=|%3D)`, 'i');
-
-// decodeURIComponent throws on a malformed escape, and "100%" is a legitimate
-// search term, so a part that will not decode is kept verbatim. Decoding here is
-// only correct because the input is the *raw* segment (see rawExtraSegment); on
-// an already-decoded param this would be a second decode and would corrupt it.
-function decodeExtraPart(part) {
-    try {
-        return decodeURIComponent(part);
-    } catch {
-        return part;
-    }
-}
-
-function parseExtra(extra) {
-    const params = {};
-    if (!extra) return params;
-
-    for (const pair of extra.split(EXTRA_PAIR_SPLIT)) {
-        const head = EXTRA_KEY_HEAD.exec(pair);
-        if (head) {
-            params[head[1].toLowerCase()] = decodeExtraPart(pair.slice(head[0].length));
-            continue;
-        }
-        // Not a key this addon declares. Kept rather than dropped, on the first
-        // literal '=', so an extra added to the manifest without being added to
-        // EXTRA_KEYS still arrives instead of vanishing silently.
-        const i = pair.indexOf('=');
-        const [k, v] = i === -1 ? [pair, ''] : [pair.slice(0, i), pair.slice(i + 1)];
-        params[decodeExtraPart(k)] = decodeExtraPart(v);
-    }
-    return params;
-}
-
-// The still-encoded :extra segment, or undefined when the request matched the
-// route pattern that has no extra. `originalUrl` is the one place the escapes
-// survive; `req.params.extra` has already lost them.
-function rawExtraSegment(req) {
-    if (req.params.extra === undefined) return undefined;
-    const path = req.originalUrl.split('?')[0];
-    return path.slice(path.lastIndexOf('/') + 1).replace(/\.json$/i, '');
-}
-
-const PAGE_SIZE = 100;
-
-// Sets the Cache-Control header that stremio-addon-sdk derives from the
-// `cacheMaxAge`/`staleRevalidate` body fields, and returns the fields too.
-// `private` because every response is account-specific and the path is a bearer
-// token.
-function withCacheHints(res, cacheMaxAge, staleRevalidate) {
-    const directives = ['private', `max-age=${cacheMaxAge}`];
-    if (staleRevalidate) directives.push(`stale-while-revalidate=${staleRevalidate}`);
-    res.setHeader('Cache-Control', directives.join(', '));
-    return staleRevalidate === undefined ? { cacheMaxAge } : { cacheMaxAge, staleRevalidate };
-}
+// The `extra` segment parsing, PAGE_SIZE and withCacheHints moved to
+// src/routes/extras.js.
 
 // A payload that is not an array is a provider failure, not an empty catalog.
 // Throwing keeps it out of the cache, since rejections are not cached.
@@ -1477,26 +726,23 @@ const SERIES_INFO_BACKOFF_MS = 500;
 // far shorter than the positive TTL.
 const SERIES_INFO_NEGATIVE_TTL = Math.max(1000, Number(process.env.SERIES_INFO_NEGATIVE_TTL_MS) || 5 * 60 * 1000);
 
-const seriesInfoCache = new BoundedMap({
+const seriesInfoCache = registerSweepable(new BoundedMap({
     maxEntries: CACHE_MAX_SERIES_INFO,
     maxAgeMs: CACHE_TTL,
     ledger: CACHE_BUDGET
-});
+}));
 
 // The LRU bound caps the worst case, but on its own it only reclaims memory
 // when something new arrives. An instance whose users have all gone away would
 // hold its last entries forever, so sweep on a timer too.
 const CACHE_SWEEP_INTERVAL_MS = Math.max(30 * 1000, Number(process.env.CACHE_SWEEP_INTERVAL_MS) || 5 * 60 * 1000);
 
+// Every cache registers itself when it is constructed, so this no longer names
+// them one by one. It used to, and a cache left off that list reclaimed memory
+// only when something else was written to the same map — a leak with no symptom
+// until the process was large. See registerSweepable.
 function sweepCaches(now = Date.now()) {
-    return catCache.sweep(now)
-        + seriesInfoCache.sweep(now)
-        + vodInfoCache.map.sweep(now)
-        + categoryStreamsCache.map.sweep(now)
-        + liveStreamsCache.map.sweep(now)
-        + vodStreamsCache.map.sweep(now)
-        + seriesStreamsCache.map.sweep(now)
-        + hlsOriginVetCache.sweep(now);
+    return sweepRegistered(now);
 }
 
 function startCacheSweeper() {
@@ -2085,125 +1331,13 @@ const CATALOG_KINDS = {
         recencyField: 'last_modified'
     }
 };
-
-// Which kind a catalog id belongs to, and which variant. Catalog ids overlap item
-// id prefixes (`xtremio_series_new`), so item ids go through typeMatchesId instead.
-// Variants are an allowlist: an unknown one must be rejected, not served unsorted.
-const CATALOG_VARIANTS = new Set(['new', 'popular', 'featured']);
-
-function parseCatalogId(id) {
-    const str = String(id || '');
-    if (str === 'xtremio_live') return { kind: 'live', variant: null, search: false };
-    if (str === 'xtremio_search_movies') return { kind: 'movies', variant: null, search: true };
-    if (str === 'xtremio_search_series') return { kind: 'series', variant: null, search: true };
-    for (const kind of ['movies', 'series']) {
-        const prefix = `xtremio_${kind}_`;
-        if (!str.startsWith(prefix)) continue;
-        const variant = str.slice(prefix.length);
-        return CATALOG_VARIANTS.has(variant) ? { kind, variant, search: false } : null;
-    }
-    return null;
-}
-
+// Catalog id parsing moved to src/catalog/shelf.js.
 function catalogTypesFor(id) {
     const route = parseCatalogId(id);
     return route ? CATALOG_KINDS[route.kind].catalogTypes : null;
 }
 
-// How long one featured order lasts. Seeded on a period rather than on the clock
-// so the shuffle holds still while a client pages through it — but a day was too
-// short (audit L14): Stremio caches catalog pages (max-age 300,
-// stale-while-revalidate 600), so for up to fifteen minutes either side of a
-// boundary a paginated shelf could mix two orders. A week cuts the number of
-// boundaries by 52 without making the shelf feel fixed. It does not remove the
-// boundary — nothing stateless can, since the client holds pages this server has
-// already forgotten — it makes it rare.
-const FEATURED_PERIOD_MS = 7 * 86400000;
-
-// The one place the period is turned into a seed. The comparator and the memo key
-// must read the same function: they used to compute `Math.floor(now / 86400000)`
-// separately, which is two things that have to agree and no way to notice when
-// they stop — a sorted view would outlive the seed it was built from.
-function featuredEpoch(now) {
-    return Math.floor(now / FEATURED_PERIOD_MS);
-}
-
-// Every comparator ends in the item id, making each sort a total order, so a page
-// does not depend on which source served the list (audit L3). `now` is a parameter
-// only for testing the featured shuffle across periods.
-function catalogComparator(kind, variant, now = Date.now()) {
-    const idOf = s => parseInt(s[kind.idField]) || 0;
-    const byId = (a, b) => idOf(a) - idOf(b);
-
-    if (variant === 'new' && kind.recencyField) {
-        return (a, b) => ((parseInt(b[kind.recencyField]) || 0) - (parseInt(a[kind.recencyField]) || 0)) || byId(a, b);
-    }
-    if (variant === 'popular') {
-        return (a, b) => ((parseFloat(b.rating) || 0) - (parseFloat(a.rating) || 0)) || byId(a, b);
-    }
-    if (variant === 'featured') {
-        // Seeded on the period, so the shuffle holds still while paginating. The
-        // seed must enter *before* the multiply: added after, it preserves order
-        // and the shuffle never changed.
-        const periodSeed = featuredEpoch(now);
-        // Spread the seed across the word so consecutive periods differ widely.
-        const dayKey = Math.imul(periodSeed, 0x9e3779b1);
-        // XOR then an odd multiplier: a bijection modulo 2^31, so distinct ids
-        // cannot collide.
-        const hash = s => (Math.imul(idOf(s) ^ dayKey, 2654435761) & 0x7fffffff);
-        return (a, b) => (hash(a) - hash(b)) || byId(a, b);
-    }
-    return null;
-}
-
-// `limit` stops the scan once that many matches are found: the route needs one
-// page, and a common word would otherwise lowercase and test every title.
-function filterByName(items, search, limit = Infinity) {
-    if (!search) return items;
-    const q = search.toLowerCase();
-    const found = [];
-    for (const s of items) {
-        if (found.length >= limit) break;
-        if (titleOf(s.name).toLowerCase().includes(q)) found.push(s);
-    }
-    return found;
-}
-
-function toCatalogMetas(items, kind) {
-    return items.map(s => ({
-        id: `${kind.idPrefix}${s[kind.idField]}`,
-        type: kind.metaType,
-        // An item with no title omits the key rather than sending ''.
-        name: titleOf(s.name) || undefined,
-        poster: s[kind.posterField] || undefined,
-        posterShape: kind.posterShape
-    }));
-}
-
-// Which categories an item is filed under: `category_id`, plus `category_ids` on
-// many panels. Both count, so a warm full list matches what the per-category call
-// returns (audit C4).
-function hasCategoryIds(item) {
-    return (item.category_id != null && item.category_id !== '')
-        || (Array.isArray(item.category_ids) && item.category_ids.length > 0);
-}
-
-function inCategories(item, ids) {
-    if (item.category_id != null && item.category_id !== '' && ids.has(String(item.category_id))) return true;
-    return Array.isArray(item.category_ids) && item.category_ids.some(id => ids.has(String(id)));
-}
-
-// Items merged from several category lists, each once, first occurrence kept: an
-// item filed under two categories of the same name is in both of their lists.
-function uniqueById(items, idField) {
-    const seen = new Set();
-    return items.filter((item) => {
-        const id = String(item?.[idField]);
-        if (seen.has(id)) return false;
-        seen.add(id);
-        return true;
-    });
-}
+// The comparators, the filters and the category matching moved with it.
 
 // Resolves a genre to its items *and* to the cached array they were derived
 // from, or to null when the genre does not resolve to a category. The second half
@@ -2315,77 +1449,7 @@ async function selectCatalogSource(cfg, kind, genre, now = Date.now()) {
     const merged = uniqueById(lists.flat(), kind.idField);
     return { items: merged, source: merged, selection };
 }
-
-// Search sorts as `new`, so its pages stay stable across refetches.
-function catalogVariant(route) {
-    return route.search ? 'new' : route.variant;
-}
-
-// Under one source, a sorted view is keyed by variant and by `selection` — never
-// by the request's genre string, which would be an unbounded key space. Account
-// and kind are implied by the source. `variant` never contains a newline, so the
-// selection cannot shift into it.
-function catalogViewKey(route, selection) {
-    return `${catalogVariant(route)}${VIEW_KEY_SEP}${selection}`;
-}
-
-// A list that stays cached across a period boundary must not keep the previous
-// period's views alongside the new ones. featuredEpoch is the same function the
-// comparator seeds from, so the two cannot disagree about when the order changed.
-
-// This period's memo for `source`, or null when there is none and `create` is
-// false. `views` holds sorted orders, keyed by variant and selection; `selections`
-// holds the filtered arrays those orders were computed from, keyed by selection
-// alone — two key spaces that must not share a map, since a selection can itself
-// contain the separator. A filtered selection does not depend on the period, but
-// it costs one filter to let both live and die together.
-function catalogMemoFor(source, epoch, create) {
-    let entry = sortedCatalogViews.get(source);
-    if (!entry || entry.epoch !== epoch) {
-        if (!create) return null;
-        entry = { epoch, views: new Map(), selections: new Map() };
-        sortedCatalogViews.set(source, entry);
-    }
-    return entry;
-}
-
-// The items a genre shelf resolved to last time, or null — consulted *before* the
-// filter that would produce them, and creating nothing. Filtering is the expensive
-// half of a genre shelf and its result depends only on the source and the
-// selection, so only the sort was being saved while the filter ran on every page
-// (audit Perf). Keyed apart from the sorted views because it outlives all of them:
-// three variants over one selection share one filtered array.
-function cachedCatalogSelection(source, selection, now = Date.now()) {
-    const memo = catalogMemoFor(source, featuredEpoch(now), false);
-    return (memo && memo.selections.get(selection)) || null;
-}
-
-// Remembers a filtered selection and returns it, so a call site can do both in the
-// expression that returns. Only ever called with the result of a filter, so it
-// cannot store the source array back into its own memo.
-function rememberCatalogSelection(source, selection, items, now = Date.now()) {
-    catalogMemoFor(source, featuredEpoch(now), true).selections.set(selection, items);
-    return items;
-}
-
-// The sorted view of one shelf, memoised against the identity of the list it was
-// derived from (see sortedCatalogViews). Returns `items` untouched when the
-// variant has no comparator — the live shelf and any unsorted kind — since there
-// is no order to remember; the filter that produced those items is remembered
-// separately, above.
-function sortedCatalogItems(kind, route, { items, source, selection }, now = Date.now()) {
-    const comparator = catalogComparator(kind, catalogVariant(route), now);
-    if (!comparator) return items;
-
-    const views = catalogMemoFor(source, featuredEpoch(now), true).views;
-    const key = catalogViewKey(route, selection);
-    const hit = views.get(key);
-    if (hit) return hit;
-
-    const sorted = [...items].sort(comparator);
-    views.set(key, sorted);
-    return sorted;
-}
+// The view memo and sortedCatalogItems moved with them.
 
 app.get(['/:config/catalog/:type/:id.json', '/:config/catalog/:type/:id/:extra.json'], async (req, res) => {
     // Degraded answers are the default, in this route and in meta and stream:
@@ -2751,22 +1815,7 @@ app.get('/:config/stream/:type/:id.json', async (req, res) => {
 // Read a capped body for rewriting. Unlike the streaming path this has to hold
 // the whole thing in memory, so an upstream that mislabels a video as a
 // playlist must not be allowed to fill the heap.
-async function readTextCapped(body, maxBytes) {
-    const reader = body.getReader();
-    const chunks = [];
-    let total = 0;
-    for (;;) {
-        const { done, value } = await reader.read();
-        if (done) break;
-        total += value.byteLength;
-        if (total > maxBytes) {
-            await reader.cancel().catch(() => {});
-            throw new Error(`playlist exceeded ${maxBytes} bytes`);
-        }
-        chunks.push(value);
-    }
-    return Buffer.concat(chunks).toString('utf8');
-}
+// readTextCapped moved to src/upstream/read-capped.js, beside readJsonCapped.
 
 // Accept-Ranges carries a range-*unit* (RFC 9110 §14.3), and providers get it wrong
 // both ways: one sends a range instead of a unit, another claims `bytes` while
@@ -3688,6 +2737,9 @@ module.exports = {
     resolveHostAddresses,
     dnsFallback,
     DNS_TIMEOUT_MS,
+    DNS_SERVERS,
+    parseDnsServers,
+    makeDnsResolver,
     parseHostList,
     panelHostAllowed,
     ALLOWED_PANEL_HOSTS,
