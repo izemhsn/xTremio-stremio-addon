@@ -47,6 +47,28 @@ function sweepRegistered(now = Date.now()) {
     return dropped;
 }
 
+// sweepCaches is sweepRegistered under the name the rest of the app and the tests
+// have always used. Kept as its own function because it is the app's sweep — a
+// test may call sweepRegistered on the registry directly without meaning that.
+function sweepCaches(now = Date.now()) {
+    return sweepRegistered(now);
+}
+
+// The LRU bound caps the worst case, but on its own it only reclaims memory when
+// something new arrives. An instance whose users have all gone away would hold its
+// last entries forever, so sweep on a timer too.
+const CACHE_SWEEP_INTERVAL_MS = Math.max(30 * 1000, Number(process.env.CACHE_SWEEP_INTERVAL_MS) || 5 * 60 * 1000);
+
+function startCacheSweeper() {
+    const timer = setInterval(() => {
+        const dropped = sweepCaches();
+        if (dropped) console.log(`[cache] swept ${dropped} expired entr${dropped === 1 ? 'y' : 'ies'}`);
+    }, CACHE_SWEEP_INTERVAL_MS);
+    // Never hold the process open for a cache sweep.
+    timer.unref();
+    return timer;
+}
+
 // All in-memory caches share the same TTL.
 const CACHE_TTL = 30 * 60 * 1000;
 
@@ -333,6 +355,9 @@ module.exports = {
     accountCacheKey,
     registerSweepable,
     sweepRegistered,
+    sweepCaches,
+    startCacheSweeper,
+    CACHE_SWEEP_INTERVAL_MS,
     createSingleFlight,
     createStreamListCache,
     createKeyedCache

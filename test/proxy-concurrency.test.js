@@ -257,10 +257,12 @@ test('the limit can be turned off', async () => {
     // All three relay limits are zeroed: each disables independently, and with any
     // one of them still on, taking a slot is exactly what should happen.
     const names = ['PROXY_MAX_CONCURRENT_PER_TOKEN', 'PROXY_MAX_CONCURRENT_PER_CLIENT', 'PROXY_MAX_CONCURRENT_TOTAL'];
-    const path = require.resolve('../index.js');
+    // Both the barrel and the module that reads the values have to be evicted, or
+    // index.js comes back fresh still holding the cached limits.
+    const paths = [require.resolve('../index.js'), require.resolve('../src/proxy/relay.js')];
     const saved = Object.fromEntries(names.map(name => [name, process.env[name]]));
     for (const name of names) process.env[name] = '0';
-    delete require.cache[path];
+    for (const p of paths) delete require.cache[p];
     try {
         const fresh = require('../index.js');
         assert.equal(fresh.PROXY_MAX_CONCURRENT_PER_TOKEN, 0);
@@ -276,7 +278,7 @@ test('the limit can be turned off', async () => {
             if (saved[name] === undefined) delete process.env[name];
             else process.env[name] = saved[name];
         }
-        delete require.cache[path];
+        for (const p of paths) delete require.cache[p];
         require('../index.js');
     }
 });

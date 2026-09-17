@@ -250,18 +250,23 @@ An instance anyone can reach, where anyone can configure their own provider, nee
 
 ```
 .
-├── index.js        Express server — routes, caches, Xtream client, proxy relay
+├── index.js        Express app: the routes, in registration order, and the bootstrap
 ├── src/            Modules index.js re-exports, so requiring index.js gets everything
 │   ├── helpers.js          URL, id and value coercions
 │   ├── config-token.js     Install-token crypto and the CONFIG_SECRET policy
 │   ├── panel-allowlist.js  Which Xtream panels this instance will serve
+│   ├── manifest.js         The manifest, built per account from its categories
+│   ├── lifecycle.js        Socket timeouts, drain flag, graceful shutdown
 │   ├── html.js             escapeHtml, shared by both pages
 │   ├── net/                SSRF guard, private-IP ranges, DNS pinning, safeFetch
 │   ├── upstream/           Capped body reading and byte weighing
 │   ├── cache/              BoundedMap, the shared budget, cache-aside primitives
-│   ├── catalog/            Catalog ids, ordering, filtering, the sorted-view memo
+│   ├── xtream/             One panel call, and every cache and getter over it
+│   ├── catalog/            Catalog kinds, ids, ordering, filtering, the view memo
 │   ├── hls/                Playlist signing, encryption and rewriting
-│   ├── routes/             Request-level helpers
+│   ├── proxy/              The shared relay, HLS target mapper, concurrency caps
+│   ├── configure/          Credential validation and scheme handling
+│   ├── routes/             Request identity, base URL, extras and cache hints
 │   └── pages/              The /configure and landing pages
 ├── test/           Unit tests — node:test, run with `npm test`
 ├── package.json

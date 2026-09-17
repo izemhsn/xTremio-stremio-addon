@@ -173,7 +173,17 @@ function pickBackdrop(value) {
     return String(value) || undefined;
 }
 
+// fetch hides the real reason in `cause`: the message is a flat 'fetch failed'
+// and the code that says which failure it was — ECONNREFUSED, ENOTFOUND, a TLS
+// error — is one level down. Here rather than beside either caller, because the
+// two log lines that use it are the ones an operator compares when a panel starts
+// failing and they must read the same.
+function causeSuffix(e) {
+    return e?.cause ? ` (cause: ${e.cause.code || e.cause.message || e.cause})` : '';
+}
+
 module.exports = {
+    causeSuffix,
     asString,
     normalizeUrl,
     buildUrl,

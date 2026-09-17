@@ -85,11 +85,13 @@ test('install links use what the trusted proxy reported', () => {
 
 test('TRUST_PROXY can count more than one hop', () => {
     // Behind a CDN and nginx that both append, the client is two in from the right.
-    // Loaded in a second module instance, because the setting is read at import.
-    const path = require.resolve('../index.js');
+    // Loaded in a second module instance, because the setting is read at import —
+    // which means evicting the module that reads it as well as the barrel that
+    // re-exports it, or index.js comes back fresh holding the cached old value.
+    const paths = [require.resolve('../index.js'), require.resolve('../src/routes/request.js')];
     const saved = process.env.TRUST_PROXY;
     process.env.TRUST_PROXY = '2';
-    delete require.cache[path];
+    for (const p of paths) delete require.cache[p];
     try {
         const fresh = require('../index.js');
         assert.strictEqual(fresh.TRUST_PROXY_HOPS, 2);
@@ -97,7 +99,7 @@ test('TRUST_PROXY can count more than one hop', () => {
         assert.strictEqual(fresh.clientKey(chained), '198.51.100.7');
     } finally {
         process.env.TRUST_PROXY = saved;
-        delete require.cache[path];
+        for (const p of paths) delete require.cache[p];
         require('../index.js');
     }
 });
