@@ -42,6 +42,27 @@ test('normalizeUrl adds a scheme and strips trailing slashes', () => {
     assert.throws(() => normalizeUrl(null), /serverUrl is required/);
 });
 
+// Audit F1. A phone auto-capitalizes the first letter of a text field, so
+// `Http://panel` reaches the server routinely. The scheme test was
+// case-sensitive, so that counted as no scheme at all and got a second one
+// prefixed: `http://Http://panel`, which /configure then tried to resolve as a
+// host called `http` and reported as unreachable.
+//
+// The scheme is lowercased rather than merely matched case-insensitively,
+// because schemeOf, the http -> https upgrade and describeDowngrade all compare
+// it as a plain string. An `i` flag here alone would have let a typed `HTTPS://`
+// count as http and be tried over http, which audit S7 forbids.
+test('normalizeUrl lowercases a capitalized scheme instead of prefixing another', () => {
+    assert.strictEqual(normalizeUrl('Http://example.com:8080'), 'http://example.com:8080');
+    assert.strictEqual(normalizeUrl('HTTP://example.com'), 'http://example.com');
+    assert.strictEqual(normalizeUrl('HTTPS://example.com'), 'https://example.com');
+    assert.strictEqual(normalizeUrl('HtTpS://example.com//'), 'https://example.com');
+    assert.strictEqual(normalizeUrl('  Https://example.com  '), 'https://example.com');
+    // Only the scheme. The host keeps its case here; URL parsing lowercases it,
+    // and the path is case-sensitive and must not be touched.
+    assert.strictEqual(normalizeUrl('HTTP://Example.COM/Path'), 'http://Example.COM/Path');
+});
+
 test('buildUrl skips null and undefined params but keeps empty strings', () => {
     const url = buildUrl('http://example.com', '/player_api.php', {
         a: 'x', b: null, c: undefined, d: '', e: 0

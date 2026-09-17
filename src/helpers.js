@@ -18,11 +18,19 @@ function asString(value) {
     return typeof value === 'string' ? value : '';
 }
 
+// The scheme is matched case-insensitively and then lowercased, because every
+// later test of it is a case-sensitive string comparison: schemeOf, the http ->
+// https upgrade in validateXtremioCredentials, describeDowngrade. A phone's
+// auto-capitalized `Http://` matched none of them and none of this either, so it
+// was prefixed again and became `http://Http://panel`, and /configure went on to
+// look up a host called `http`. Lowercasing here rather than adding an `i` flag
+// at each of those sites is what keeps a typed `HTTPS://` from counting as http
+// and being tried over http, which is the rule audit S7 exists for.
 function normalizeUrl(url) {
     url = String(url || '').trim().replace(/\/+$/, '');
     if (!url) throw new Error('serverUrl is required');
-    if (!/^https?:\/\//.test(url)) url = 'http://' + url;
-    return url;
+    if (/^https?:\/\//i.test(url)) return url.replace(/^https?/i, (s) => s.toLowerCase());
+    return 'http://' + url;
 }
 
 // hostnameOf, parseHostList, ALLOWED_PANEL_HOSTS, panelHostAllowed and

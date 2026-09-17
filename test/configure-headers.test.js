@@ -194,3 +194,46 @@ test('a page rendered without a nonce still renders', () => {
     assert.match(html, /<form method="POST" action="\/configure">/);
     assert.doesNotMatch(html, /undefined/);
 });
+
+// Audit F5. The server URL field was <input type="url">, so the browser refused
+// to submit `panel.example:8080` at all — and the server's deliberate handling
+// for an address with no scheme, which tries https first so the password is not
+// sent in cleartext before the panel's TLS port has been tried (audit L9), was
+// reachable only by a direct POST. The field is plain text for that reason, and
+// the browser must not be allowed to validate or rewrite it: autocapitalize off
+// is what stops a phone turning a typed address into `Http://panel` (audit F1).
+test('the server URL field accepts an address with no scheme', () => {
+    const html = renderConfigPage({ nonce: 'n' });
+    const field = html.match(/<input[^>]*name="serverUrl"[^>]*>/)[0];
+
+    assert.doesNotMatch(field, /type="url"/, 'type="url" blocks a scheme-less address');
+    assert.match(field, /type="text"/);
+    assert.match(field, /inputmode="url"/, 'the keyboard should still suit a URL');
+    assert.match(field, /autocapitalize="off"/);
+    assert.match(field, /autocorrect="off"/);
+    assert.match(field, /spellcheck="false"/);
+    assert.match(field, /required/);
+});
+
+test('every field is labelled and carries the right autocomplete hint', () => {
+    const html = renderConfigPage({ nonce: 'n' });
+
+    // A <label> wrapping nothing and pointing at nothing is a label only to a
+    // sighted user; the for/id pair is what makes it one to a screen reader and
+    // what makes the label clickable.
+    for (const name of ['serverUrl', 'username', 'password']) {
+        assert.match(html, new RegExp(`<label for="${name}">`), `${name} has no linked label`);
+        assert.match(html, new RegExp(`<input[^>]*id="${name}"`), `${name} has no id`);
+    }
+
+    const username = html.match(/<input[^>]*name="username"[^>]*>/)[0];
+    const password = html.match(/<input[^>]*name="password"[^>]*>/)[0];
+    assert.match(username, /autocomplete="username"/);
+    assert.match(password, /autocomplete="current-password"/);
+    assert.match(password, /type="password"/, 'the password must never be a visible field');
+});
+
+test('the page declares its charset', () => {
+    // The page interpolates provider-supplied strings, which are not ASCII.
+    assert.match(renderConfigPage({ nonce: 'n' }), /<meta charset="utf-8">/);
+});

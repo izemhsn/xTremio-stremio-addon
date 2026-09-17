@@ -5,6 +5,16 @@
 // onclick/onmouseover attribute: the page is served under a strict CSP and those
 // are silently refused, so a handler added that way looks fine and does nothing.
 // Behaviour belongs in the nonced <script> block, hover states in <style>.
+//
+// The server URL field is deliberately type="text" and not type="url". The
+// server has careful handling for an address typed with no scheme — https is
+// tried first, so the password is never put on the wire in cleartext before the
+// panel's TLS port has been tried (audit L9) — and type="url" made the browser
+// refuse to submit one, so only a direct POST could ever reach it. The
+// autocapitalize/autocorrect/spellcheck attributes are the other half of that:
+// a phone capitalizing the first letter of the field is where a typed `Http://`
+// comes from, which normalizeUrl now lowercases rather than mistaking for no
+// scheme at all.
 const { escapeHtml } = require('../html.js');
 // The page shows the install URL, which means minting a token from the fields
 // just submitted.
@@ -117,6 +127,7 @@ function renderConfigPage({ serverUrl = '', username = '', password = '', status
 
     return `<!DOCTYPE html>
     <html><head>
+        <meta charset="utf-8">
         <title>xTremio Configuration</title>
         <meta name="viewport" content="width=device-width, initial-scale=1.0">
         <style>
@@ -203,24 +214,24 @@ function renderConfigPage({ serverUrl = '', username = '', password = '', status
                 </div>
                 <form method="POST" action="/configure">
                     <div class="input-group">
-                        <label>Server URL</label>
+                        <label for="serverUrl">Server URL</label>
                         <div class="input-wrapper">
                             <svg fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M21 12a9 9 0 01-9 9m9-9a9 9 0 00-9-9m9 9H3m9 9a9 9 0 01-9-9m9 9c1.657 0 3-4.03 3-9s-1.343-9-3-9m0 18c-1.657 0-3-4.03-3-9s1.343-9 3-9m-9 9a9 9 0 019-9"/></svg>
-                            <input type="url" name="serverUrl" value="${safeServerUrl}" placeholder="http://example.com:port" required />
+                            <input type="text" inputmode="url" id="serverUrl" name="serverUrl" value="${safeServerUrl}" placeholder="example.com:port" autocapitalize="off" autocorrect="off" autocomplete="url" spellcheck="false" required />
                         </div>
                     </div>
                     <div class="input-group">
-                        <label>Username</label>
+                        <label for="username">Username</label>
                         <div class="input-wrapper">
                             <svg fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M16 7a4 4 0 11-8 0 4 4 0 018 0zM12 14a7 7 0 00-7 7h14a7 7 0 00-7-7z"/></svg>
-                            <input type="text" name="username" value="${safeUsername}" placeholder="Enter username" required />
+                            <input type="text" id="username" name="username" value="${safeUsername}" placeholder="Enter username" autocapitalize="off" autocorrect="off" autocomplete="username" spellcheck="false" required />
                         </div>
                     </div>
                     <div class="input-group">
-                        <label>Password</label>
+                        <label for="password">Password</label>
                         <div class="input-wrapper">
                             <svg fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M12 15v2m-6 4h12a2 2 0 002-2v-6a2 2 0 00-2-2H6a2 2 0 00-2 2v6a2 2 0 002 2zm10-10V7a4 4 0 00-8 0v4h8z"/></svg>
-                            <input type="password" name="password" value="${safePassword}" placeholder="Enter password" required />
+                            <input type="password" id="password" name="password" value="${safePassword}" placeholder="Enter password" autocomplete="current-password" required />
                         </div>
                     </div>
                     <button type="submit" class="btn full">Save & Install</button>

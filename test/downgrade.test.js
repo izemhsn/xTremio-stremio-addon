@@ -122,6 +122,30 @@ test('a typed http:// is still tried first, with https only as the upgrade', asy
     assert.deepStrictEqual(attempted, ['http'], 'what the user asked for is what is used');
 });
 
+// Audit F1. The two halves of the case fix, asserted where the scheme order is
+// decided rather than in the helper: a capitalized scheme has to reach the panel
+// it names, and a capitalized `HTTPS://` has to keep the S7 protection that a
+// lowercase one gets. A case-insensitive test in normalizeUrl alone would pass
+// the first of these and fail the second.
+test('a typed Http:// reaches the panel over http, not a host called http', async () => {
+    const attempted = stubProvider({ works: ['http', 'https'] });
+
+    const result = await validateXtremioCredentials('Http://provider.test', 'u', 'p');
+
+    assert.strictEqual(result.valid, true);
+    assert.deepStrictEqual(attempted, ['http'], 'the typed scheme is honoured, not re-prefixed');
+    assert.strictEqual(result.resolvedUrl, 'http://provider.test');
+});
+
+test('a typed HTTPS:// is never tried over http', async () => {
+    const attempted = stubProvider({ works: ['http'] });
+
+    const result = await validateXtremioCredentials('HTTPS://provider.test', 'u', 'p');
+
+    assert.strictEqual(result.valid, false, 'https that fails is never retried over http');
+    assert.deepStrictEqual(attempted, ['https'], 'the password never went out in cleartext');
+});
+
 test('the guessed scheme is bounded by the shorter deadline, not the full one', async () => {
     // Trying https first costs nothing when it fails fast, but an http-only panel
     // behind a firewalled 443 hangs instead — and that wait is paid by every
