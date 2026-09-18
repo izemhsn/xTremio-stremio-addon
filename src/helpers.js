@@ -33,10 +33,6 @@ function normalizeUrl(url) {
     return 'http://' + url;
 }
 
-// hostnameOf, parseHostList, ALLOWED_PANEL_HOSTS, panelHostAllowed and
-// noteRefusedPanel moved to src/panel-allowlist.js. Required at the top of the
-// file, because decodeConfig enforces the panel list and so depends on it.
-
 function buildUrl(base, pathname, params = {}) {
     const url = new URL(pathname, base);
     for (const [key, value] of Object.entries(params)) {
@@ -96,7 +92,7 @@ function typeMatchesId(type, id) {
 
 // Catalog ids are not item ids and overlap their prefixes (`xtremio_series_new`
 // starts with `xtremio_series_`), so catalogs are matched separately — see
-// `catalogTypesFor`, which lives with the catalog table further down.
+// `catalogTypesFor`, which lives with the catalog table in src/catalog/kinds.js.
 
 // The container the provider named, or null when it named none usable. The
 // stream route needs that difference: a guessed extension must not be cached.

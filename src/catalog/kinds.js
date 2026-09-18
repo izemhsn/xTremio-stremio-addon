@@ -8,7 +8,6 @@
 // This is where the catalog meets the panel: the table names the loaders and the
 // list caches, which is why it is here and not in shelf.js, and why shelf.js takes
 // the `kind` it needs as an argument instead.
-const { titleOf } = require('../helpers.js');
 const { accountCacheKey } = require('../cache/layers.js');
 const {
     getCategories,
@@ -30,11 +29,6 @@ const {
     VIEW_KEY_SEP
 } = require('./shelf.js');
 
-// --- Catalogs ---
-// The three catalog kinds differ only in the fields below. Everything else —
-// genre resolution, the search filter, sorting, pagination and the meta shape —
-// is one code path, so a change to any of it cannot apply to movies and quietly
-// miss series.
 const CATALOG_KINDS = {
     live: {
         catalogTypes: ['Live TV'],
@@ -83,13 +77,10 @@ const CATALOG_KINDS = {
         recencyField: 'last_modified'
     }
 };
-// Catalog id parsing moved to src/catalog/shelf.js.
 function catalogTypesFor(id) {
     const route = parseCatalogId(id);
     return route ? CATALOG_KINDS[route.kind].catalogTypes : null;
 }
-
-
 
 // "no categories" is a fact about an account and a kind, but selectCatalogSource
 // runs on every catalog request, so an account whose category calls are failing

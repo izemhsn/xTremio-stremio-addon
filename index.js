@@ -1,71 +1,41 @@
 const express = require('express');
-const { Readable } = require('stream');
 const crypto = require('crypto');
-const dns = require('dns').promises;
-const net = require('net');
-// Only for the connection-level DNS pin below — outbound requests still go
-// through the global fetch. See PINNED_DISPATCHER for why the two have to come
-// from the same undici major.
-const { Agent: UndiciAgent } = require('undici');
 // Event-loop delay for /health. Native, and its timer does not hold the process
 // open, so it does not interfere with a graceful shutdown.
 const { monitorEventLoopDelay } = require('node:perf_hooks');
 
 // The address tables the SSRF guard refuses. Pure, and the one part of the guard
 // with a test file of its own, so it is the first thing to leave index.js.
-const {
-    isPrivateIp,
-    ipv6ToBytes,
-    ipv6MatchesPrefix,
-    IPV4_PRIVATE_CIDRS,
-    IPV6_PRIVATE_PREFIXES,
-    IPV6_EMBEDDED_IPV4
-} = require('./src/net/private-ip.js');
+const { isPrivateIp } = require('./src/net/private-ip.js');
 
 // Entry-count and byte bounds, and the one LRU order they all share.
-const { BoundedMap, CacheBudget, weightOf } = require('./src/cache/bounded-map.js');
+const { BoundedMap, CacheBudget } = require('./src/cache/bounded-map.js');
 
 // Which panels this instance will serve, and how a host is named.
 const {
     hostnameOf,
     parseHostList,
     panelHostAllowed,
-    noteRefusedPanel,
-    ALLOWED_PANEL_HOSTS,
-    refusedPanelHostsLogged,
-    REFUSED_PANEL_LOG_MAX
+    ALLOWED_PANEL_HOSTS
 } = require('./src/panel-allowlist.js');
 
 // The install-token crypto and the CONFIG_SECRET policy. Required here, near the
 // top, because its keys are derived from the environment at load time.
 const {
     CONFIG_TOKEN_VERSION,
-    RAW_CONFIG_SECRET,
     CONFIG_SECRET,
     CONFIG_SECRET_MIN_BYTES,
     IS_PRODUCTION,
     SCRYPT_PARAMS,
     deriveConfigKey,
     deriveConfigKeys,
-    CONFIG_ENC_KEY,
-    CONFIG_MAC_KEY,
-    CURRENT_CONFIG_KEYS,
-    PREVIOUS_CONFIG_KEYS,
-    notePreviousSecretUse,
     UNDECODABLE_REPORT_INTERVAL_MS,
     undecodableTokens,
     noteUndecodableToken,
-    HLS_ENC_KEY,
-    HLS_MAC_KEY,
-    GCM_IV_BYTES,
-    GCM_TAG_BYTES,
-    CONFIG_MAC_BYTES,
     configSecretProblems,
     enforceConfigSecretPolicy,
     validateConfig,
     signTokenBody,
-    decodeTokenPart,
-    timingSafeEqualString,
     encodeConfig,
     sealConfig,
     decodeConfig
@@ -75,18 +45,8 @@ const {
 // that vets a target before signing is built here and passed in.
 const {
     HLS_SIGNATURE_TTL_MS,
-    HLS_KIND_PLAYLIST,
-    HLS_KIND_SEGMENT,
-    HLS_SNIFF_BYTES,
-    HLS_BODY_PREFIX,
-    HLS_CONTENT_TYPES,
-    HLS_PLAYLIST_URI_TAGS,
-    HLS_STREAM_INF_TAG,
-    HLS_URI_ATTR,
-    PLAYLIST_PATH_EXT,
     MAX_PLAYLIST_BYTES,
     signHlsTarget,
-    hlsTargetAad,
     encodeHlsTarget,
     decodeHlsTarget,
     looksLikePlaylist,
@@ -110,7 +70,6 @@ const {
     isNumericId,
     getPrefixedNumericId,
     parseEpisodeId,
-    ID_PREFIX_TYPES,
     typeMatchesId,
     statedContainerExt,
     normalizeContainerExt,
@@ -126,11 +85,8 @@ const {
 // The SSRF guard and the DNS pin that makes it binding. Every outbound request
 // for a user-supplied URL goes through safeFetch; never call bare fetch.
 const {
-    ALLOW_PRIVATE_NETWORKS,
     DNS_TIMEOUT_MS,
     DNS_PIN_TTL_MS,
-    DNS_PIN_MAX_HOSTS,
-    DNS_RESOLVER_UNUSABLE,
     DNS_SERVERS,
     parseDnsServers,
     makeDnsResolver,
@@ -139,11 +95,8 @@ const {
     resolveHostAddresses,
     pinResolvedAddresses,
     pinnedLookup,
-    pinnedLookupError,
     PINNED_DISPATCHER,
-    UNDICI_INTEROPERABLE_MAJORS,
     warnOnUndiciMismatch,
-    blockedOutbound,
     assertSafeOutboundUrl,
     discardBody,
     safeFetch
@@ -154,10 +107,7 @@ const {
 const {
     MAX_UPSTREAM_BYTES,
     MAX_PARSED_TO_BODY_RATIO,
-    PARSED_WEIGHT,
-    parsedSizeEstimates,
     readJsonCapped,
-    readTextCapped,
     estimateBytes,
     weighJson
 } = require('./src/upstream/read-capped.js');
@@ -178,20 +128,14 @@ const {
     CACHE_BUDGET,
     CACHE_STALE_MAX_AGE_MS,
     accountCacheKey,
-    registerSweepable,
-    sweepRegistered,
     sweepCaches,
     startCacheSweeper,
-    CACHE_SWEEP_INTERVAL_MS,
     createSingleFlight,
-    createStreamListCache,
     createKeyedCache
 } = require('./src/cache/layers.js');
 
 // Reading a catalog request's `extra` segment, and the cache hints on the answer.
 const {
-    EXTRA_KEYS,
-    decodeExtraPart,
     parseExtra,
     rawExtraSegment,
     PAGE_SIZE,
@@ -203,20 +147,13 @@ const {
 // loaders and list caches it names.
 const {
     sortedCatalogViews,
-    VIEW_KEY_SEP,
-    CATALOG_VARIANTS,
     parseCatalogId,
     FEATURED_PERIOD_MS,
     featuredEpoch,
     catalogComparator,
     filterByName,
     toCatalogMetas,
-    hasCategoryIds,
-    inCategories,
-    uniqueById,
-    catalogVariant,
     catalogViewKey,
-    catalogMemoFor,
     cachedCatalogSelection,
     rememberCatalogSelection,
     sortedCatalogItems
@@ -229,8 +166,7 @@ const {
     UPSTREAM_IDLE_TIMEOUT_MS,
     UPSTREAM_BODY_TIMEOUT_MS,
     LOG_REQUESTS,
-    xtremioGet,
-    getStreams
+    xtremioGet
 } = require('./src/xtream/client.js');
 
 // What this addon reads from a panel, and the caches in front of it. The cache
@@ -238,26 +174,20 @@ const {
 const {
     catCache,
     getCategories,
-    refreshCategories,
     liveStreamsCache,
     vodStreamsCache,
     seriesStreamsCache,
-    streamIdIndexes,
     findStreamById,
     getAllVodStreams,
     getAllSeriesStreams,
     getAllLiveStreams,
     categoryStreamsCache,
-    categoryStreamsCacheKey,
     getCategoryStreams,
     parseYear,
     isUsableSeriesInfo,
-    hasSeriesEpisodes,
     SERIES_INFO_MAX_ATTEMPTS,
-    SERIES_INFO_BACKOFF_MS,
     SERIES_INFO_NEGATIVE_TTL,
     seriesInfoCache,
-    seriesInfoCacheKey,
     readSeriesInfoEntry,
     getCachedSeriesInfo,
     setCachedSeriesInfo,
@@ -265,7 +195,6 @@ const {
     getSeriesInfo,
     fetchSeriesInfo,
     vodInfoCache,
-    vodInfoCacheKey,
     isUsableVodInfo,
     getVodInfo,
     warmVodItem
@@ -277,14 +206,13 @@ const {
     CATALOG_KINDS,
     catalogTypesFor,
     DEGRADED_CATALOG_LOG_INTERVAL_MS,
-    DEGRADED_CATALOG_LOG_MAX,
     degradedCatalogLogged,
     noteDegradedCatalog,
     selectCatalogSource
 } = require('./src/catalog/kinds.js');
 
 // The manifest Stremio installs against, built per account from its categories.
-const { getManifest, ADDON_ID, ADDON_VERSION } = require('./src/manifest.js');
+const { getManifest } = require('./src/manifest.js');
 
 // Who a request is from and what URL this server is reachable at — both read
 // through TRUST_PROXY, because both come from headers a client can set.
@@ -303,15 +231,12 @@ const {
 // Relaying provider bytes to the player: the shared relay, the HLS target mapper,
 // and the three concurrency caps. Both proxy routes go through it.
 const {
-    PROXY_USER_AGENT,
     PROXY_HEADER_TIMEOUT_MS,
     PLAYLIST_BODY_TIMEOUT_MS,
     MAX_PLAYLIST_ORIGINS,
     PLAYLIST_REWRITE_TIMEOUT_MS,
     HLS_ORIGIN_VET_TTL_MS,
-    HLS_ORIGIN_VET_MAX,
     hlsOriginVetCache,
-    vetHlsOrigin,
     hlsPrefixVerdict,
     sniffPlaylistStart,
     setRelayHeaders,
@@ -321,7 +246,6 @@ const {
     hlsTargetOrigins,
     makeHlsProxyMapper,
     HLS_TARGET_ALLOWED_HOSTS,
-    relayLimitFromEnv,
     PROXY_MAX_CONCURRENT_PER_TOKEN,
     PROXY_MAX_CONCURRENT_PER_CLIENT,
     PROXY_MAX_CONCURRENT_TOTAL,
@@ -340,7 +264,6 @@ const {
     schemeOf,
     describeDowngrade,
     serverInfoOrigin,
-    credentialsWorkAt,
     validateXtremioCredentials
 } = require('./src/configure/validate.js');
 
@@ -596,16 +519,6 @@ function logRouteError(route, e) {
     else console.error(`[${route}] Error:`, e?.message);
 }
 
-
-// Resolves a genre to its items *and* to the cached array they were derived
-// from, or to null when the genre does not resolve to a category. The second half
-// is what lets the sorted view be invalidated by identity: a genre shelf is
-// usually a fresh `.filter()` of the full list, so
-// the items array is new on every request and says nothing about whether the
-// underlying data changed — but the array it was filtered from is the one the
-// list cache holds, and that is replaced only by a refetch.
-//
-
 app.get(['/:config/catalog/:type/:id.json', '/:config/catalog/:type/:id/:extra.json'], async (req, res) => {
     // Degraded answers are the default, in this route and in meta and stream:
     // every early return is an empty answer produced by a failure, and a client
@@ -636,7 +549,8 @@ app.get(['/:config/catalog/:type/:id.json', '/:config/catalog/:type/:id/:extra.j
         const extra = parseExtra(rawExtraSegment(req));
         const skip = Math.max(0, parseInt(extra.skip) || 0);
         // One clock for the whole request: the selection memo and the sorted view
-        // are both scoped to the day, and reading it twice could straddle midnight.
+        // are both scoped to the featured period, and reading it twice could fall
+        // either side of a period boundary.
         const now = Date.now();
 
         let selected;

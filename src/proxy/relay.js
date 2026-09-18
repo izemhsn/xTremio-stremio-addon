@@ -19,13 +19,12 @@ const { Readable } = require('node:stream');
 const { normalizeUrl } = require('../helpers.js');
 const { BoundedMap } = require('../cache/bounded-map.js');
 const { registerSweepable, accountCacheKey } = require('../cache/layers.js');
-const { parseHostList, hostnameOf } = require('../panel-allowlist.js');
+const { parseHostList } = require('../panel-allowlist.js');
 const { clientKey } = require('../routes/request.js');
 const {
     safeFetch,
     discardBody,
     assertSafeOutboundUrl,
-    blockedOutbound,
     DNS_PIN_TTL_MS
 } = require('../net/safe-fetch.js');
 const { readTextCapped } = require('../upstream/read-capped.js');
@@ -215,8 +214,11 @@ async function relayUpstream(req, res, { upstreamUrl, label, ext, rewriteFor }) 
             try { controller.abort(); } catch {}
         }
     };
+    // 'close' alone: it fires whether the client finished or vanished, and covers
+    // everything the deprecated 'aborted' event did. Listening for both was two
+    // calls to the same idempotent abort, and one of them is on its way out of
+    // Node.
     req.on('close', abort);
-    req.on('aborted', abort);
 
     const isAbortErr = (e) => e && (e.name === 'AbortError' || e.code === 'ABORT_ERR' || controller.signal.aborted);
 

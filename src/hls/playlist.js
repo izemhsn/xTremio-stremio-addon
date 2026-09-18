@@ -3,7 +3,7 @@
 // Deliberately knows nothing about DNS, the SSRF guard or Express.
 // rewriteHlsPlaylist takes its `toProxyUrl` mapper as an argument, and the
 // production mapper — which vets a target before signing it — is built in
-// index.js, where the guard lives. That is what keeps this module a leaf.
+// src/proxy/relay.js, with the guard. That is what keeps this module a leaf.
 const crypto = require('node:crypto');
 
 const {

@@ -8,6 +8,8 @@
 // The shutdown handler raises the drain signal as it begins rather than when
 // close() finishes: the point is to leave the load balancer's pool before this
 // instance stops serving, which is what /health reports.
+//
+// This process is a streaming proxy, not a plain JSON API: a single request can
 // hold a socket open for the length of a movie. That changes what the right
 // timeout and shutdown behaviour are, so both are stated explicitly rather than
 // left on Node's defaults.

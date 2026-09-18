@@ -9,16 +9,17 @@
 // cached array a genre shelf was filtered *from* as the token rather than the
 // filtered result.
 //
-// CATALOG_KINDS stays in index.js: it names the loaders and the list caches, so it
-// belongs with them rather than here. Everything in this file takes the `kind` it
-// needs as an argument.
+// CATALOG_KINDS lives in src/catalog/kinds.js: it names the loaders and the list
+// caches, so it belongs with them rather than here. Everything in this file takes
+// the `kind` it needs as an argument, which is what keeps this file ignorant of
+// the panel.
 const { titleOf } = require('../helpers.js');
 
 // Sorted catalog views, so paginating a shelf does not re-sort the whole list per
 // page. A WeakMap keyed by the cached array a view was sorted from: a refetch
 // invalidates it at once, and an evicted list takes its views with it. Nothing in a
 // view may hold a strong reference back to its list. Each source maps to
-// `{ day, views }`; see sortedCatalogItems.
+// `{ epoch, views, selections }`; see sortedCatalogItems.
 const sortedCatalogViews = new WeakMap();
 
 // The separator inside view and selection keys. A newline, because no variant
@@ -155,16 +156,17 @@ function catalogViewKey(route, selection) {
     return `${catalogVariant(route)}${VIEW_KEY_SEP}${selection}`;
 }
 
-// A list that stays cached across a period boundary must not keep the previous
-// period's views alongside the new ones. featuredEpoch is the same function the
-// comparator seeds from, so the two cannot disagree about when the order changed.
-
 // This period's memo for `source`, or null when there is none and `create` is
-// false. `views` holds sorted orders, keyed by variant and selection; `selections`
-// holds the filtered arrays those orders were computed from, keyed by selection
-// alone — two key spaces that must not share a map, since a selection can itself
-// contain the separator. A filtered selection does not depend on the period, but
-// it costs one filter to let both live and die together.
+// false. A list that stays cached across a period boundary must not keep the
+// previous period's views alongside the new ones, and featuredEpoch is the same
+// function the comparator seeds from, so the two cannot disagree about when the
+// order changed.
+//
+// `views` holds sorted orders, keyed by variant and selection; `selections` holds
+// the filtered arrays those orders were computed from, keyed by selection alone —
+// two key spaces that must not share a map, since a selection can itself contain
+// the separator. A filtered selection does not depend on the period, but it costs
+// one filter to let both live and die together.
 function catalogMemoFor(source, epoch, create) {
     let entry = sortedCatalogViews.get(source);
     if (!entry || entry.epoch !== epoch) {

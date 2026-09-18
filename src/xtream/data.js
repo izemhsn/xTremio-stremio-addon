@@ -8,7 +8,7 @@
 // The cache instances live with the calls they front rather than in
 // src/cache/layers.js, which holds only the primitives and knows nothing about
 // Xtream.
-const { titleOf, causeSuffix } = require('../helpers.js');
+const { causeSuffix } = require('../helpers.js');
 const { BoundedMap } = require('../cache/bounded-map.js');
 const { estimateBytes } = require('../upstream/read-capped.js');
 const { xtremioGet, getStreams, LOG_REQUESTS } = require('./client.js');
@@ -28,8 +28,9 @@ const {
     createKeyedCache
 } = require('../cache/layers.js');
 
-// estimateBytes and weighJson moved with the reader whose byte count they read.
-// The per-cache bounds moved with them.
+// Categories per account. maxAgeMs is the 24-hour stale window rather than
+// CACHE_TTL, because getCategories serves a stale copy through an outage and the
+// sweep must not reclaim what it is still answering from.
 const catCache = registerSweepable(new BoundedMap({
     maxEntries: CACHE_MAX_ACCOUNTS,
     maxAgeMs: CACHE_STALE_MAX_AGE_MS,
@@ -86,7 +87,6 @@ const liveStreamsCache = createStreamListCache();
 const vodStreamsCache = createStreamListCache();
 const seriesStreamsCache = createStreamListCache();
 
-// The sorted-view memo and its key separator moved to src/catalog/shelf.js.
 
 // stream_id -> item for a cached live or movie list, so opening a channel or
 // falling back from get_vod_info is a lookup rather than a scan. Keyed by the
@@ -177,7 +177,6 @@ const seriesInfoCache = registerSweepable(new BoundedMap({
     maxAgeMs: CACHE_TTL,
     ledger: CACHE_BUDGET
 }));
-// The sweep itself lives in src/cache/layers.js, with the registry it reads.
 
 function seriesInfoCacheKey(cfg, seriesId) {
     return `${accountCacheKey(cfg)}\n${seriesId}`;
