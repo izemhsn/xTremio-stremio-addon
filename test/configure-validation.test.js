@@ -110,3 +110,45 @@ test('the form is redisplayed with the bad URL still in it', async () => {
     assert.ok(html.includes('value="http://bad host"'), 'the typed URL is echoed back');
     assert.ok(html.includes('value="alice"'), 'and so is the username');
 });
+
+// Audit O2. express.urlencoded was mounted app-wide, so a POST to any path at
+// all had its body parsed before the 404 that was always coming — work done on
+// the thread that also relays video, for a request that was never going to be
+// answered. The parser now sits on POST /configure, the only route that reads a
+// form, and the two halves of that are observable: a large body to another path
+// is no longer refused by the parser, and one to /configure still is.
+async function postTo(path, body, headers = {}) {
+    const server = await new Promise(r => { const s = app.listen(0, '127.0.0.1', () => r(s)); });
+    try {
+        const res = await realFetch(`http://127.0.0.1:${server.address().port}${path}`, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/x-www-form-urlencoded', ...headers },
+            body
+        });
+        return { status: res.status, text: await res.text() };
+    } finally {
+        await new Promise(r => server.close(r));
+    }
+}
+
+test('a form body is only parsed on the route that reads one', async () => {
+    const big = 'x=' + 'a'.repeat(200 * 1024);
+
+    // Another path: the 404 it was always going to get, not the parser's 413.
+    const other = await postTo('/not-a-route', big);
+    assert.strictEqual(other.status, 404, 'an unrouted POST is answered without parsing its body');
+
+    // /configure: the parser runs, and its limit is what answers.
+    const configure = await postTo('/configure', big);
+    assert.strictEqual(configure.status, 413, 'the form route still bounds what it will parse');
+    assert.strictEqual(configure.text, 'bad request',
+        'and the terminal handler honours the status body-parser set');
+});
+
+test('a normal form still reaches the route', async () => {
+    // The guard against mounting the parser and forgetting to pass it: without
+    // it req.body is undefined and every field reads as missing.
+    const { text } = await postTo('/configure', 'serverUrl=&username=alice&password=secret');
+    assert.ok(text.includes('Please enter your server URL.'), 'the fields were parsed');
+    assert.ok(text.includes('value="alice"'), 'and echoed back');
+});

@@ -59,7 +59,7 @@ function serverInfoOrigin(si) {
 // SSRF guard included, is simply "no".
 async function credentialsWorkAt(origin, username, password) {
     const controller = new AbortController();
-    const timer = setTimeout(() => controller.abort(), 15000);
+    const timer = setTimeout(() => controller.abort(), CONFIGURE_TIMEOUT_MS);
     try {
         const res = await safeFetch(buildUrl(origin, '/player_api.php', { username, password }), { signal: controller.signal });
         const json = await readJsonCapped(res, 'credential check', 1024 * 1024);

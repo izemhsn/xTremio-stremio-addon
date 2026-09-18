@@ -283,9 +283,13 @@ const {
 const app = express();
 // Free stack fingerprinting for anyone who can reach the port.
 app.disable('x-powered-by');
-// The only form is three flat string fields. Extended parsing (qs) would build
-// nested objects and arrays that asString then has to defend against.
-app.use(express.urlencoded({ extended: false }));
+// Mounted on POST /configure alone rather than app-wide: it is the only route
+// that reads a form, and as a global middleware a POST to any other path — a
+// catalog URL, say — had up to 100 KB of body parsed before the 404 that was
+// always coming. The only form is three flat string fields, so extended parsing
+// (qs) is off: it would build nested objects and arrays that asString then has to
+// defend against.
+const parseConfigureForm = express.urlencoded({ extended: false, limit: '8kb' });
 
 // The Stremio addon protocol is called cross-origin by web.stremio.com, so its
 // JSON resources genuinely need a wildcard. Nothing else here does: /configure
@@ -439,7 +443,7 @@ app.get('/configure', (req, res) => sendConfigurePage(req, res, req.query.config
 // /<token>/configure, which has no handler.
 app.get('/:config/configure', (req, res) => sendConfigurePage(req, res, req.params.config));
 
-app.post('/configure', async (req, res) => {
+app.post('/configure', parseConfigureForm, async (req, res) => {
     const nonce = setPrivateHeaders(res);
     // req.body may be undefined, and its fields are not guaranteed to be strings.
     const body = req.body || {};

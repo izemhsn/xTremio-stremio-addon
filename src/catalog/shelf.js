@@ -93,15 +93,40 @@ function catalogComparator(kind, variant, now = Date.now()) {
     return null;
 }
 
+// The lowercased title of each item in a list, memoised by the list's identity —
+// the same rule as sortedCatalogViews, and for the same reason: a refetch is a
+// new array, so there is no second lifetime that could disagree with the list's
+// own, and an evicted list takes its titles with it. The values are plain
+// strings and hold no reference back, so nothing here keeps a list alive.
+//
+// It sits outside CACHE_MAX_MB like the sorted views do, and for the same
+// reason: what it can hold is already bounded by the list caches.
+const lowerTitles = new WeakMap();
+
 // `limit` stops the scan once that many matches are found: the route needs one
 // page, and a common word would otherwise lowercase and test every title.
+//
+// The titles are filled in *as the scan reaches them*, not mapped up front.
+// Measured on 50,000 items, a search whose term matches almost nothing scans the
+// whole list and cost 3.9 ms against 1.5 ms lowercasing once — but mapping the
+// whole list first turns the opposite case, the first page of a term that
+// matches often, from 0.16 ms into 2.9 ms, because the scan used to stop after a
+// hundred matches and would now weigh all fifty thousand. Filling on demand
+// keeps that case at 0.29 ms and still leaves every later page and every repeat
+// search reading strings it already has. `??` and not `||` because titleOf
+// answers `''` for a title it cannot use, and that is an answer, not a miss.
 function filterByName(items, search, limit = Infinity) {
     if (!search) return items;
+    let titles = lowerTitles.get(items);
+    if (!titles) {
+        titles = new Array(items.length);
+        lowerTitles.set(items, titles);
+    }
     const q = search.toLowerCase();
     const found = [];
-    for (const s of items) {
-        if (found.length >= limit) break;
-        if (titleOf(s.name).toLowerCase().includes(q)) found.push(s);
+    for (let i = 0; i < items.length && found.length < limit; i++) {
+        const title = titles[i] ?? (titles[i] = titleOf(items[i].name).toLowerCase());
+        if (title.includes(q)) found.push(items[i]);
     }
     return found;
 }

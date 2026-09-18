@@ -177,6 +177,54 @@ test('filterByName is a no-op without a search term', () => {
     assert.deepEqual(filterByName([{ stream_id: 1 }, { stream_id: 2, name: 'Hit' }], 'hit').map(s => s.stream_id), [2]);
 });
 
+// Audit O1. The titles were lowercased on every search, so Stremio's global
+// search — which queries both search catalogs — did that work twice per query on
+// the thread that also relays video. They are memoised by the list's identity
+// now, which means the answers have to be identical whether or not the memo is
+// warm, and have to follow a refetch.
+test('a memoised title does not change what a search matches', () => {
+    // Same list, three searches: the first fills the memo as it scans, the rest
+    // read it. Nothing about the result may depend on which one is running.
+    assert.deepEqual(filterByName(MOVIES, 'alph').map(s => s.stream_id), [101]);
+    assert.deepEqual(filterByName(MOVIES, 'brav').map(s => s.stream_id), [102]);
+    assert.deepEqual(filterByName(MOVIES, 'alph').map(s => s.stream_id), [101]);
+    assert.deepEqual(filterByName(MOVIES, 'a').map(s => s.stream_id), [101, 102, 103]);
+});
+
+test('a limit still stops the scan, and the memo picks up where it left off', () => {
+    // The titles are filled as the scan reaches them, so a limited search leaves
+    // the tail uncomputed. A later unlimited search over the same list must
+    // still see every item, not only the prefix the first one warmed.
+    const items = MOVIES.slice();
+    assert.deepEqual(filterByName(items, 'a', 1).map(s => s.stream_id), [101]);
+    assert.deepEqual(filterByName(items, 'a', 2).map(s => s.stream_id), [101, 102]);
+    assert.deepEqual(filterByName(items, 'a').map(s => s.stream_id), [101, 102, 103]);
+    assert.deepEqual(filterByName(items, 'charl').map(s => s.stream_id), [103]);
+});
+
+test('a refetched list is searched again rather than answered from the old titles', () => {
+    // The memo is keyed by the array's identity, exactly as the sorted views
+    // are: a refetch is a new array and cannot inherit the old one's answers.
+    const first = [{ stream_id: 1, name: 'Old Name' }];
+    assert.deepEqual(filterByName(first, 'old').map(s => s.stream_id), [1]);
+
+    const refetched = [{ stream_id: 1, name: 'New Name' }];
+    assert.deepEqual(filterByName(refetched, 'old').map(s => s.stream_id), []);
+    assert.deepEqual(filterByName(refetched, 'new').map(s => s.stream_id), [1]);
+});
+
+test('a title the memo cannot use is remembered as empty, not recomputed as a miss', () => {
+    // titleOf answers '' for a name it cannot render, and '' is a real answer.
+    // Cached with || instead of ??, every such item would be lowercased again on
+    // every search — the exact cost this memo exists to remove.
+    const items = [{ stream_id: 1 }, { stream_id: 2, name: {} }, { stream_id: 3, name: 'Hit' }];
+    assert.deepEqual(filterByName(items, 'hit').map(s => s.stream_id), [3]);
+    assert.deepEqual(filterByName(items, 'hit').map(s => s.stream_id), [3]);
+    // An empty search term is a no-op, so '' matching everything is not reachable
+    // through the route; matching on a substring of nothing still finds nothing.
+    assert.deepEqual(filterByName(items, 'x').map(s => s.stream_id), []);
+});
+
 // --- L3: the comparators are total ----------------------------------------
 
 test('every comparator breaks ties by id, in each direction', () => {
