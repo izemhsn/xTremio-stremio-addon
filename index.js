@@ -1,9 +1,316 @@
 const express = require('express');
-const { Readable } = require('stream');
+const crypto = require('crypto');
+// Event-loop delay for /health. Native, and its timer does not hold the process
+// open, so it does not interfere with a graceful shutdown.
+const { monitorEventLoopDelay } = require('node:perf_hooks');
+
+// The address tables the SSRF guard refuses. Pure, and the one part of the guard
+// with a test file of its own, so it is the first thing to leave index.js.
+const { isPrivateIp } = require('./src/net/private-ip.js');
+
+// Entry-count and byte bounds, and the one LRU order they all share.
+const { BoundedMap, CacheBudget } = require('./src/cache/bounded-map.js');
+
+// Which panels this instance will serve, and how a host is named.
+const {
+    hostnameOf,
+    parseHostList,
+    panelHostAllowed,
+    ALLOWED_PANEL_HOSTS
+} = require('./src/panel-allowlist.js');
+
+// The install-token crypto and the CONFIG_SECRET policy. Required here, near the
+// top, because its keys are derived from the environment at load time.
+const {
+    CONFIG_TOKEN_VERSION,
+    CONFIG_SECRET,
+    CONFIG_SECRET_MIN_BYTES,
+    IS_PRODUCTION,
+    SCRYPT_PARAMS,
+    deriveConfigKey,
+    deriveConfigKeys,
+    UNDECODABLE_REPORT_INTERVAL_MS,
+    undecodableTokens,
+    noteUndecodableToken,
+    configSecretProblems,
+    enforceConfigSecretPolicy,
+    validateConfig,
+    signTokenBody,
+    encodeConfig,
+    sealConfig,
+    decodeConfig
+} = require('./src/config-token.js');
+
+// Signing, encrypting and rewriting playlists. No DNS and no Express: the mapper
+// that vets a target before signing is built here and passed in.
+const {
+    HLS_SIGNATURE_TTL_MS,
+    MAX_PLAYLIST_BYTES,
+    signHlsTarget,
+    encodeHlsTarget,
+    decodeHlsTarget,
+    looksLikePlaylist,
+    hlsTargetExt,
+    rewriteHlsPlaylist
+} = require('./src/hls/playlist.js');
+
+// HTML escaping, and the /configure page that depends on it.
+const { escapeHtml } = require('./src/html.js');
+const { renderConfigPage } = require('./src/pages/configure.js');
+const { renderLandingPage } = require('./src/pages/landing.js');
+
+// Pure value helpers — URL and id shapes, and the coercions that make a
+// provider's untyped JSON safe to render.
+const {
+    causeSuffix,
+    asString,
+    normalizeUrl,
+    buildUrl,
+    buildXtremioApiUrl,
+    isNumericId,
+    getPrefixedNumericId,
+    parseEpisodeId,
+    typeMatchesId,
+    statedContainerExt,
+    normalizeContainerExt,
+    isNotWebReady,
+    toIsoDate,
+    titleOf,
+    ratingOf,
+    splitList,
+    youtubeTrailers,
+    pickBackdrop
+} = require('./src/helpers.js');
+
+// The SSRF guard and the DNS pin that makes it binding. Every outbound request
+// for a user-supplied URL goes through safeFetch; never call bare fetch.
+const {
+    DNS_TIMEOUT_MS,
+    DNS_PIN_TTL_MS,
+    DNS_SERVERS,
+    parseDnsServers,
+    makeDnsResolver,
+    dnsFallback,
+    dnsPins,
+    resolveHostAddresses,
+    pinResolvedAddresses,
+    pinnedLookup,
+    PINNED_DISPATCHER,
+    warnOnUndiciMismatch,
+    assertSafeOutboundUrl,
+    discardBody,
+    safeFetch
+} = require('./src/net/safe-fetch.js');
+
+// Reading an upstream body under a byte cap and a parsed-shape cap, and the
+// weighing the caches charge against CACHE_MAX_MB.
+const {
+    MAX_UPSTREAM_BYTES,
+    MAX_PARSED_TO_BODY_RATIO,
+    readJsonCapped,
+    estimateBytes,
+    weighJson
+} = require('./src/upstream/read-capped.js');
+
+// The cache TTLs, the shared byte budget, and the cache-aside primitives. The
+// cache instances themselves stay below, beside the upstream calls they front.
+const {
+    CACHE_TTL,
+    CACHE_FAILURE_TTL,
+    CACHE_REFRESH_AHEAD,
+    CACHE_MAX_ACCOUNTS,
+    CACHE_MAX_STREAM_ACCOUNTS,
+    CACHE_MAX_STREAM_BYTES,
+    CACHE_MAX_SERIES_INFO,
+    CACHE_MAX_VOD_INFO,
+    CACHE_MAX_CATEGORY_LISTS,
+    CACHE_MAX_BYTES,
+    CACHE_BUDGET,
+    CACHE_STALE_MAX_AGE_MS,
+    accountCacheKey,
+    sweepCaches,
+    startCacheSweeper,
+    createSingleFlight,
+    createKeyedCache
+} = require('./src/cache/layers.js');
+
+// Reading a catalog request's `extra` segment, and the cache hints on the answer.
+const {
+    parseExtra,
+    rawExtraSegment,
+    PAGE_SIZE,
+    withCacheHints
+} = require('./src/routes/extras.js');
+
+// Ordering, filtering and paginating a shelf, and the identity-keyed memo that
+// keeps a list from being re-sorted per page. CATALOG_KINDS stays below, with the
+// loaders and list caches it names.
+const {
+    sortedCatalogViews,
+    parseCatalogId,
+    FEATURED_PERIOD_MS,
+    featuredEpoch,
+    catalogComparator,
+    filterByName,
+    toCatalogMetas,
+    catalogViewKey,
+    cachedCatalogSelection,
+    rememberCatalogSelection,
+    sortedCatalogItems
+} = require('./src/catalog/shelf.js');
+
+// One call to an Xtream panel: the three upstream deadlines, the body caps and
+// the SSRF guard, in one place.
+const {
+    UPSTREAM_HEADER_TIMEOUT_MS,
+    UPSTREAM_IDLE_TIMEOUT_MS,
+    UPSTREAM_BODY_TIMEOUT_MS,
+    LOG_REQUESTS,
+    xtremioGet
+} = require('./src/xtream/client.js');
+
+// What this addon reads from a panel, and the caches in front of it. The cache
+// instances live with the calls they front, not with the primitives.
+const {
+    catCache,
+    getCategories,
+    liveStreamsCache,
+    vodStreamsCache,
+    seriesStreamsCache,
+    findStreamById,
+    getAllVodStreams,
+    getAllSeriesStreams,
+    getAllLiveStreams,
+    categoryStreamsCache,
+    getCategoryStreams,
+    parseYear,
+    isUsableSeriesInfo,
+    SERIES_INFO_MAX_ATTEMPTS,
+    SERIES_INFO_NEGATIVE_TTL,
+    seriesInfoCache,
+    readSeriesInfoEntry,
+    getCachedSeriesInfo,
+    setCachedSeriesInfo,
+    setNegativeSeriesInfo,
+    getSeriesInfo,
+    fetchSeriesInfo,
+    vodInfoCache,
+    isUsableVodInfo,
+    getVodInfo,
+    warmVodItem
+} = require('./src/xtream/data.js');
+
+// The three catalog kinds and how a genre resolves to items. The table names the
+// loaders and the list caches, so it sits between the catalog and the panel.
+const {
+    CATALOG_KINDS,
+    catalogTypesFor,
+    DEGRADED_CATALOG_LOG_INTERVAL_MS,
+    degradedCatalogLogged,
+    noteDegradedCatalog,
+    selectCatalogSource
+} = require('./src/catalog/kinds.js');
+
+// The manifest Stremio installs against, built per account from its categories.
+const { getManifest } = require('./src/manifest.js');
+
+// Who a request is from and what URL this server is reachable at — both read
+// through TRUST_PROXY, because both come from headers a client can set.
+const {
+    PORT,
+    HOST,
+    PUBLIC_URL,
+    SAFE_HOST,
+    TRUST_PROXY_HOPS,
+    forwardedValue,
+    getBaseUrl,
+    clientKey,
+    addressBucket
+} = require('./src/routes/request.js');
+
+// Relaying provider bytes to the player: the shared relay, the HLS target mapper,
+// and the three concurrency caps. Both proxy routes go through it.
+const {
+    PROXY_HEADER_TIMEOUT_MS,
+    PLAYLIST_BODY_TIMEOUT_MS,
+    MAX_PLAYLIST_ORIGINS,
+    PLAYLIST_REWRITE_TIMEOUT_MS,
+    HLS_ORIGIN_VET_TTL_MS,
+    hlsOriginVetCache,
+    hlsPrefixVerdict,
+    sniffPlaylistStart,
+    setRelayHeaders,
+    normalizeAcceptRanges,
+    relayUpstream,
+    panelOrigin,
+    hlsTargetOrigins,
+    makeHlsProxyMapper,
+    HLS_TARGET_ALLOWED_HOSTS,
+    PROXY_MAX_CONCURRENT_PER_TOKEN,
+    PROXY_MAX_CONCURRENT_PER_CLIENT,
+    PROXY_MAX_CONCURRENT_TOTAL,
+    proxyInFlight,
+    proxyInFlightByClient,
+    proxyRelays,
+    acquireProxySlot,
+    rejectOverCap
+} = require('./src/proxy/relay.js');
+
+// Whether a panel exists and the credentials work there, and what to tell the
+// user when the connection was downgraded on the way.
+const {
+    CONFIGURE_TIMEOUT_MS,
+    CONFIGURE_PROBE_TIMEOUT_MS,
+    schemeOf,
+    describeDowngrade,
+    serverInfoOrigin,
+    validateXtremioCredentials
+} = require('./src/configure/validate.js');
+
+// Starting and stopping cleanly: the ordered socket timeouts, the drain flag
+// /health reports, and the shutdown handler.
+const {
+    SHUTDOWN_TIMEOUT_MS,
+    KEEPALIVE_TIMEOUT_MS,
+    HEADERS_TIMEOUT_MS,
+    REQUEST_TIMEOUT_MS,
+    isShuttingDown,
+    setShuttingDown,
+    applyServerTimeouts,
+    createShutdownHandler
+} = require('./src/lifecycle.js');
 
 const app = express();
-app.use(express.urlencoded({ extended: true }));
+// Free stack fingerprinting for anyone who can reach the port.
+app.disable('x-powered-by');
+// Mounted on POST /configure alone rather than app-wide: it is the only route
+// that reads a form, and as a global middleware a POST to any other path — a
+// catalog URL, say — had up to 100 KB of body parsed before the 404 that was
+// always coming. The only form is three flat string fields, so extended parsing
+// (qs) is off: it would build nested objects and arrays that asString then has to
+// defend against.
+const parseConfigureForm = express.urlencoded({ extended: false, limit: '8kb' });
+
+// The Stremio addon protocol is called cross-origin by web.stremio.com, so its
+// JSON resources genuinely need a wildcard. Nothing else here does: /configure
+// handles plaintext credentials, and the landing page and health probe are read
+// by people and orchestrators, not by scripts on other origins.
+const CORS_PATH = /^\/(?:[^/]+\/)?(?:manifest\.json|catalog\/|meta\/|stream\/)/;
+
+// The byte proxy is deliberately excluded. CORS is not what stops someone
+// spending your bandwidth — a plain <video src> or a server-side fetch needs no
+// CORS at all, so the token is the only real gate. Set PROXY_CORS=true if a
+// player turns out to need it (an MSE-based one, or a crossorigin video element).
+const PROXY_CORS = process.env.PROXY_CORS === 'true';
+const PROXY_PATH = /^\/[^/]+\/proxy\//;
+
+function corsApplies(path) {
+    if (PROXY_PATH.test(path)) return PROXY_CORS;
+    return CORS_PATH.test(path);
+}
+
 app.use((req, res, next) => {
+    if (!corsApplies(req.path)) return next();
     res.setHeader('Access-Control-Allow-Origin', '*');
     res.setHeader('Access-Control-Allow-Headers', 'Content-Type');
     res.setHeader('Access-Control-Allow-Methods', 'GET, POST, OPTIONS');
@@ -11,833 +318,333 @@ app.use((req, res, next) => {
     next();
 });
 
-const PORT = process.env.PORT || 3000;
-const HOST = process.env.HOST || '0.0.0.0';
-const ADDON_ID = 'org.xtremio.addon';
 
-function getBaseUrl(req) {
-    const proto = req.headers['x-forwarded-proto'] || req.protocol || 'http';
-    const host = req.headers['x-forwarded-host'] || req.headers.host || `localhost:${PORT}`;
-    return `${proto}://${host}`;
+// The other half of that policy, for the other thing a deployment can get wrong
+// silently. SAFE_HOST below only checks the *shape* of the host an install link
+// is built from, so with PUBLIC_URL unset any hostname an attacker controls and
+// points at this instance mints install links carrying that hostname — and
+// whoever controls it can repoint its DNS later and collect the config tokens
+// users installed (audit L7). Warned rather than refused: a single-host
+// deployment behind a proxy that sets Host correctly is legitimate, but in
+// production it should be a deliberate choice rather than the default.
+function warnOnUnpinnedBaseUrl({ publicUrl = PUBLIC_URL, production = IS_PRODUCTION, log = console } = {}) {
+    if (publicUrl || !production) return false;
+    log.warn(
+        '[security] PUBLIC_URL is not set, so install links are built from the request Host. ' +
+        'A hostname an attacker controls, pointed at this instance, mints install URLs carrying ' +
+        'that hostname, and repointing its DNS later collects the config tokens users installed. ' +
+        "Set PUBLIC_URL to this addon's own public address."
+    );
+    return true;
 }
 
-function escapeHtml(str) {
-    return String(str || '').replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;').replace(/'/g, '&#039;');
-}
-
-function encodeConfig(cfg) {
-    return Buffer.from(JSON.stringify({
-        serverUrl: cfg.serverUrl,
-        username: cfg.username,
-        password: cfg.password
-    })).toString('base64url');
-}
-
-function decodeConfig(encoded) {
-    if (!encoded) return null;
-    try {
-        const cfg = JSON.parse(Buffer.from(encoded, 'base64url').toString('utf8'));
-        if (!cfg || typeof cfg !== 'object') return null;
-        if (!cfg.serverUrl || !cfg.username || !cfg.password) return null;
-        return cfg;
-    } catch {
-        return null;
-    }
-}
-
-async function getManifest(baseUrl = `http://localhost:${PORT}`, cfg = null) {
-    const catalogs = [];
-
-    if (cfg) {
-        try {
-            const cats = await getCategories(cfg);
-            const movieGenres = [...new Set(cats.movies.map(c => c.category_name).filter(Boolean))];
-            const seriesGenres = [...new Set(cats.series.map(c => c.category_name).filter(Boolean))];
-            const liveGenres = [...new Set(cats.live.map(c => c.category_name).filter(Boolean))];
-
-            catalogs.push(
-                {
-                    type: 'Live TV',
-                    id: 'xtremio_live',
-                    name: 'Live TV',
-                    extra: [
-                        { name: 'genre', options: liveGenres, isRequired: true },
-                        { name: 'skip' },
-                        { name: 'search' }
-                    ]
-                },
-                {
-                    type: 'XT-Movies',
-                    id: 'xtremio_movies_popular',
-                    name: 'Popular',
-                    extra: [
-                        { name: 'genre', options: movieGenres, isRequired: true },
-                        { name: 'skip' },
-                        { name: 'search' }
-                    ]
-                },
-                {
-                    type: 'XT-Movies',
-                    id: 'xtremio_movies_new',
-                    name: 'New',
-                    extra: [
-                        { name: 'genre', options: movieGenres, isRequired: true },
-                        { name: 'skip' },
-                        { name: 'search' }
-                    ]
-                },
-                {
-                    type: 'XT-Movies',
-                    id: 'xtremio_movies_featured',
-                    name: 'Featured',
-                    extra: [
-                        { name: 'genre', options: movieGenres, isRequired: true },
-                        { name: 'skip' },
-                        { name: 'search' }
-                    ]
-                },
-                {
-                    type: 'XT-Series',
-                    id: 'xtremio_series_popular',
-                    name: 'Popular',
-                    extra: [
-                        { name: 'genre', options: seriesGenres, isRequired: true },
-                        { name: 'skip' },
-                        { name: 'search' }
-                    ]
-                },
-                {
-                    type: 'XT-Series',
-                    id: 'xtremio_series_new',
-                    name: 'New',
-                    extra: [
-                        { name: 'genre', options: seriesGenres, isRequired: true },
-                        { name: 'skip' },
-                        { name: 'search' }
-                    ]
-                },
-                {
-                    type: 'XT-Series',
-                    id: 'xtremio_series_featured',
-                    name: 'Featured',
-                    extra: [
-                        { name: 'genre', options: seriesGenres, isRequired: true },
-                        { name: 'skip' },
-                        { name: 'search' }
-                    ]
-                },
-                {
-                    type: 'XT-Movies',
-                    id: 'xtremio_search_movies',
-                    name: 'Search Movies',
-                    extra: [{ name: 'search', isRequired: true }],
-                    searchProperties: ['name']
-                },
-                {
-                    type: 'XT-Series',
-                    id: 'xtremio_search_series',
-                    name: 'Search Series',
-                    extra: [{ name: 'search', isRequired: true }],
-                    searchProperties: ['name']
-                }
-            );
-        } catch (e) {
-            catalogs.push(
-                { type: 'Live TV', id: 'xtremio_live', name: 'Live TV' },
-                { type: 'XT-Movies', id: 'xtremio_movies_popular', name: 'Popular' },
-                { type: 'XT-Movies', id: 'xtremio_movies_new', name: 'New' },
-                { type: 'XT-Movies', id: 'xtremio_movies_featured', name: 'Featured' },
-                { type: 'XT-Series', id: 'xtremio_series_popular', name: 'Popular' },
-                { type: 'XT-Series', id: 'xtremio_series_new', name: 'New' },
-                { type: 'XT-Series', id: 'xtremio_series_featured', name: 'Featured' },
-                { type: 'XT-Movies', id: 'xtremio_search_movies', name: 'Search Movies', extra: [{ name: 'search', isRequired: true }], searchProperties: ['name'] },
-                { type: 'XT-Series', id: 'xtremio_search_series', name: 'Search Series', extra: [{ name: 'search', isRequired: true }], searchProperties: ['name'] }
-            );
-        }
-    }
-
-    return {
-        id: ADDON_ID,
-        version: '1.0.2',
-        name: 'xTremio',
-        description: 'xTremio addon for Stremio',
-        resources: ['catalog', 'meta', 'stream'],
-        types: ['Live TV', 'XT-Movies', 'XT-Series', 'series'],
-        catalogs,
-        idPrefixes: ['xtremio_live_', 'xtremio_movie_', 'xtremio_series_', 'xtremio_episode_'],
-        behaviorHints: {
-            configurable: true,
-            configurationRequired: !cfg
-        },
-        config: { url: `${baseUrl}/configure` }
-    };
-}
 
 app.get('/manifest.json', async (req, res) => {
-    res.json(await getManifest(getBaseUrl(req), null));
+    res.json(await getManifest(null));
 });
 
 app.get('/:config/manifest.json', async (req, res) => {
     const cfg = decodeConfig(req.params.config);
-    res.json(await getManifest(getBaseUrl(req), cfg));
+    res.json(await getManifest(cfg));
 });
 
-function normalizeUrl(url) {
-    url = url.trim().replace(/\/+$/, '');
-    if (!/^https?:\/\//.test(url)) url = 'http://' + url;
-    return url;
+// The configure page echoes a submitted password and embeds the install token, so
+// it is kept out of caches and Referer headers, and cannot be framed (it is a
+// clickjacking target). The CSP is a backstop behind escapeHtml: nothing external
+// loads, scripts run only under a per-response nonce (so no inline on* handlers),
+// and style-src keeps 'unsafe-inline' for the style="…" attributes. Returns the
+// nonce, which the caller must pass to renderConfigPage.
+function setPrivateHeaders(res) {
+    res.setHeader('Cache-Control', 'no-store');
+    res.setHeader('Referrer-Policy', 'no-referrer');
+
+    const nonce = crypto.randomBytes(16).toString('base64');
+    res.setHeader('Content-Security-Policy', [
+        "default-src 'none'",
+        `script-src 'nonce-${nonce}'`,
+        "style-src 'unsafe-inline'",
+        // form-action does not fall back to default-src, so the page's own POST
+        // has to be allowed explicitly or the form silently stops submitting.
+        "form-action 'self'",
+        "base-uri 'none'",
+        "frame-ancestors 'none'"
+    ].join('; '));
+    res.setHeader('X-Frame-Options', 'DENY');
+    res.setHeader('X-Content-Type-Options', 'nosniff');
+    return nonce;
 }
 
-// Per Stremio SDK: notWebReady must be true when the URL is http:// or
-// the file is not an MP4 container. Without this, the player may stop
-// after a short period (e.g. ~1 min) and Stremio treats it as "ended",
-// returning to details (movies) or auto-advancing (series episodes).
-function isNotWebReady(url, ext) {
-    const isHttps = /^https:\/\//i.test(url);
-    const isMp4 = String(ext || '').toLowerCase() === 'mp4';
-    return !(isHttps && isMp4);
-}
+// POST /configure makes an outbound request to a host the caller chooses, with
+// credentials the caller chooses, before any authentication. Unmetered, that
+// makes the instance a port scanner and a credential-stuffing relay running on
+// this server's IP. A handful of attempts per minute is far more than a human
+// configuring an addon needs.
+const CONFIGURE_RATE_LIMIT = Math.max(1, Number(process.env.CONFIGURE_RATE_LIMIT) || 10);
+const CONFIGURE_RATE_WINDOW_MS = Math.max(1000, Number(process.env.CONFIGURE_RATE_WINDOW_MS) || 60 * 1000);
+// Bounded; once full, the oldest bucket makes room rather than letting new clients
+// through untracked.
+const CONFIGURE_RATE_MAX_CLIENTS = 10000;
+const configureAttempts = new Map();
 
-// Browser-like UA — many Xtream CDNs reject or shortchange non-browser UAs.
-const PROXY_USER_AGENT = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0 Safari/537.36';
 
-async function xtremioGet(cfg, action, extraParams = '', { timeoutMs = 15000 } = {}) {
-    const base = normalizeUrl(cfg.serverUrl);
-    const url = `${base}/player_api.php?username=${encodeURIComponent(cfg.username)}&password=${encodeURIComponent(cfg.password)}&action=${action}${extraParams}`;
-    const controller = new AbortController();
-    const timer = setTimeout(() => controller.abort(), timeoutMs);
-    try {
-        const res = await fetch(url, { signal: controller.signal, redirect: 'follow' });
-        if (!res.ok) throw new Error(`xtremio ${action} failed: HTTP ${res.status}`);
-        const data = await res.json();
-
-        console.log(`[xtremioGet] ${action} (${Array.isArray(data) ? data.length : '?'} items)`);
-
-        return data;
-    } finally {
-        clearTimeout(timer);
+// Fixed window: on the first hit of a window the count resets. Sweeping expired
+// entries on each call keeps the map proportional to *active* clients. A bucket is
+// only ever inserted at the start of its window, and the window is fixed, so
+// insertion order is expiry order and the sweep stops at the first live bucket;
+// one that expired out of order is replaced when its client next arrives.
+function rateLimitConfigure(req) {
+    const now = Date.now();
+    for (const [key, entry] of configureAttempts) {
+        if (entry.resetAt > now) break;
+        configureAttempts.delete(key);
     }
-}
 
-function toIsoDate(s) {
-    if (!s) return undefined;
-    const d = new Date(s);
-    return isNaN(d.getTime()) ? undefined : d.toISOString();
-}
-
-// Xtream providers return `cast`/`genre` as either a comma-separated string or an array.
-function splitList(value) {
-    if (!value) return [];
-    if (Array.isArray(value)) return value.map(v => String(v).trim()).filter(Boolean);
-    return String(value).split(',').map(v => v.trim()).filter(Boolean);
-}
-
-// `backdrop_path` can be an array of URLs or a single URL string.
-function pickBackdrop(value) {
-    if (!value) return undefined;
-    if (Array.isArray(value)) return value[0] || undefined;
-    return String(value) || undefined;
-}
-
-// All in-memory caches share the same TTL.
-const CACHE_TTL = 30 * 60 * 1000;
-
-// Keys must include credentials so two users on the same Xtream host don't
-// share cached catalogs/streams (different accounts can see different content).
-function accountCacheKey(cfg) {
-    return `${cfg.serverUrl}\n${cfg.username}\n${cfg.password}`;
-}
-
-const catCache = new Map();
-
-async function getCategories(cfg) {
-    const key = accountCacheKey(cfg);
-    const cached = catCache.get(key);
-    if (cached && cached.ts > Date.now() - CACHE_TTL) return cached;
-    const results = await Promise.allSettled([
-        xtremioGet(cfg, 'get_live_categories'),
-        xtremioGet(cfg, 'get_vod_categories'),
-        xtremioGet(cfg, 'get_series_categories')
-    ]);
-    const pick = r => (r.status === 'fulfilled' && Array.isArray(r.value)) ? r.value : [];
-    results.forEach((r, i) => {
-        if (r.status === 'rejected') {
-            console.error(`[getCategories] source ${i} failed:`, r.reason?.message || r.reason);
+    const key = clientKey(req);
+    let entry = configureAttempts.get(key);
+    if (entry && entry.resetAt <= now) {
+        configureAttempts.delete(key);
+        entry = undefined;
+    }
+    if (!entry) {
+        while (configureAttempts.size >= CONFIGURE_RATE_MAX_CLIENTS) {
+            configureAttempts.delete(configureAttempts.keys().next().value);
         }
-    });
-    const entry = {
-        live: pick(results[0]),
-        movies: pick(results[1]),
-        series: pick(results[2]),
-        ts: Date.now()
-    };
-    catCache.set(key, entry);
-    return entry;
-}
-
-// Stream list caches - populated on first fetch, reused for catalogs, search and meta
-function createStreamListCache() {
-    const map = new Map();
-    return {
-        get(cfg) {
-            const cached = map.get(accountCacheKey(cfg));
-            if (cached && cached.ts > Date.now() - CACHE_TTL) return cached.data;
-            return null;
-        },
-        set(cfg, items) {
-            map.set(accountCacheKey(cfg), { data: items, ts: Date.now() });
-        }
-    };
-}
-
-const liveStreamsCache = createStreamListCache();
-const vodStreamsCache = createStreamListCache();
-const seriesStreamsCache = createStreamListCache();
-
-async function getAllVodStreams(cfg) {
-    let items = vodStreamsCache.get(cfg);
-    if (!items) {
-        items = await getStreams(cfg, 'get_vod_streams', '');
-        vodStreamsCache.set(cfg, items);
-    }
-    return items;
-}
-
-async function getAllSeriesStreams(cfg) {
-    let items = seriesStreamsCache.get(cfg);
-    if (!items) {
-        items = await getStreams(cfg, 'get_series', '');
-        seriesStreamsCache.set(cfg, items);
-    }
-    return items;
-}
-
-async function getAllLiveStreams(cfg) {
-    let items = liveStreamsCache.get(cfg);
-    if (!items) {
-        items = await getStreams(cfg, 'get_live_streams', '');
-        liveStreamsCache.set(cfg, items);
-    }
-    return items;
-}
-
-function parseExtra(extra) {
-    const params = {};
-    if (extra) {
-        extra.split('&').forEach(p => {
-            const [k, ...rest] = p.split('=');
-            params[decodeURIComponent(k)] = decodeURIComponent(rest.join('='));
-        });
-    }
-    return params;
-}
-
-const PAGE_SIZE = 100;
-
-async function getStreams(cfg, action, catParam = '') {
-    const data = await xtremioGet(cfg, action, catParam);
-    return Array.isArray(data) ? data : [];
-}
-
-function parseYear(s) {
-    if (!s) return undefined;
-    const m = String(s).match(/\d{4}/);
-    return m ? parseInt(m[0]) : undefined;
-}
-
-function isUsableSeriesInfo(info) {
-    if (!info || typeof info !== 'object') return false;
-    const hasInfo = info.info && typeof info.info === 'object'
-        && (info.info.name || info.info.plot || info.info.genre || info.info.cover);
-    const eps = info.episodes;
-    const hasEpisodes = eps && typeof eps === 'object' && Object.keys(eps).length > 0;
-    return Boolean(hasInfo || hasEpisodes);
-}
-
-const SERIES_INFO_MAX_ATTEMPTS = 3;
-const SERIES_INFO_BACKOFF_MS = 500;
-
-const seriesInfoCache = new Map();
-
-function seriesInfoCacheKey(cfg, seriesId) {
-    return `${cfg.serverUrl}\n${cfg.username}\n${cfg.password}\n${seriesId}`;
-}
-
-function getCachedSeriesInfo(cfg, seriesId) {
-    const entry = seriesInfoCache.get(seriesInfoCacheKey(cfg, seriesId));
-    if (entry && entry.ts > Date.now() - CACHE_TTL) return entry.data;
-    return null;
-}
-
-function setCachedSeriesInfo(cfg, seriesId, data) {
-    seriesInfoCache.set(seriesInfoCacheKey(cfg, seriesId), { data, ts: Date.now() });
-}
-
-async function getSeriesInfo(cfg, seriesId) {
-    const hit = getCachedSeriesInfo(cfg, seriesId);
-    if (hit) return hit;
-
-    let lastInfo = null;
-    let lastError = null;
-    for (let attempt = 1; attempt <= SERIES_INFO_MAX_ATTEMPTS; attempt++) {
-        try {
-            const info = await xtremioGet(cfg, 'get_series_info', `&series_id=${seriesId}`, { timeoutMs: 8000 });
-            if (isUsableSeriesInfo(info)) {
-                setCachedSeriesInfo(cfg, seriesId, info);
-                return info;
-            }
-            lastInfo = info;
-            console.warn(`[getSeriesInfo] attempt ${attempt}/${SERIES_INFO_MAX_ATTEMPTS} for series ${seriesId} returned unusable data`);
-        } catch (e) {
-            lastError = e;
-            const causeMsg = e.cause ? ` (cause: ${e.cause.code || e.cause.message || e.cause})` : '';
-            console.warn(`[getSeriesInfo] attempt ${attempt}/${SERIES_INFO_MAX_ATTEMPTS} for series ${seriesId} failed: ${e.message}${causeMsg}`);
-        }
-        if (attempt < SERIES_INFO_MAX_ATTEMPTS) {
-            await new Promise(r => setTimeout(r, SERIES_INFO_BACKOFF_MS * attempt));
-        }
-    }
-    if (lastInfo !== null) return lastInfo;
-    throw lastError || new Error(`get_series_info failed for series ${seriesId}`);
-}
-
-async function validateXtremioCredentials(serverUrl, username, password) {
-    const base = normalizeUrl(serverUrl);
-    const path = `/player_api.php?username=${encodeURIComponent(username)}&password=${encodeURIComponent(password)}`;
-    const urls = [base, base.replace(/^https?/, m => m === 'https' ? 'http' : 'https')];
-
-    for (const url of urls) {
-        const controller = new AbortController();
-        const timer = setTimeout(() => controller.abort(), 15000);
-        try {
-            const res = await fetch(url + path, { signal: controller.signal, redirect: 'follow' });
-            const json = await res.json();
-
-            if (!json.user_info) return { valid: false, error: 'Not a valid xTremio server' };
-            if (json.user_info.auth !== 1) return { valid: false, error: 'Invalid username or password' };
-            if (json.user_info.status !== 'Active') return { valid: false, error: `Account is ${json.user_info.status || 'inactive'}` };
-
-            const expDate = parseInt(json.user_info.exp_date, 10);
-            if (expDate && expDate < Math.floor(Date.now() / 1000)) {
-                return { valid: false, error: 'Account has expired' };
-            }
-
-            let resolvedUrl;
-            const si = json.server_info;
-            if (si && si.url) {
-                const proto = si.server_protocol || 'http';
-                const port = (proto === 'https' ? si.https_port : si.port) || si.port;
-                resolvedUrl = port ? `${proto}://${si.url}:${port}` : `${proto}://${si.url}`;
-            }
-
-            return {
-                valid: true,
-                userInfo: json.user_info,
-                resolvedUrl: resolvedUrl || url
-            };
-        } catch (e) {
-            if (url === urls[0] && urls.length > 1) continue;
-            const msg = e.name === 'AbortError' ? 'Connection timed out'
-                : e.cause?.code === 'ECONNREFUSED' ? 'Connection refused — check server URL and port'
-                    : e.cause?.code === 'ENOTFOUND' ? 'Server not found — check the URL'
-                        : e.cause?.code === 'ECONNRESET' ? 'Connection reset by server'
-                            : e.message || 'Cannot connect to server';
-            return { valid: false, error: msg };
-        } finally {
-            clearTimeout(timer);
-        }
-    }
-    return { valid: false, error: 'Cannot connect to server' };
-}
-
-function renderConfigPage({ serverUrl = '', username = '', password = '', status = null, baseUrl = `http://localhost:${PORT}` }) {
-    const safeServerUrl = escapeHtml(serverUrl);
-    const safeUsername = escapeHtml(username);
-    const safePassword = escapeHtml(password);
-    let statusHtml = '';
-    if (status) {
-        if (status.valid) {
-            const encoded = encodeConfig({ serverUrl, username, password });
-            const installUrl = `stremio://${baseUrl.replace(/^https?:\/\//, '')}/${encoded}/manifest.json`;
-            const httpUrl = `${baseUrl}/${encoded}/manifest.json`;
-            statusHtml = `
-                <div class="status-section">
-                    <div class="status-banner status-success">
-                        <svg fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="3" d="M5 13l4 4L19 7"/></svg>
-                        <span class="status-text">Connected! Welcome, ${escapeHtml(status.userInfo.username || username)}</span>
-                    </div>
-                    <a href="${installUrl}" class="btn full install-link">
-                        <svg fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M4 16v1a3 3 0 003 3h10a3 3 0 003-3v-1m-4-4l-4 4m0 0l-4-4m4 4V4"/></svg>
-                        Install in Stremio
-                    </a>
-                    <div style="margin-top: 16px;">
-                        <p style="font-size: 13px; color: #555; margin-bottom: 8px; font-weight: 600; text-align: left;">Or copy this link to install:</p>
-                        <input type="text" value="${httpUrl}" readonly onclick="this.select(); document.execCommand('copy'); const p = this.previousElementSibling; const orig = p.innerText; p.innerText = '✓ Copied to clipboard!'; p.style.color = '#2e7d32'; setTimeout(() => { p.innerText = orig; p.style.color = '#555'; }, 2000);" style="width: 100%; padding: 12px; border: 2px solid #e0e0e0; border-radius: 10px; font-size: 14px; color: #333; background: #f9f9f9; cursor: pointer; text-align: center; transition: border-color 0.2s;" title="Click to copy install link" onmouseover="this.style.borderColor='#7c4dff'" onmouseout="this.style.borderColor='#e0e0e0'" />
-                    </div>
-                </div>`;
-        } else {
-            statusHtml = `
-                <div class="status-section">
-                    <div class="status-banner status-error">
-                        <svg fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="3" d="M6 18L18 6M6 6l12 12"/></svg>
-                        <span class="status-text">${escapeHtml(status.error)}</span>
-                    </div>
-                </div>`;
-        }
+        configureAttempts.set(key, { count: 1, resetAt: now + CONFIGURE_RATE_WINDOW_MS });
+        return { allowed: true, retryAfter: 0 };
     }
 
-    return `<!DOCTYPE html>
-    <html><head>
-        <title>xTremio Configuration</title>
-        <meta name="viewport" content="width=device-width, initial-scale=1.0">
-        <style>
-            * { box-sizing: border-box; margin: 0; padding: 0; }
-            body {
-                font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Oxygen, Ubuntu, sans-serif;
-                min-height: 100vh; display: flex; align-items: center; justify-content: center;
-                background: linear-gradient(135deg, #1a1a2e 0%, #16213e 50%, #0f3460 100%);
-                padding: 20px;
-            }
-            .card {
-                background: #fff; border-radius: 16px;
-                box-shadow: 0 20px 60px rgba(0,0,0,0.3);
-                max-width: 420px; width: 100%; overflow: hidden;
-            }
-            .header {
-                background: linear-gradient(135deg, #7c4dff 0%, #5c6bc0 100%);
-                padding: 30px; text-align: center;
-            }
-            .header h1 { color: #fff; font-size: 24px; font-weight: 600; }
-            .header p { color: rgba(255,255,255,0.8); font-size: 14px; margin-top: 8px; }
-            .btn {
-                display: inline-flex; align-items: center; gap: 10px;
-                padding: 14px 32px;
-                background: linear-gradient(135deg, #7c4dff 0%, #5c6bc0 100%);
-                color: #fff; text-decoration: none; border: none;
-                border-radius: 10px; font-size: 16px; font-weight: 600; cursor: pointer;
-                transition: transform 0.2s, box-shadow 0.2s;
-            }
-            .btn:hover { transform: translateY(-2px); box-shadow: 0 8px 25px rgba(124,77,255,0.4); }
-            .btn:active { transform: translateY(0); }
-            .btn svg { width: 20px; height: 20px; }
-            .form-container { padding: 30px; }
-            .input-group { margin-bottom: 20px; }
-            .input-group label { display: block; font-size: 13px; font-weight: 600; color: #333; margin-bottom: 8px; }
-            .input-wrapper { position: relative; }
-            .input-wrapper svg { position: absolute; left: 14px; top: 50%; transform: translateY(-50%); width: 18px; height: 18px; color: #999; }
-            .input-wrapper input { width: 100%; padding: 14px 14px 14px 44px; border: 2px solid #e0e0e0; border-radius: 10px; font-size: 15px; transition: border-color 0.2s, box-shadow 0.2s; }
-            .input-wrapper input:focus { outline: none; border-color: #7c4dff; box-shadow: 0 0 0 3px rgba(124,77,255,0.1); }
-            .input-wrapper input::placeholder { color: #aaa; }
-            .btn.full { width: 100%; justify-content: center; }
-            .status-section { padding: 0 30px 30px; text-align: center; }
-            .status-banner { padding: 16px; border-radius: 10px; display: flex; align-items: center; gap: 12px; margin-bottom: 16px; }
-            .status-banner svg { width: 22px; height: 22px; flex-shrink: 0; }
-            .status-banner .status-text { font-size: 14px; font-weight: 500; text-align: left; }
-            .status-success { background: #e8f5e9; color: #2e7d32; }
-            .status-error { background: #ffebee; color: #c62828; }
-            .install-link { margin-top: 4px; }
-            .disclaimer {
-                background: #fff8e1;
-                border: 1px solid #ffe082;
-                color: #5d4037;
-                border-radius: 10px;
-                padding: 12px 14px;
-                font-size: 12px;
-                line-height: 1.5;
-                margin-bottom: 22px;
-            }
-            .disclaimer strong { color: #ef6c00; display: block; margin-bottom: 4px; font-size: 13px; }
-            .disclaimer ul { margin: 6px 0 0 18px; padding: 0; }
-            .disclaimer li { margin-bottom: 3px; }
-        </style>
-    </head><body>
-        <div class="card">
-            <div class="header">
-                <h1>xTremio Addon</h1>
-                <p>Configure your credentials</p>
-            </div>
-            <div class="form-container">
-                <div class="disclaimer">
-                    <strong>⚠ Disclaimer</strong>
-                    This addon is a technical gateway only. It does <b>not</b> host, store, or provide any media content.
-                    <ul>
-                        <li>You must have a valid, legally obtained Xtream Codes account.</li>
-                        <li>You are solely responsible for the content accessed through your provider.</li>
-                        <li>Credentials are encoded into your install URL &mdash; keep it private, do not share it.</li>
-                    </ul>
-                </div>
-                <form method="POST">
-                    <div class="input-group">
-                        <label>Server URL</label>
-                        <div class="input-wrapper">
-                            <svg fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M21 12a9 9 0 01-9 9m9-9a9 9 0 00-9-9m9 9H3m9 9a9 9 0 01-9-9m9 9c1.657 0 3-4.03 3-9s-1.343-9-3-9m0 18c-1.657 0-3-4.03-3-9s1.343-9 3-9m-9 9a9 9 0 019-9"/></svg>
-                            <input type="url" name="serverUrl" value="${safeServerUrl}" placeholder="http://example.com:port" required />
-                        </div>
-                    </div>
-                    <div class="input-group">
-                        <label>Username</label>
-                        <div class="input-wrapper">
-                            <svg fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M16 7a4 4 0 11-8 0 4 4 0 018 0zM12 14a7 7 0 00-7 7h14a7 7 0 00-7-7z"/></svg>
-                            <input type="text" name="username" value="${safeUsername}" placeholder="Enter username" required />
-                        </div>
-                    </div>
-                    <div class="input-group">
-                        <label>Password</label>
-                        <div class="input-wrapper">
-                            <svg fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M12 15v2m-6 4h12a2 2 0 002-2v-6a2 2 0 00-2-2H6a2 2 0 00-2 2v6a2 2 0 002 2zm10-10V7a4 4 0 00-8 0v4h8z"/></svg>
-                            <input type="password" name="password" value="${safePassword}" placeholder="Enter password" required />
-                        </div>
-                    </div>
-                    <button type="submit" class="btn full">Save & Install</button>
-                </form>
-            </div>
-            ${statusHtml}
-        </div>
-    </body></html>`;
+    entry.count += 1;
+    if (entry.count > CONFIGURE_RATE_LIMIT) {
+        return { allowed: false, retryAfter: Math.ceil((entry.resetAt - now) / 1000) };
+    }
+    return { allowed: true, retryAfter: 0 };
 }
 
-app.get('/configure', (req, res) => {
-    const existing = decodeConfig(req.query.config) || {};
+// Prefill comes from an encrypted `config` token only, and never includes the
+// password: the token is the install URL Stremio syncs, and decrypting its password
+// into the page would hand whoever holds that URL a working provider credential.
+function sendConfigurePage(req, res, token) {
+    const nonce = setPrivateHeaders(res);
+    const existing = decodeConfig(token) || {};
     res.send(renderConfigPage({
-        serverUrl: req.query.serverUrl || existing.serverUrl || '',
-        username: req.query.username || existing.username || '',
-        password: req.query.password || existing.password || '',
-        baseUrl: getBaseUrl(req)
+        serverUrl: existing.serverUrl || '',
+        username: existing.username || '',
+        baseUrl: getBaseUrl(req),
+        nonce
     }));
-});
+}
 
-app.post('/configure', async (req, res) => {
-    const rawServerUrl = (req.body.serverUrl || '').trim().replace(/\/+$/, '');
-    const username = req.body.username || '';
-    const password = req.body.password || '';
+app.get('/configure', (req, res) => sendConfigurePage(req, res, req.query.config));
+
+// Stremio's Configure button on an installed addon swaps manifest.json for
+// `configure` in the transport URL, so it lands here and not on /configure. An
+// undecodable token renders the empty form, as the bare route does. The form
+// names /configure as its action because a bare POST from this path would go to
+// /<token>/configure, which has no handler.
+app.get('/:config/configure', (req, res) => sendConfigurePage(req, res, req.params.config));
+
+app.post('/configure', parseConfigureForm, async (req, res) => {
+    const nonce = setPrivateHeaders(res);
+    // req.body may be undefined, and its fields are not guaranteed to be strings.
+    const body = req.body || {};
+    const rawServerUrl = asString(body.serverUrl).trim().replace(/\/+$/, '');
+    const username = asString(body.username);
+    const password = asString(body.password);
+    const render = (status, serverUrl = rawServerUrl) => res.send(renderConfigPage({
+        serverUrl,
+        username,
+        password,
+        status,
+        baseUrl: getBaseUrl(req),
+        nonce
+    }));
+    const fail = (error) => render({ valid: false, error });
+
+    const limit = rateLimitConfigure(req);
+    if (!limit.allowed) {
+        res.status(429);
+        res.setHeader('Retry-After', String(limit.retryAfter));
+        return fail(`Too many attempts. Try again in ${limit.retryAfter} second${limit.retryAfter === 1 ? '' : 's'}.`);
+    }
+
+    // Normally prevented by `required`, but a direct POST still gets told which
+    // field is missing.
+    const missing = [
+        !rawServerUrl && 'server URL',
+        !username && 'username',
+        !password && 'password'
+    ].filter(Boolean);
+    if (missing.length) {
+        const named = missing.length === 1
+            ? missing[0]
+            : `${missing.slice(0, -1).join(', ')} and ${missing[missing.length - 1]}`;
+        return fail(`Please enter your ${named}.`);
+    }
+
+    // Before any request is made to the host: the credential check is itself an
+    // outbound fetch to a URL the caller chose. The reply does not list the hosts
+    // that are allowed — whether to publish that is the operator's decision.
+    if (!panelHostAllowed(rawServerUrl)) {
+        console.warn(
+            `[configure] refused ${JSON.stringify(hostnameOf(rawServerUrl) || rawServerUrl.slice(0, 100))}: ` +
+            'not in ALLOWED_PANEL_HOSTS'
+        );
+        return fail('This instance only accepts accounts from specific providers, and that server is not one of them.');
+    }
 
     try {
         const validation = await validateXtremioCredentials(rawServerUrl, username, password);
-        const finalServerUrl = validation.valid
+        render(validation, validation.valid
             ? (validation.resolvedUrl || normalizeUrl(rawServerUrl))
-            : rawServerUrl;
-
-        res.send(renderConfigPage({
-            serverUrl: finalServerUrl,
-            username,
-            password,
-            status: validation,
-            baseUrl: getBaseUrl(req)
-        }));
+            : rawServerUrl);
     } catch (e) {
-        res.send(renderConfigPage({
-            serverUrl: rawServerUrl,
-            username,
-            password,
-            status: { valid: false, error: 'Something went wrong. Please try again.' },
-            baseUrl: getBaseUrl(req)
-        }));
+        // validateXtremioCredentials is meant to answer, not throw — every
+        // provider and network failure is already a { valid: false } result. So
+        // anything arriving here is a bug in this server, and it used to be
+        // swallowed: a malformed server URL threw while the catch inside was
+        // logging, and the operator saw nothing at all (audit F2).
+        logRouteError('configure', e);
+        fail('Something went wrong. Please try again.');
     }
 });
 
+// Route failures are answered quietly, so the log is where a bug has to look
+// different from a provider outage (audit R6): a programming error keeps its stack,
+// provider and network failures stay one line.
+
+function isProgrammingError(e) {
+    if (e instanceof ReferenceError || e instanceof RangeError) return true;
+    // fetch reports a network failure as TypeError('fetch failed') with a cause.
+    return e instanceof TypeError && !e.cause && e.message !== 'fetch failed';
+}
+
+function logRouteError(route, e) {
+    if (isProgrammingError(e)) console.error(`[${route}] unexpected error: ${e.stack}`);
+    else console.error(`[${route}] Error:`, e?.message);
+}
+
 app.get(['/:config/catalog/:type/:id.json', '/:config/catalog/:type/:id/:extra.json'], async (req, res) => {
+    // Degraded answers are the default, in this route and in meta and stream:
+    // every early return is an empty answer produced by a failure, and a client
+    // applying heuristic caching to one would pin a transient fault.
+    // withCacheHints overwrites this on the paths that succeeded.
+    res.setHeader('Cache-Control', 'no-store');
     const cfg = decodeConfig(req.params.config);
     if (!cfg) return res.json({ metas: [] });
 
-    const { id } = req.params;
-    const extra = parseExtra(req.params.extra);
-    const skip = parseInt(extra.skip) || 0;
-    const genre = extra.genre;
+    const { id, type } = req.params;
+
+    // Through catalogTypesFor, not a copy of it, so the tested check is the one
+    // that runs.
+    const types = catalogTypesFor(id);
+    if (!types) return res.json({ metas: [] });
+    if (!types.includes(type)) {
+        // Quoted, here and in meta and stream: both values come straight from the
+        // path, and a %0A in :type let a caller write its own log line (audit L1).
+        // JSON.stringify escapes the newline and makes the boundaries visible.
+        console.warn(`[catalog] type/id mismatch: type=${JSON.stringify(type)} id=${JSON.stringify(id)}`);
+        return res.json({ metas: [] });
+    }
+
+    const route = parseCatalogId(id);
+    const kind = CATALOG_KINDS[route.kind];
 
     try {
-        if (id === 'xtremio_live') {
-            const cats = await getCategories(cfg);
-            const selectedGenre = genre || (cats.live[0] && cats.live[0].category_name);
-            let categoryId;
-            if (selectedGenre) {
-                const cat = cats.live.find(c => c.category_name === selectedGenre);
-                if (cat) categoryId = cat.category_id;
-            }
+        const extra = parseExtra(rawExtraSegment(req));
+        const skip = Math.max(0, parseInt(extra.skip) || 0);
+        // One clock for the whole request: the selection memo and the sorted view
+        // are both scoped to the featured period, and reading it twice could fall
+        // either side of a period boundary.
+        const now = Date.now();
 
-            // No genre selected and none resolvable -> nothing to show.
-            if (!categoryId) return res.json({ metas: [] });
-
-            // Fetch all live channels once (cached), then filter in-memory by selected category.
-            const allItems = await getAllLiveStreams(cfg);
-            const catIdStr = String(categoryId);
-            const selectedGenreLower = (selectedGenre || '').toLowerCase();
-            let items = allItems.filter(s => {
-                if (s.category_id != null && s.category_id !== '') {
-                    return String(s.category_id) === catIdStr;
-                }
-                return selectedGenreLower && String(s.category_name || '').toLowerCase() === selectedGenreLower;
-            });
-
-            if (extra.search) {
-                const q = extra.search.toLowerCase();
-                items = items.filter(s => s.name?.toLowerCase().includes(q));
-            }
-
-            const page = items.slice(skip, skip + PAGE_SIZE);
-            const metas = page.map(s => ({
-                id: `xtremio_live_${s.stream_id}`,
-                type: 'Live TV',
-                name: s.name,
-                poster: s.stream_icon || undefined,
-                posterShape: 'square'
-            }));
-
-            return res.json({ metas, cacheMaxAge: 300, staleRevalidate: 600 });
+        let selected;
+        if (route.search) {
+            // Global search: one full-list fetch per account (cached), then an
+            // in-memory filter. This is what makes search cheap.
+            if (!extra.search) return res.json({ metas: [] });
+            const all = await kind.loadAll(cfg);
+            selected = { items: all, source: all, selection: 'all' };
+        } else {
+            selected = await selectCatalogSource(cfg, kind, extra.genre, now);
+            if (!selected) return res.json({ metas: [] });
         }
 
-        if (id.startsWith('xtremio_movies_')) {
-            const cats = await getCategories(cfg);
-            const selectedGenre = genre || (cats.movies[0] && cats.movies[0].category_name);
-            const cat = cats.movies.find(c => c.category_name === selectedGenre);
-            if (!cat) return res.json({ metas: [] });
+        // Search sorts too (as `new`), so pages stay stable across refetches. The
+        // sort runs before the search filter: for a total order the two commute,
+        // and this way the memoised view does not depend on the search term. The
+        // filter stops once it has this page's worth of matches.
+        const items = filterByName(
+            sortedCatalogItems(kind, route, selected, now),
+            extra.search,
+            skip + PAGE_SIZE
+        );
 
-            // Reuse the full-list cache if available; fall back to per-category fetch.
-            const catIdStr = String(cat.category_id);
-            const fullList = vodStreamsCache.get(cfg);
-            let items = fullList
-                ? fullList.filter(s => String(s.category_id) === catIdStr)
-                : await getStreams(cfg, 'get_vod_streams', `&category_id=${catIdStr}`);
-
-            if (extra.search) {
-                const q = extra.search.toLowerCase();
-                items = items.filter(s => s.name?.toLowerCase().includes(q));
-            }
-
-            if (id === 'xtremio_movies_new') {
-                items = [...items].sort((a, b) => (parseInt(b.added) || 0) - (parseInt(a.added) || 0));
-            } else if (id === 'xtremio_movies_popular') {
-                items = [...items].sort((a, b) => (parseFloat(b.rating) || 0) - (parseFloat(a.rating) || 0));
-            } else if (id === 'xtremio_movies_featured') {
-                // Seeded shuffle based on the day so order is stable across pagination
-                const daySeed = Math.floor(Date.now() / 86400000);
-                items = [...items].sort((a, b) => {
-                    const ha = ((parseInt(a.stream_id) || 0) * 2654435761 + daySeed) & 0x7fffffff;
-                    const hb = ((parseInt(b.stream_id) || 0) * 2654435761 + daySeed) & 0x7fffffff;
-                    return ha - hb;
-                });
-            }
-
-            const page = items.slice(skip, skip + PAGE_SIZE);
-            const metas = page.map(s => ({
-                id: `xtremio_movie_${s.stream_id}`,
-                type: 'XT-Movies',
-                name: s.name,
-                poster: s.stream_icon || undefined,
-                posterShape: 'poster'
-            }));
-
-            return res.json({ metas, cacheMaxAge: 300, staleRevalidate: 600 });
-        }
-
-        if (id.startsWith('xtremio_series_')) {
-            const cats = await getCategories(cfg);
-            const selectedGenre = genre || (cats.series[0] && cats.series[0].category_name);
-            const cat = cats.series.find(c => c.category_name === selectedGenre);
-            if (!cat) return res.json({ metas: [] });
-
-            // Reuse the full-list cache if available; fall back to per-category fetch.
-            const catIdStr = String(cat.category_id);
-            const fullList = seriesStreamsCache.get(cfg);
-            let items = fullList
-                ? fullList.filter(s => String(s.category_id) === catIdStr)
-                : await getStreams(cfg, 'get_series', `&category_id=${catIdStr}`);
-
-            if (extra.search) {
-                const q = extra.search.toLowerCase();
-                items = items.filter(s => s.name?.toLowerCase().includes(q));
-            }
-
-            if (id === 'xtremio_series_new') {
-                items = [...items].sort((a, b) => (parseInt(b.last_modified) || 0) - (parseInt(a.last_modified) || 0));
-            } else if (id === 'xtremio_series_popular') {
-                items = [...items].sort((a, b) => (parseFloat(b.rating) || 0) - (parseFloat(a.rating) || 0));
-            } else if (id === 'xtremio_series_featured') {
-                const daySeed = Math.floor(Date.now() / 86400000);
-                items = [...items].sort((a, b) => {
-                    const ha = ((parseInt(a.series_id) || 0) * 2654435761 + daySeed) & 0x7fffffff;
-                    const hb = ((parseInt(b.series_id) || 0) * 2654435761 + daySeed) & 0x7fffffff;
-                    return ha - hb;
-                });
-            }
-
-            const page = items.slice(skip, skip + PAGE_SIZE);
-            const metas = page.map(s => ({
-                id: `xtremio_series_${s.series_id}`,
-                type: 'series',
-                name: s.name,
-                poster: s.cover || undefined,
-                posterShape: 'poster'
-            }));
-
-            return res.json({ metas, cacheMaxAge: 300, staleRevalidate: 600 });
-        }
-
-        // Global search catalogs - fetch all streams once, filter in memory
-        if (id === 'xtremio_search_movies' && extra.search) {
-            const q = extra.search.toLowerCase();
-            const allMovies = await getAllVodStreams(cfg);
-            const filtered = allMovies.filter(s => s.name?.toLowerCase().includes(q));
-            const page = filtered.slice(skip, skip + PAGE_SIZE);
-            const metas = page.map(s => ({
-                id: `xtremio_movie_${s.stream_id}`,
-                type: 'XT-Movies',
-                name: s.name,
-                poster: s.stream_icon || undefined,
-                posterShape: 'poster'
-            }));
-            return res.json({ metas, cacheMaxAge: 300, staleRevalidate: 600 });
-        }
-
-        if (id === 'xtremio_search_series' && extra.search) {
-            const q = extra.search.toLowerCase();
-            const allSeries = await getAllSeriesStreams(cfg);
-            const filtered = allSeries.filter(s => s.name?.toLowerCase().includes(q));
-            const page = filtered.slice(skip, skip + PAGE_SIZE);
-            const metas = page.map(s => ({
-                id: `xtremio_series_${s.series_id}`,
-                type: 'series',
-                name: s.name,
-                poster: s.cover || undefined,
-                posterShape: 'poster'
-            }));
-            return res.json({ metas, cacheMaxAge: 300, staleRevalidate: 600 });
-        }
-
-        res.json({ metas: [] });
+        const metas = toCatalogMetas(items.slice(skip, skip + PAGE_SIZE), kind);
+        // An empty page stays no-store: empty lists are often transient.
+        if (!metas.length) return res.json({ metas });
+        return res.json({ metas, ...withCacheHints(res, 300, 600) });
     } catch (e) {
-        console.error('[catalog] Error:', e.message);
+        logRouteError('catalog', e);
         res.json({ metas: [] });
     }
 });
 
 app.get('/:config/meta/:type/:id.json', async (req, res) => {
+    // Degraded answers are the default; see the catalog route.
+    res.setHeader('Cache-Control', 'no-store');
     const cfg = decodeConfig(req.params.config);
     if (!cfg) return res.json({ meta: null });
     const { id, type } = req.params;
-    console.log(`[meta] type=${type} id=${id}`);
+    if (LOG_REQUESTS) console.log(`[meta] type=${JSON.stringify(type)} id=${JSON.stringify(id)}`);
+
+    if (!typeMatchesId(type, id)) {
+        console.warn(`[meta] type/id mismatch: type=${JSON.stringify(type)} id=${JSON.stringify(id)}`);
+        return res.status(404).json({ meta: null });
+    }
 
     try {
         if (id.startsWith('xtremio_live_')) {
-            const streamId = id.replace('xtremio_live_', '');
-            const allLive = await getAllLiveStreams(cfg);
-            let s = allLive.find(i => String(i.stream_id) === streamId);
+            const streamId = getPrefixedNumericId(id, 'xtremio_live_');
+            if (!streamId) return res.status(400).json({ meta: null });
+            const s = findStreamById(await getAllLiveStreams(cfg), streamId);
 
             if (!s) return res.json({ meta: null });
             const meta = {
                 id: `xtremio_live_${s.stream_id}`,
                 type: 'Live TV',
-                name: s.name,
+                name: titleOf(s.name) || undefined,
                 poster: s.stream_icon || undefined,
                 posterShape: 'square',
                 genres: s.category_name ? [s.category_name] : [],
-                description: s.name || undefined
+                description: titleOf(s.name) || undefined
             };
-            return res.json({ meta, cacheMaxAge: 300 });
+            return res.json({ meta, ...withCacheHints(res, 300) });
         }
 
         if (id.startsWith('xtremio_movie_')) {
-            const streamId = id.replace('xtremio_movie_', '');
-            const info = await xtremioGet(cfg, 'get_vod_info', `&vod_id=${streamId}`);
+            const streamId = getPrefixedNumericId(id, 'xtremio_movie_');
+            if (!streamId) return res.status(400).json({ meta: null });
+            let info;
+            try {
+                info = await getVodInfo(cfg, streamId);
+            } catch (e) {
+                // A movie the catalog lists is still worth a page when its details
+                // fail: name and poster from the list, served no-store so the full
+                // meta replaces it once get_vod_info answers (audit M2).
+                const item = isProgrammingError(e) ? null : warmVodItem(cfg, streamId);
+                if (!item) throw e;
+                console.warn(`[meta] get_vod_info failed for movie ${streamId} (${e.message}); serving the catalog item`);
+                return res.json({
+                    meta: {
+                        id: `xtremio_movie_${streamId}`,
+                        type: 'XT-Movies',
+                        name: titleOf(item.name) || 'Unknown',
+                        poster: item.stream_icon || undefined,
+                        posterShape: 'poster',
+                        imdbRating: ratingOf(item.rating)
+                    }
+                });
+            }
             const movie = info?.info ?? info ?? {};
             const cast = splitList(movie.cast);
             const backdrop = pickBackdrop(movie.backdrop_path);
@@ -845,7 +652,7 @@ app.get('/:config/meta/:type/:id.json', async (req, res) => {
             const meta = {
                 id: `xtremio_movie_${streamId}`,
                 type: 'XT-Movies',
-                name: movie.name || movie.o_name || 'Unknown',
+                name: titleOf(movie.name || movie.o_name || info?.movie_data?.name) || 'Unknown',
                 poster: movie.cover_big || movie.movie_image || undefined,
                 posterShape: 'poster',
                 background: backdrop,
@@ -853,42 +660,64 @@ app.get('/:config/meta/:type/:id.json', async (req, res) => {
                 releaseInfo: movie.releasedate ? String(movie.releasedate) : undefined,
                 genres: splitList(movie.genre),
                 runtime: movie.duration ? String(movie.duration) + ' min' : (movie.episode_run_time ? String(movie.episode_run_time) + ' min' : undefined),
-                director: movie.director || undefined,
+                director: splitList(movie.director),
                 cast,
-                imdbRating: movie.rating ? String(movie.rating) : undefined,
+                imdbRating: ratingOf(movie.rating),
                 year: parseYear(movie.releasedate),
                 country: movie.country || undefined,
-                trailer: movie.youtube_trailer || undefined
+                trailers: youtubeTrailers(movie.youtube_trailer)
             };
-            return res.json({ meta, cacheMaxAge: 86400 });
+            return res.json({ meta, ...withCacheHints(res, 86400) });
         }
 
         if (id.startsWith('xtremio_series_')) {
-            const seriesId = id.replace('xtremio_series_', '');
+            const seriesId = getPrefixedNumericId(id, 'xtremio_series_');
+            if (!seriesId) return res.status(400).json({ meta: null });
             let info = null;
             try {
                 info = await getSeriesInfo(cfg, seriesId);
             } catch (e) {
-                const causeMsg = e.cause ? ` (cause: ${e.cause.code || e.cause.message || e.cause})` : '';
-                console.warn(`[meta] getSeriesInfo(${seriesId}) failed after retries: ${e.message}${causeMsg}`);
+                console.warn(`[meta] getSeriesInfo(${seriesId}) failed after retries: ${e.message}${causeSuffix(e)}`);
             }
             const series = info?.info ?? info ?? {};
 
             const videos = [];
             const episodes = info?.episodes ?? {};
+            let skippedEpisodes = 0;
             for (const [seasonNum, eps] of Object.entries(episodes)) {
                 if (!Array.isArray(eps)) continue;
+                // parseEpisodeId requires all three components to be numeric, so an
+                // episode built from a non-numeric season key or episode id would
+                // render in the UI and then 400 on play. Drop it here instead.
+                if (!isNumericId(seasonNum)) {
+                    skippedEpisodes += eps.length;
+                    continue;
+                }
                 for (const ep of eps) {
+                    if (!isNumericId(ep?.id)) {
+                        skippedEpisodes++;
+                        continue;
+                    }
+                    // Episode 0 is real (specials, pilots); only a value that
+                    // will not parse falls back to 1.
+                    const parsedEpisode = parseInt(ep.episode_num);
+                    const episodeNum = Number.isInteger(parsedEpisode) ? parsedEpisode : 1;
                     videos.push({
                         id: `xtremio_episode_${seriesId}:${seasonNum}:${ep.id}`,
-                        title: ep.title || `Episode ${ep.episode_num}`,
+                        // Built from the resolved number, so a missing episode_num
+                        // reads "Episode 1" rather than "Episode undefined".
+                        title: titleOf(ep.title) || `Episode ${episodeNum}`,
                         season: parseInt(seasonNum),
-                        episode: parseInt(ep.episode_num) || 1,
-                        released: toIsoDate(ep.info?.releasedate) || '1970-01-01T00:00:00.000Z',
+                        episode: episodeNum,
+                        // Omitted, never epoch-defaulted: Stremio renders any date.
+                        released: toIsoDate(ep.info?.releasedate) || undefined,
                         overview: ep.info?.plot || undefined,
                         thumbnail: ep.info?.movie_image || undefined
                     });
                 }
+            }
+            if (skippedEpisodes) {
+                console.warn(`[meta] series ${seriesId}: skipped ${skippedEpisodes} episode(s) with non-numeric season/episode ids`);
             }
 
             const hasContent = Boolean(series.name || videos.length);
@@ -903,7 +732,7 @@ app.get('/:config/meta/:type/:id.json', async (req, res) => {
             const meta = {
                 id: `xtremio_series_${seriesId}`,
                 type: 'series',
-                name: series.name || 'Unknown',
+                name: titleOf(series.name) || 'Unknown',
                 poster: series.cover || undefined,
                 posterShape: 'poster',
                 background: backdrop,
@@ -911,49 +740,93 @@ app.get('/:config/meta/:type/:id.json', async (req, res) => {
                 releaseInfo: series.releaseDate ? String(series.releaseDate) : undefined,
                 genres: splitList(series.genre),
                 runtime: series.episode_run_time ? String(series.episode_run_time) + ' min' : undefined,
-                director: series.director || undefined,
+                director: splitList(series.director),
                 cast,
-                imdbRating: series.rating ? String(series.rating) : undefined,
+                imdbRating: ratingOf(series.rating),
                 year: parseYear(series.releaseDate),
                 videos
             };
-            return res.json({ meta, cacheMaxAge: 3600 });
+            return res.json({ meta, ...withCacheHints(res, 3600) });
         }
 
         res.json({ meta: null });
     } catch (e) {
-        console.error('[meta] Error:', e.message);
+        logRouteError('meta', e);
         res.json({ meta: null });
     }
 });
 
 app.get('/:config/stream/:type/:id.json', async (req, res) => {
+    // Degraded answers are the default; see the catalog route.
+    res.setHeader('Cache-Control', 'no-store');
     const cfg = decodeConfig(req.params.config);
     if (!cfg) return res.json({ streams: [] });
     const { id, type } = req.params;
-    console.log(`[stream] type=${type} id=${id}`);
+    if (LOG_REQUESTS) console.log(`[stream] type=${JSON.stringify(type)} id=${JSON.stringify(id)}`);
+
+    if (!typeMatchesId(type, id)) {
+        console.warn(`[stream] type/id mismatch: type=${JSON.stringify(type)} id=${JSON.stringify(id)}`);
+        return res.status(404).json({ streams: [] });
+    }
 
     try {
-        const { username, password } = cfg;
-        const serverUrl = normalizeUrl(cfg.serverUrl);
+        // No credentials are read here any more: every stream this route hands
+        // out is a proxy URL on this server, and the proxy is what holds them.
 
         // --- Handle xTremio's own IDs ---
         if (id.startsWith('xtremio_live_')) {
-            const streamId = id.replace('xtremio_live_', '');
+            const streamId = getPrefixedNumericId(id, 'xtremio_live_');
+            if (!streamId) return res.status(400).json({ streams: [] });
+            // Live is proxied too, because its upstream URL embeds the
+            // credentials (audit M9).
+            const proxyBase = `${getBaseUrl(req)}/${req.params.config}/proxy/live/${streamId}`;
+            const variants = [
+                { ext: 'm3u8', title: 'HLS' },
+                { ext: 'ts', title: 'MPEG-TS' }
+            ];
             return res.json({
-                streams: [
-                    { url: `${serverUrl}/live/${username}/${password}/${streamId}.m3u8`, title: 'HLS' },
-                    { url: `${serverUrl}/live/${username}/${password}/${streamId}.ts`, title: 'MPEG-TS' }
-                ],
-                cacheMaxAge: 3600
+                streams: variants.map(({ ext, title }) => {
+                    const url = `${proxyBase}.${ext}`;
+                    return {
+                        url,
+                        title,
+                        behaviorHints: {
+                            notWebReady: isNotWebReady(url, ext),
+                            bingeGroup: `xtremio-live-${ext}`
+                        }
+                    };
+                }),
+                ...withCacheHints(res, 3600)
             });
         }
 
         if (id.startsWith('xtremio_movie_')) {
-            const streamId = id.replace('xtremio_movie_', '');
-            const info = await xtremioGet(cfg, 'get_vod_info', `&vod_id=${streamId}`);
-            const ext = info?.movie_data?.container_extension || 'mp4';
+            const streamId = getPrefixedNumericId(id, 'xtremio_movie_');
+            if (!streamId) return res.status(400).json({ streams: [] });
+            // The stream needs only the container, and the warm full list usually
+            // names it, so a failed or container-less get_vod_info no longer means
+            // "No streams" for a file the proxy would serve (audit M2).
+            let info = null;
+            try {
+                info = await getVodInfo(cfg, streamId);
+            } catch (e) {
+                if (isProgrammingError(e) || !warmVodItem(cfg, streamId)) throw e;
+                console.warn(`[stream] get_vod_info failed for movie ${streamId} (${e.message}); using the catalog item's container`);
+            }
+            let rawExt = info?.movie_data?.container_extension;
+            let fromList = false;
+            if (statedContainerExt(rawExt) === null) {
+                const listExt = warmVodItem(cfg, streamId)?.container_extension;
+                if (statedContainerExt(listExt) !== null) {
+                    rawExt = listExt;
+                    fromList = true;
+                }
+            }
+            const ext = normalizeContainerExt(rawExt);
+            const extStated = statedContainerExt(rawExt) !== null;
             const proxyUrl = `${getBaseUrl(req)}/${req.params.config}/proxy/movie/${streamId}.${ext}`;
+            // Cacheable, since the proxy URL is stable — but only when get_vod_info
+            // named the container, not when mp4 was guessed or the list stood in.
             return res.json({
                 streams: [
                     {
@@ -964,30 +837,30 @@ app.get('/:config/stream/:type/:id.json', async (req, res) => {
                             bingeGroup: `xtremio-movie-${ext}`
                         }
                     }
-                ]
+                ],
+                ...(extStated && !fromList && info ? withCacheHints(res, 3600) : {})
             });
         }
 
         if (id.startsWith('xtremio_episode_')) {
             // Format: xtremio_episode_{seriesId}:{season}:{episodeId}
-            const [seriesId, , episodeId] = id.replace('xtremio_episode_', '').split(':');
+            const parsed = parseEpisodeId(id);
+            if (!parsed) return res.status(400).json({ streams: [] });
+            const { seriesId, seasonNum, episodeId } = parsed;
 
-            const findExt = (data) => {
-                const episodes = data?.episodes ?? {};
-                for (const eps of Object.values(episodes)) {
-                    if (!Array.isArray(eps)) continue;
-                    const ep = eps.find(e => String(e.id) === episodeId);
-                    if (ep) return ep.container_extension || 'mp4';
-                }
-                return null;
+            const findEpisode = (data) => {
+                const eps = (data?.episodes ?? {})[seasonNum];
+                return Array.isArray(eps) ? eps.find(e => String(e.id) === episodeId) || null : null;
             };
 
             const info = await getSeriesInfo(cfg, seriesId);
-            let ext = findExt(info);
-            if (!ext) {
-                console.warn(`[stream] episode ${episodeId} not found in series ${seriesId} info; defaulting to mp4`);
-                ext = 'mp4';
+            const rawExt = findEpisode(info)?.container_extension;
+            // Not cached when guessed, for the same reason as the movie branch.
+            const extStated = statedContainerExt(rawExt) !== null;
+            if (!extStated) {
+                console.warn(`[stream] episode ${episodeId} is missing from series ${seriesId} info or names no container; defaulting to mp4`);
             }
+            const ext = normalizeContainerExt(rawExt);
 
             const proxyUrl = `${getBaseUrl(req)}/${req.params.config}/proxy/series/${episodeId}.${ext}`;
             return res.json({
@@ -1000,22 +873,19 @@ app.get('/:config/stream/:type/:id.json', async (req, res) => {
                             bingeGroup: `xtremio-series-${seriesId}-${ext}`
                         }
                     }
-                ]
+                ],
+                ...(extStated ? withCacheHints(res, 3600) : {})
             });
         }
 
         res.json({ streams: [] });
     } catch (e) {
-        console.error('[stream] Error:', e.message);
+        logRouteError('stream', e);
         res.json({ streams: [] });
     }
 });
 
-// Stream proxy. Xtream providers 302-redirect to a CDN URL that carries
-// a short-lived signed token (~60s). Handing that URL directly to
-// Stremio causes "playback error" after ~1 minute when the token
-// expires. By proxying every range request through the addon, we
-// re-resolve the origin URL (and get a fresh token) for each request.
+
 app.all('/:config/proxy/:kind/:file', async (req, res) => {
     if (req.method !== 'GET' && req.method !== 'HEAD') {
         return res.status(405).end('method not allowed');
@@ -1030,225 +900,441 @@ app.all('/:config/proxy/:kind/:file', async (req, res) => {
     const match = /^([^./]+)\.([A-Za-z0-9]+)$/.exec(file);
     if (!match) return res.status(400).end('bad file');
     const [, streamId, ext] = match;
+    if (!isNumericId(streamId)) return res.status(400).end('bad stream id');
 
-    const serverUrl = normalizeUrl(cfg.serverUrl);
-    const upstreamUrl = `${serverUrl}/${kind}/${encodeURIComponent(cfg.username)}/${encodeURIComponent(cfg.password)}/${streamId}.${ext}`;
-
-    const headers = { 'User-Agent': PROXY_USER_AGENT };
-    if (req.headers.range) headers['Range'] = req.headers.range;
-    if (req.headers['if-range']) headers['If-Range'] = req.headers['if-range'];
-
-    const controller = new AbortController();
-    const abort = () => {
-        if (!controller.signal.aborted) {
-            try { controller.abort(); } catch {}
-        }
-    };
-    req.on('close', abort);
-    req.on('aborted', abort);
-
-    const isAbortErr = (e) => e && (e.name === 'AbortError' || e.code === 'ABORT_ERR' || controller.signal.aborted);
-
-    let upstream;
+    // A token minted before server_info was validated can hold a server URL that
+    // does not parse. Node puts the rejected input on the TypeError, and here that
+    // input is this path — username and password included — so the failure is
+    // answered on the spot rather than thrown to the terminal handler's log.
+    let serverUrl;
+    let upstreamUrl;
     try {
-        upstream = await fetch(upstreamUrl, {
-            method: 'GET',
-            headers,
-            redirect: 'follow',
-            signal: controller.signal
-        });
-    } catch (e) {
-        if (!isAbortErr(e)) {
-            console.warn(`[proxy] upstream fetch failed for ${kind}/${streamId}.${ext}: ${e.message}`);
+        serverUrl = normalizeUrl(cfg.serverUrl);
+        upstreamUrl = new URL(
+            `/${kind}/${encodeURIComponent(cfg.username)}/${encodeURIComponent(cfg.password)}/${streamId}.${ext}`,
+            serverUrl
+        ).toString();
+    } catch {
+        console.warn('[proxy] the configured server URL does not parse; the account needs reconfiguring');
+        return res.status(502).end('bad upstream');
+    }
+
+    // Taken only once the request is known to be a relay, so a malformed one is
+    // answered for what it is rather than 429'd by an account at its cap.
+    const refused = acquireProxySlot(cfg, req, res);
+    if (refused) return rejectOverCap(res, refused);
+
+    const base = getBaseUrl(req);
+    await relayUpstream(req, res, {
+        upstreamUrl,
+        label: `${kind}/${streamId}.${ext}`,
+        ext,
+        rewriteFor: (finalUrl, contentType) => {
+            if (!looksLikePlaylist(ext, contentType)) return null;
+            return makeHlsProxyMapper(
+                base,
+                req.params.config,
+                hlsTargetOrigins(serverUrl, upstreamUrl, finalUrl)
+            );
         }
-        if (!res.headersSent) res.status(502).end('upstream fetch failed');
-        return;
-    }
-
-    res.status(upstream.status);
-
-    // Forward headers relevant for seekable playback.
-    const forward = [
-        'content-type',
-        'content-length',
-        'content-range',
-        'accept-ranges',
-        'last-modified',
-        'etag'
-    ];
-    for (const h of forward) {
-        const v = upstream.headers.get(h);
-        if (v) res.setHeader(h, v);
-    }
-    if (!upstream.headers.get('accept-ranges')) {
-        res.setHeader('Accept-Ranges', 'bytes');
-    }
-    res.setHeader('Cache-Control', 'no-store');
-
-    if (req.method === 'HEAD' || !upstream.body) {
-        return res.end();
-    }
-
-    const nodeStream = Readable.fromWeb(upstream.body);
-    nodeStream.on('error', (e) => {
-        if (!isAbortErr(e)) {
-            console.warn(`[proxy] stream error for ${kind}/${streamId}.${ext}: ${e.message}`);
-        }
-        if (!res.headersSent) res.status(502);
-        res.end();
     });
-    res.on('error', () => abort());
-    res.on('close', () => {
-        abort();
-        nodeStream.destroy();
-    });
-    nodeStream.pipe(res);
 });
 
-app.get('/', (req, res) => {
-    res.send(`<!DOCTYPE html>
-<html lang="en">
-<head>
-    <meta charset="UTF-8">
-    <title>xTremio &mdash; Stremio Addon</title>
-    <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <meta name="description" content="Stremio addon that exposes any Xtream Codes IPTV provider as Live TV, Movies and Series.">
-    <style>
-        * { box-sizing: border-box; margin: 0; padding: 0; }
-        body {
-            font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
-            min-height: 100vh;
-            display: flex;
-            align-items: center;
-            justify-content: center;
-            background: linear-gradient(135deg, #1a1a2e 0%, #16213e 50%, #0f3460 100%);
-            color: #fff;
-            padding: 20px;
-            text-align: center;
-        }
-        .wrap { max-width: 560px; width: 100%; }
-        .logo {
-            display: inline-flex;
-            align-items: center;
-            justify-content: center;
-            width: 72px; height: 72px;
-            background: linear-gradient(135deg, #7c4dff 0%, #5c6bc0 100%);
-            border-radius: 20px;
-            margin-bottom: 24px;
-            box-shadow: 0 10px 30px rgba(124,77,255,0.4);
-        }
-        .logo svg { width: 38px; height: 38px; color: #fff; }
-        h1 { font-size: 36px; font-weight: 700; margin-bottom: 12px; letter-spacing: -0.5px; }
-        .tagline { font-size: 17px; color: rgba(255,255,255,0.75); margin-bottom: 36px; line-height: 1.5; }
-        .features {
-            display: grid;
-            grid-template-columns: repeat(3, 1fr);
-            gap: 12px;
-            margin-bottom: 36px;
-        }
-        .feature {
-            background: rgba(255,255,255,0.06);
-            border: 1px solid rgba(255,255,255,0.1);
-            border-radius: 12px;
-            padding: 16px 10px;
-            font-size: 13px;
-            color: rgba(255,255,255,0.85);
-        }
-        .feature b { display: block; color: #fff; font-size: 14px; margin-bottom: 4px; }
-        .btn {
-            display: inline-flex; align-items: center; gap: 10px;
-            padding: 16px 36px;
-            background: linear-gradient(135deg, #7c4dff 0%, #5c6bc0 100%);
-            color: #fff; text-decoration: none;
-            border-radius: 12px;
-            font-size: 16px; font-weight: 600;
-            transition: transform 0.2s, box-shadow 0.2s;
-            box-shadow: 0 8px 20px rgba(124,77,255,0.3);
-        }
-        .btn:hover { transform: translateY(-2px); box-shadow: 0 12px 30px rgba(124,77,255,0.5); }
-        .btn svg { width: 20px; height: 20px; }
-        .links {
-            margin-top: 28px;
-            font-size: 14px;
-            color: rgba(255,255,255,0.6);
-        }
-        .links a {
-            color: rgba(255,255,255,0.85);
-            text-decoration: none;
-            border-bottom: 1px solid rgba(255,255,255,0.3);
-            padding-bottom: 1px;
-        }
-        .links a:hover { color: #fff; border-bottom-color: #fff; }
-        .footer {
-            margin-top: 40px;
-            font-size: 12px;
-            color: rgba(255,255,255,0.4);
-            line-height: 1.6;
-        }
-        @media (max-width: 520px) {
-            h1 { font-size: 28px; }
-            .features { grid-template-columns: 1fr; }
-        }
-    </style>
-</head>
-<body>
-    <div class="wrap">
-        <div class="logo">
-            <svg fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M15 10l4.553-2.276A1 1 0 0121 8.618v6.764a1 1 0 01-1.447.894L15 14M5 18h8a2 2 0 002-2V8a2 2 0 00-2-2H5a2 2 0 00-2 2v8a2 2 0 002 2z"/></svg>
-        </div>
-        <h1>xTremio</h1>
-        <p class="tagline">A Stremio addon that turns your Xtream Codes IPTV provider into browseable Live TV, Movies, and Series catalogs.</p>
+// Sub-resources of a proxied playlist: variant playlists, segments and keys.
+// Reached only through URLs this server generated and signed, so the target is
+// not caller-chosen despite being carried in the query string. A nested
+// playlist is rewritten in turn, which is what makes master playlists work.
+app.all('/:config/proxy/hls', async (req, res) => {
+    if (req.method !== 'GET' && req.method !== 'HEAD') {
+        return res.status(405).end('method not allowed');
+    }
+    const cfg = decodeConfig(req.params.config);
+    if (!cfg) return res.status(401).end('unauthorized');
 
-        <div class="features">
-            <div class="feature"><b>Live TV</b>Watch your channels</div>
-            <div class="feature"><b>Movies &amp; Series</b>Full VOD catalog</div>
-            <div class="feature"><b>Global Search</b>Across everything</div>
-        </div>
+    // Bound to this config token: a signature minted for another account's
+    // playlist does not verify here, even though the keys are shared by every
+    // account on this instance.
+    const target = decodeHlsTarget(req.query.u, req.query.s, req.query.e, req.params.config);
+    if (!target) return res.status(400).end('bad target');
 
-        <a href="/configure" class="btn">
-            <svg fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M13 10V3L4 14h7v7l9-11h-7z"/></svg>
-            Install Addon
-        </a>
+    const refused = acquireProxySlot(cfg, req, res);
+    if (refused) return rejectOverCap(res, refused);
 
-        <div class="links">
-            <a href="https://github.com/izemhsn/xTremio-stremio-addon" target="_blank" rel="noopener">View on GitHub</a>
-        </div>
+    const upstreamUrl = target.url;
+    // What the playlist said this target was, or what its path says. Content
+    // type alone used to decide it here, which missed every variant playlist a
+    // provider labelled text/plain: the body was then relayed untouched, with
+    // the credential-bearing URIs the rewrite exists to remove still in it.
+    // Supplying the extension also withholds Range, so the response cannot come
+    // back a 206 that skips the rewrite.
+    const ext = hlsTargetExt(target);
 
-        <div class="footer">
-            This is a self-hosted technical gateway. No media is hosted here.<br>
-            You must supply your own legally obtained Xtream Codes account.
-        </div>
-    </div>
-</body>
-</html>`);
+    const base = getBaseUrl(req);
+    await relayUpstream(req, res, {
+        upstreamUrl,
+        label: 'hls sub-resource',
+        ext,
+        rewriteFor: (finalUrl, contentType) => {
+            if (!looksLikePlaylist(ext, contentType)) return null;
+            // A nested playlist keeps the same rule. `upstreamUrl` is included as
+            // well as `finalUrl` because a variant playlist that redirects may
+            // still name its segments back on the host it was fetched from.
+            return makeHlsProxyMapper(
+                base,
+                req.params.config,
+                hlsTargetOrigins(panelOrigin(cfg), upstreamUrl, finalUrl)
+            );
+        }
+    });
 });
+
+// The page itself is in src/pages/landing.js; it is static, so the route is just
+// the send.
+app.get('/', (req, res) => res.send(renderLandingPage()));
+
+// --- Server lifecycle ---
+// The socket timeouts, the drain flag and the shutdown handler are in
+// src/lifecycle.js; the bootstrap that uses them is at the end of this file.
+
+// Liveness alone says only that the process is running, which on this server is
+// nearly always true and nearly never the question: the thread that answers
+// /health is the thread that parses tens of MB of catalog and relays video, so
+// the way this instance fails is by being too busy to answer anything in time.
+// Event-loop delay is the one number that says so.
+//
+// The histogram is reset on every read, so each probe reports the window since
+// the last one — which is what a readiness check is asking. Two consequences:
+// concurrent probes split the window between them, and a long gap between probes
+// widens it. Both are acceptable for a load balancer polling on a fixed interval,
+// and neither can hide a stall, since the peak stays the peak of whatever window
+// it lands in.
+const eventLoopDelay = monitorEventLoopDelay({ resolution: 10 });
+eventLoopDelay.enable();
+
+// Deliberately far above anything healthy. Idle delay is the platform's timer
+// granularity — measured at 15.6 ms on Windows — and a 25 MB catalog parse, the
+// largest block this server does on purpose, is 128 ms. A second is nothing a
+// working instance reaches, which is the point: readiness that flaps under load
+// pulls a busy-but-working instance out of the pool and moves its traffic onto
+// the others, and that is how one slow instance becomes an outage.
+const HEALTH_MAX_EVENT_LOOP_LAG_MS = 1000;
 
 app.get('/health', (req, res) => {
-    res.json({ status: 'ok', uptime: process.uptime() });
+    // Reporting unhealthy while draining is the point: it takes this instance out
+    // of the load balancer pool before the process actually goes away, instead of
+    // letting it keep receiving requests it is about to drop.
+    const draining = isShuttingDown();
+    // An empty window — two probes close enough together that the histogram's
+    // timer has not fired between them — reports `mean` as NaN, which JSON writes
+    // as null. Nothing was measured, so the honest reading is 0; reporting null
+    // would make a probe that arrived early look like a broken metric. Rounded
+    // because this is a measurement, not an identity, and a full float of
+    // nanoseconds in a probe response invites false precision.
+    const ms = (ns) => (Number.isFinite(ns) ? Math.round((ns / 1e6) * 10) / 10 : 0);
+    const lagMs = ms(eventLoopDelay.max);
+    const meanLagMs = ms(eventLoopDelay.mean);
+    eventLoopDelay.reset();
+
+    const stalled = lagMs > HEALTH_MAX_EVENT_LOOP_LAG_MS;
+    const status = draining ? 'shutting_down' : (stalled ? 'stalled' : 'ok');
+    res.status(draining || stalled ? 503 : 200)
+        .set('Cache-Control', 'no-store')
+        .json({
+            status,
+            uptime: process.uptime(),
+            eventLoopLagMs: lagMs,
+            eventLoopLagMeanMs: meanLagMs
+        });
 });
 
-const server = app.listen(PORT, HOST, () => {
-    console.log(`Addon running at http://${HOST === '0.0.0.0' ? 'localhost' : HOST}:${PORT}`);
-    console.log(`Configure: http://localhost:${PORT}/configure`);
+// A path begins with the config token, which is a bearer credential: it
+// decrypts to the account's password. Logging one would put working install
+// URLs in the log file, so the first segment is dropped when it is long enough
+// to be a token rather than a route name.
+//
+// The path is not the only place a token appears, though — /configure takes one
+// as a query parameter — so the two halves are redacted separately. One greedy
+// run of non-slash characters read straight through the `?` (audit L13), which
+// both missed tokens and destroyed paths depending only on where the first slash
+// fell: `/a/b?config=<token>` was logged whole, while `/configure?config=<token>`
+// came out as `/<config>`, naming no route at all.
+function redactConfigInPath(path) {
+    const raw = String(path);
+    const cut = raw.indexOf('?');
+    const pathname = cut === -1 ? raw : raw.slice(0, cut);
+    const query = cut === -1 ? '' : raw.slice(cut);
+    return pathname.replace(/^\/[^/]{24,}/, '/<config>')
+        + query.replace(/([?&]config=)[^&]*/gi, '$1<config>');
+}
+
+// Unknown paths, so Express's default HTML 404 (which names the method and the
+// path) never reaches a client.
+app.use((req, res) => {
+    res.status(404).type('text/plain').end('not found');
 });
 
-server.on('error', (err) => {
-    if (err.code === 'EADDRINUSE') {
-        console.error(`Port ${PORT} is already in use. Kill the existing process or use a different port: PORT=3001 npm start`);
-    } else {
-        console.error('Server error:', err.message);
-    }
-    process.exit(1);
-});
+// Terminal error handler: Express's default writes stacks into responses. A
+// malformed percent-escape throws a URIError out of the router before any handler
+// runs, so only this can catch it. Registered last; the four parameters are what
+// mark it as an error handler.
+function terminalErrorHandler(err, req, res, next) {
+    // A URIError from decodeParam means the client sent a bad path, not that
+    // the server broke; anything carrying its own status (body-parser and
+    // friends) is trusted to have set a sensible one — but only inside the
+    // error range, since res.status() will send whatever it is given.
+    const claimed = Number(err?.status || err?.statusCode);
+    const status = err instanceof URIError
+        ? 400
+        : (claimed >= 400 && claimed <= 599 ? claimed : 500);
 
-process.on('SIGTERM', () => { console.log('SIGTERM received, shutting down...'); server.close(() => process.exit(0)); });
-process.on('SIGINT', () => { console.log('SIGINT received, shutting down...'); server.close(() => process.exit(0)); });
-process.on('uncaughtException', (err) => {
-    // AbortErrors are expected when a client disconnects mid-stream from the proxy.
-    if (err && (err.name === 'AbortError' || err.code === 'ABORT_ERR')) return;
-    console.error('Uncaught exception:', err);
-});
-process.on('unhandledRejection', (err) => {
-    if (err && (err.name === 'AbortError' || err.code === 'ABORT_ERR')) return;
-    console.error('Unhandled rejection:', err);
-});
+    const where = `${req.method} ${redactConfigInPath(req.originalUrl || req.url)} -> ${status}`;
+    // A 5xx logs its stack; a 4xx one line. The stack, never the error object,
+    // whose properties can carry request data (a failed `new URL()` holds its
+    // input, which can include credentials).
+    if (status >= 500) console.error(`[error] ${where}:`, err?.stack || String(err));
+    else console.warn(`[error] ${where}: ${err?.message}`);
+
+    // Once the body has started there is no status left to set, and the
+    // response is already half-written; hand back to Express, which closes the
+    // connection rather than appending a stack to a partial body.
+    if (res.headersSent) return next(err);
+
+    res.status(status).type('text/plain').end(status < 500 ? 'bad request' : 'internal error');
+}
+
+app.use(terminalErrorHandler);
+
+// Only bind the port and install process-wide handlers when run directly, so
+// `require('./index.js')` from a test can exercise the internals below without
+// starting a server or hijacking the test runner's exception handling.
+if (require.main === module) {
+    // Before binding a port: a production deploy with a weak or absent secret
+    // should fail loudly at startup, not quietly issue forgeable install URLs.
+    enforceConfigSecretPolicy();
+    warnOnUnpinnedBaseUrl();
+    warnOnUndiciMismatch();
+
+    // Only when actually serving: importing this module for tests should not
+    // leave a timer running.
+    startCacheSweeper();
+
+    const server = applyServerTimeouts(app.listen(PORT, HOST, () => {
+        console.log(`Addon running at http://${HOST === '0.0.0.0' ? 'localhost' : HOST}:${PORT}`);
+        console.log(`Configure: http://localhost:${PORT}/configure`);
+    }));
+
+    server.on('error', (err) => {
+        if (err.code === 'EADDRINUSE') {
+            console.error(`Port ${PORT} is already in use. Kill the existing process or use a different port: PORT=3001 npm start`);
+        } else {
+            console.error('Server error:', err.message);
+        }
+        process.exit(1);
+    });
+
+    const shutdown = createShutdownHandler(server);
+    process.on('SIGTERM', () => shutdown('SIGTERM'));
+    process.on('SIGINT', () => shutdown('SIGINT'));
+    // No AbortError exemption: client disconnects are handled where they happen,
+    // so an abort reaching here is a real gap.
+    process.on('uncaughtException', (err) => {
+        // Process state is undefined after an uncaught throw; exit and be restarted.
+        console.error('Uncaught exception, exiting:', err);
+        process.exit(1);
+    });
+    // Same for an unhandled rejection; Express 5 already routes async route
+    // errors to the terminal handler, so anything here is a bug.
+    process.on('unhandledRejection', (err) => {
+        console.error('Unhandled rejection, exiting:', err);
+        process.exit(1);
+    });
+}
+
+// Exported for the test suite only — nothing here is a public API.
+module.exports = {
+    app,
+    getManifest,
+    ratingOf,
+    encodeConfig,
+    decodeConfig,
+    xtremioGet,
+    UPSTREAM_HEADER_TIMEOUT_MS,
+    UPSTREAM_IDLE_TIMEOUT_MS,
+    UPSTREAM_BODY_TIMEOUT_MS,
+    isProgrammingError,
+    noteUndecodableToken,
+    noteDegradedCatalog,
+    degradedCatalogLogged,
+    DEGRADED_CATALOG_LOG_INTERVAL_MS,
+    undecodableTokens,
+    UNDECODABLE_REPORT_INTERVAL_MS,
+    validateConfig,
+    configSecretProblems,
+    enforceConfigSecretPolicy,
+    warnOnUnpinnedBaseUrl,
+    corsApplies,
+    deriveConfigKey,
+    CONFIG_TOKEN_VERSION,
+    CONFIG_SECRET_MIN_BYTES,
+    SCRYPT_PARAMS,
+    getBaseUrl,
+    escapeHtml,
+    normalizeUrl,
+    serverInfoOrigin,
+    hostnameOf,
+    sealConfig,
+    deriveConfigKeys,
+    resolveHostAddresses,
+    dnsFallback,
+    DNS_TIMEOUT_MS,
+    DNS_SERVERS,
+    parseDnsServers,
+    makeDnsResolver,
+    parseHostList,
+    panelHostAllowed,
+    ALLOWED_PANEL_HOSTS,
+    terminalErrorHandler,
+    buildUrl,
+    buildXtremioApiUrl,
+    isNumericId,
+    getPrefixedNumericId,
+    parseEpisodeId,
+    typeMatchesId,
+    catalogTypesFor,
+    withCacheHints,
+    parseCatalogId,
+    CATALOG_KINDS,
+    catalogComparator,
+    featuredEpoch,
+    FEATURED_PERIOD_MS,
+    filterByName,
+    titleOf,
+    toCatalogMetas,
+    selectCatalogSource,
+    sortedCatalogItems,
+    cachedCatalogSelection,
+    rememberCatalogSelection,
+    catalogViewKey,
+    sortedCatalogViews,
+    normalizeContainerExt,
+    statedContainerExt,
+    isNotWebReady,
+    normalizeAcceptRanges,
+    hlsPrefixVerdict,
+    sniffPlaylistStart,
+    setRelayHeaders,
+    CONFIGURE_TIMEOUT_MS,
+    CONFIGURE_PROBE_TIMEOUT_MS,
+    estimateBytes,
+    CACHE_MAX_STREAM_BYTES,
+    PLAYLIST_BODY_TIMEOUT_MS,
+    PLAYLIST_REWRITE_TIMEOUT_MS,
+    PROXY_HEADER_TIMEOUT_MS,
+    MAX_PLAYLIST_ORIGINS,
+    signTokenBody,
+    rewriteHlsPlaylist,
+    looksLikePlaylist,
+    encodeHlsTarget,
+    decodeHlsTarget,
+    signHlsTarget,
+    HLS_SIGNATURE_TTL_MS,
+    MAX_PLAYLIST_BYTES,
+    isPrivateIp,
+    readJsonCapped,
+    MAX_UPSTREAM_BYTES,
+    MAX_PARSED_TO_BODY_RATIO,
+    weighJson,
+    assertSafeOutboundUrl,
+    discardBody,
+    acquireProxySlot,
+    proxyInFlight,
+    PROXY_MAX_CONCURRENT_PER_TOKEN,
+    PROXY_MAX_CONCURRENT_PER_CLIENT,
+    PROXY_MAX_CONCURRENT_TOTAL,
+    proxyInFlightByClient,
+    proxyRelays,
+    makeHlsProxyMapper,
+    hlsTargetOrigins,
+    HLS_TARGET_ALLOWED_HOSTS,
+    hlsOriginVetCache,
+    HLS_ORIGIN_VET_TTL_MS,
+    asString,
+    redactConfigInPath,
+    pinnedLookup,
+    pinResolvedAddresses,
+    dnsPins,
+    PINNED_DISPATCHER,
+    DNS_PIN_TTL_MS,
+    warnOnUndiciMismatch,
+    parseExtra,
+    rawExtraSegment,
+    parseYear,
+    toIsoDate,
+    splitList,
+    youtubeTrailers,
+    pickBackdrop,
+    isUsableSeriesInfo,
+    isUsableVodInfo,
+    getCategories,
+    getAllVodStreams,
+    getAllSeriesStreams,
+    getAllLiveStreams,
+    getSeriesInfo,
+    getVodInfo,
+    getCategoryStreams,
+    createSingleFlight,
+    createKeyedCache,
+    accountCacheKey,
+    catCache,
+    vodStreamsCache,
+    seriesStreamsCache,
+    liveStreamsCache,
+    seriesInfoCache,
+    vodInfoCache,
+    categoryStreamsCache,
+    CACHE_TTL,
+    CACHE_FAILURE_TTL,
+    CACHE_REFRESH_AHEAD,
+    PAGE_SIZE,
+    BoundedMap,
+    sweepCaches,
+    startCacheSweeper,
+    CACHE_MAX_ACCOUNTS,
+    CACHE_MAX_STREAM_ACCOUNTS,
+    CACHE_MAX_SERIES_INFO,
+    CACHE_MAX_VOD_INFO,
+    CACHE_MAX_CATEGORY_LISTS,
+    CACHE_MAX_BYTES,
+    CACHE_BUDGET,
+    CacheBudget,
+    CACHE_STALE_MAX_AGE_MS,
+    readSeriesInfoEntry,
+    setNegativeSeriesInfo,
+    getCachedSeriesInfo,
+    setCachedSeriesInfo,
+    fetchSeriesInfo,
+    SERIES_INFO_NEGATIVE_TTL,
+    SERIES_INFO_MAX_ATTEMPTS,
+    validateXtremioCredentials,
+    describeDowngrade,
+    schemeOf,
+    renderConfigPage,
+    rateLimitConfigure,
+    configureAttempts,
+    clientKey,
+    addressBucket,
+    forwardedValue,
+    TRUST_PROXY_HOPS,
+    CONFIGURE_RATE_LIMIT,
+    CONFIGURE_RATE_WINDOW_MS,
+    CONFIGURE_RATE_MAX_CLIENTS,
+    applyServerTimeouts,
+    createShutdownHandler,
+    isShuttingDown,
+    setShuttingDown,
+    SHUTDOWN_TIMEOUT_MS,
+    KEEPALIVE_TIMEOUT_MS,
+    HEADERS_TIMEOUT_MS,
+    REQUEST_TIMEOUT_MS,
+    HEALTH_MAX_EVENT_LOOP_LAG_MS
+};

@@ -1,0 +1,4 @@
+# Normalize to LF in the repository. The working tree is Windows and CI is
+# Ubuntu, so without this a checkout on either side produces diffs that change
+# nothing but line endings.
+* text=auto eol=lf
