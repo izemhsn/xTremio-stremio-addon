@@ -73,6 +73,18 @@ async function credentialsWorkAt(origin, username, password) {
 
 async function validateXtremioCredentials(serverUrl, username, password) {
     const base = normalizeUrl(serverUrl);
+    // Parsed once, here, because everything past this point assumes it parses:
+    // buildUrl inside the loop, and the catch block's own log line, which calls
+    // `new URL(url)` on the same value. A URL that fails both — `http://bad
+    // host:8080` — threw out of buildUrl, and the catch threw a *second* time
+    // while logging, which escaped this function entirely. POST /configure then
+    // answered "Something went wrong. Please try again." and logged nothing, so
+    // neither the user nor the operator was told the URL was the problem
+    // (audit F2). Once `base` parses, `httpsBase` does too: swapping the scheme
+    // cannot make a URL unparseable.
+    if (!URL.canParse(base)) {
+        return { valid: false, error: 'That server URL is not valid — check it for typos, spaces or a missing port.' };
+    }
     // normalizeUrl assumes http for a URL with no scheme, so the normalized value
     // cannot tell a typed `http://` from no scheme at all — and the two deserve
     // different orders.

@@ -15,7 +15,7 @@ process.env.CONFIG_SECRET = 'test-secret-for-unit-tests';
 const test = require('node:test');
 const assert = require('node:assert');
 
-const { isPrivateIp } = require('../index.js');
+const { isPrivateIp, addressBucket } = require('../index.js');
 
 // --- what must be blocked --------------------------------------------------
 
@@ -86,7 +86,14 @@ test('IPv6 formats that embed an IPv4 address are judged by that address', () =>
         ['64:ff9b::7f00:1', 'NAT64 to 127.0.0.1'],
         ['64:ff9b::a9fe:a9fe', 'NAT64 to 169.254.169.254'],
         ['2002:7f00:1::1', '6to4 to 127.0.0.1'],
-        ['2002:a9fe:a9fe::1', '6to4 to 169.254.169.254']
+        ['2002:a9fe:a9fe::1', '6to4 to 169.254.169.254'],
+        // Audit F4. The IPv4-translated form (::ffff:0:0:0/96, RFC 2765) is one
+        // prefix over from the v4-mapped one and was missing from the table, so
+        // both of these read as public. Only reachable behind a stateless
+        // translator, but which network this server sits on is not its choice.
+        ['::ffff:0:7f00:1', 'IPv4-translated 127.0.0.1'],
+        ['::ffff:0:a9fe:a9fe', 'IPv4-translated 169.254.169.254'],
+        ['::ffff:0:a00:1', 'IPv4-translated 10.0.0.1']
     ];
     for (const [ip, what] of blocked) {
         assert.equal(isPrivateIp(ip), true, `${ip} (${what}) must be blocked`);
@@ -123,6 +130,28 @@ test('an embedded public IPv4 stays reachable in every wrapper', () => {
     assert.equal(isPrivateIp('::ffff:93.184.216.34'), false);
     assert.equal(isPrivateIp('2002:5db8:d822::1'), false, '6to4 wrapping 93.184.216.34');
     assert.equal(isPrivateIp('64:ff9b::5db8:d822'), false, 'NAT64 wrapping 93.184.216.34');
+    assert.equal(isPrivateIp('::ffff:0:5db8:d822'), false, 'IPv4-translated 93.184.216.34');
+});
+
+test('the v4-mapped and IPv4-translated prefixes do not shadow each other', () => {
+    // The two differ only in bytes 8-11, and both take their address from byte
+    // 12. A row written at the wrong offset would make one of them decide the
+    // other's address, which reads as a pass either way and so cannot be seen
+    // from the blocked list alone.
+    assert.equal(isPrivateIp('::ffff:7f00:1'), true, 'v4-mapped loopback');
+    assert.equal(isPrivateIp('::ffff:0:7f00:1'), true, 'IPv4-translated loopback');
+    assert.equal(isPrivateIp('::ffff:5db8:d822'), false, 'v4-mapped public');
+    assert.equal(isPrivateIp('::ffff:0:5db8:d822'), false, 'IPv4-translated public');
+});
+
+test('a client arriving as IPv4-translated is not bucketed as an IPv4 client', () => {
+    // addressBucket resolves only the v4-mapped form to an IPv4 address, and it
+    // names that entry rather than reading the table at [0] — adding a row above
+    // it used to rekey every IPv4 client's rate-limit bucket silently.
+    assert.strictEqual(addressBucket('::ffff:127.0.0.1'), '127.0.0.1');
+    assert.strictEqual(addressBucket('::ffff:7f00:1'), '127.0.0.1');
+    assert.strictEqual(addressBucket('::ffff:0:7f00:1'), '0:0:0:0::/64',
+        'the translated form is a v6 address and is bucketed by its /64');
 });
 
 // --- parsing and failure mode ----------------------------------------------

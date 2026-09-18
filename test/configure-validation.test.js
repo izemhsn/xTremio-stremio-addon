@@ -74,3 +74,39 @@ test('whitespace and trailing slashes do not disguise an empty server URL', asyn
     const { html } = await post('serverUrl=%20%20%2F%2F%2F%20&username=alice&password=secret');
     assert.ok(html.includes('Please enter your server URL.'), 'a slash-only URL is still empty');
 });
+
+// Audit F2. `http://bad host:8080` normalizes fine but does not parse, so
+// buildUrl threw inside the attempt loop — and the catch's own log line called
+// `new URL(url)` on the same value and threw a *second* time, out of
+// validateXtremioCredentials entirely. The route answered the same catch-all
+// "Something went wrong" that L-7 above was written to get rid of, and logged
+// nothing, so neither the user nor the operator learned the URL was at fault.
+test('a server URL that does not parse is named as the problem', async () => {
+    const cases = [
+        ['http://bad host:8080', 'a space in the host'],
+        ['https://a b', 'a space with a typed scheme'],
+        ['bad host:1', 'a space with no scheme at all']
+    ];
+    for (const [url, what] of cases) {
+        const { html } = await post(
+            `serverUrl=${encodeURIComponent(url)}&username=alice&password=secret`
+        );
+        assert.ok(
+            html.includes('That server URL is not valid'),
+            `${url} (${what}) should be reported as an invalid URL, not a generic failure`
+        );
+        assert.ok(
+            !html.includes('Something went wrong'),
+            `${url} must not fall through to the catch-all`
+        );
+    }
+    assert.equal(upstreamCalls, 0, 'a URL that cannot be parsed is never dialled');
+});
+
+test('the form is redisplayed with the bad URL still in it', async () => {
+    // The user has to be able to see and correct what they typed; the whole
+    // point of naming the field is lost if the form comes back empty.
+    const { html } = await post('serverUrl=http%3A%2F%2Fbad%20host&username=alice&password=secret');
+    assert.ok(html.includes('value="http://bad host"'), 'the typed URL is echoed back');
+    assert.ok(html.includes('value="alice"'), 'and so is the username');
+});

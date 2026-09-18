@@ -8,7 +8,7 @@
 const net = require('node:net');
 
 const { normalizeUrl } = require('../helpers.js');
-const { ipv6ToBytes, ipv6MatchesPrefix, IPV6_EMBEDDED_IPV4 } = require('../net/private-ip.js');
+const { ipv6ToBytes, ipv6MatchesPrefix, IPV6_V4_MAPPED } = require('../net/private-ip.js');
 
 const PORT = process.env.PORT || 3000;
 const HOST = process.env.HOST || '0.0.0.0';
@@ -79,9 +79,8 @@ function addressBucket(address) {
     if (family !== 6) return '';
     const bytes = ipv6ToBytes(address);
     if (!bytes) return '';
-    const mapped = IPV6_EMBEDDED_IPV4[0];
-    if (ipv6MatchesPrefix(bytes, mapped.bytes, mapped.bits)) {
-        return Array.from(bytes.subarray(mapped.offset, mapped.offset + 4)).join('.');
+    if (ipv6MatchesPrefix(bytes, IPV6_V4_MAPPED.bytes, IPV6_V4_MAPPED.bits)) {
+        return Array.from(bytes.subarray(IPV6_V4_MAPPED.offset, IPV6_V4_MAPPED.offset + 4)).join('.');
     }
     const hextets = [];
     for (let i = 0; i < 8; i += 2) hextets.push(((bytes[i] << 8) | bytes[i + 1]).toString(16));

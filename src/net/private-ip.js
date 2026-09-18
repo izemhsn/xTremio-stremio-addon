@@ -90,11 +90,25 @@ const IPV6_PRIVATE_PREFIXES = [
 // public IPv4 is itself public, and refusing those would break real providers.
 // `64:ff9b::7f00:1` is the one that matters — on a NAT64 network it reaches
 // 127.0.0.1, and the old check let it straight through.
+//
+// The IPv4-translated form is the same gap one prefix over (audit F4):
+// `::ffff:0:7f00:1` is 127.0.0.1 and `::ffff:0:a9fe:a9fe` is the cloud metadata
+// address, and both read as public while the row was missing. It is only
+// reachable behind a stateless translator, which is why it went unnoticed, but
+// that is a property of the network this server happens to sit on.
 const IPV6_EMBEDDED_IPV4 = [
-    ['::ffff:0:0', 96, 12],  // v4-mapped
-    ['64:ff9b::', 96, 12],   // NAT64 (RFC 6052)
-    ['2002::', 16, 2]        // 6to4 (RFC 3056)
-].map(([prefix, bits, offset]) => ({ bytes: ipv6ToBytes(prefix), bits, offset }));
+    ['::ffff:0:0', 96, 12],    // v4-mapped
+    ['::ffff:0:0:0', 96, 12],  // IPv4-translated (RFC 2765/6145)
+    ['64:ff9b::', 96, 12],     // NAT64 (RFC 6052)
+    ['2002::', 16, 2]          // 6to4 (RFC 3056)
+].map(([prefix, bits, offset]) => ({ prefix, bytes: ipv6ToBytes(prefix), bits, offset }));
+
+// addressBucket needs the v4-mapped entry in particular, so that a dual-stack
+// socket reporting an IPv4 client gets the same rate-limit bucket the client
+// would get over IPv4. It used to reach into the table at [0]: a row added in
+// the wrong place would have rekeyed every IPv4 client silently, which is the
+// kind of thing adding a row here is otherwise free of.
+const IPV6_V4_MAPPED = IPV6_EMBEDDED_IPV4.find(e => e.prefix === '::ffff:0:0');
 
 function isPrivateIp(ip) {
     if (net.isIP(ip) === 4) {
@@ -123,5 +137,6 @@ module.exports = {
     ipv6MatchesPrefix,
     IPV4_PRIVATE_CIDRS,
     IPV6_PRIVATE_PREFIXES,
-    IPV6_EMBEDDED_IPV4
+    IPV6_EMBEDDED_IPV4,
+    IPV6_V4_MAPPED
 };

@@ -571,6 +571,12 @@ app.post('/configure', async (req, res) => {
             ? (validation.resolvedUrl || normalizeUrl(rawServerUrl))
             : rawServerUrl);
     } catch (e) {
+        // validateXtremioCredentials is meant to answer, not throw — every
+        // provider and network failure is already a { valid: false } result. So
+        // anything arriving here is a bug in this server, and it used to be
+        // swallowed: a malformed server URL threw while the catch inside was
+        // logging, and the operator saw nothing at all (audit F2).
+        logRouteError('configure', e);
         fail('Something went wrong. Please try again.');
     }
 });

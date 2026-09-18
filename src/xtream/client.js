@@ -9,7 +9,7 @@
 // not behaviour, and threading it through every caller would be the more confusing
 // of the two.
 const { buildXtremioApiUrl } = require('../helpers.js');
-const { safeFetch } = require('../net/safe-fetch.js');
+const { safeFetch, discardBody } = require('../net/safe-fetch.js');
 const { readJsonCapped, MAX_UPSTREAM_BYTES } = require('../upstream/read-capped.js');
 const { CACHE_FAILURE_TTL } = require('../cache/layers.js');
 
@@ -36,7 +36,14 @@ async function xtremioGet(cfg, action, params = {}, { timeoutMs = UPSTREAM_HEADE
     try {
         const res = await safeFetch(url, { signal: controller.signal });
         clearTimeout(phaseTimer);
-        if (!res.ok) throw new Error(`xtremio ${action} failed: HTTP ${res.status}`);
+        if (!res.ok) {
+            // The body of an error response is never read, so it has to be
+            // cancelled: undici holds that connection out of its pool until the
+            // response is garbage collected, and a panel answering every call
+            // with a 5xx HTML page can tie up a socket per call (audit F3).
+            discardBody(res);
+            throw new Error(`xtremio ${action} failed: HTTP ${res.status}`);
+        }
         const resetIdle = () => {
             clearTimeout(phaseTimer);
             phaseTimer = expire('the next chunk', UPSTREAM_IDLE_TIMEOUT_MS);
