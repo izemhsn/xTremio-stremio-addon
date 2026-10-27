@@ -1,0 +1,80 @@
+# CI/CD
+#
+# CI - on every push to main/dev and on every pull request:
+#   1. Run the tests.
+#   2. Check that the Docker image builds.
+#
+# CD - when you push a version tag:
+#   3. Publish the Docker image to ghcr.io/izemhsn/xtremio-stremio-addon
+#
+# How to release:
+#   git tag v2.1.0
+#   git push origin v2.1.0
+
+name: CI/CD
+
+on:
+  push:
+    branches: [main, dev]
+    tags: ['v*']
+  pull_request:
+
+# Read-only access to the repo by default (safer).
+permissions:
+  contents: read
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    strategy:
+      # Keep testing the other Node versions even if one fails.
+      fail-fast: false
+      matrix:
+        # Every Node version the addon supports.
+        node: ['20.18.1', '22', '24']
+    steps:
+      - name: Get the code
+        uses: actions/checkout@v4
+
+      - name: Install Node ${{ matrix.node }}
+        uses: actions/setup-node@v4
+        with:
+          node-version: ${{ matrix.node }}
+          cache: npm
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Run tests
+        run: npm test
+
+  docker:
+    # Wait until all tests pass.
+    needs: test
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write   # allows pushing the image to ghcr.io
+    steps:
+      - name: Get the code
+        uses: actions/checkout@v4
+
+      - name: Build the Docker image
+        run: docker build -t xtremio .
+
+      # The two steps below only run for a version tag.
+
+      - name: Log in to ghcr.io
+        if: github.ref_type == 'tag'
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}   # GitHub creates this token automatically
+
+      - name: Publish the image
+        if: github.ref_type == 'tag'
+        run: |
+          docker tag xtremio ghcr.io/izemhsn/xtremio-stremio-addon:${{ github.ref_name }}
+          docker tag xtremio ghcr.io/izemhsn/xtremio-stremio-addon:latest
+          docker push --all-tags ghcr.io/izemhsn/xtremio-stremio-addon

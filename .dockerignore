@@ -1,0 +1,20 @@
+# Files Docker should NOT copy into the image.
+# Keeps the image small and keeps secrets out of it.
+
+# Dependencies are installed fresh inside the image
+node_modules
+npm-debug.log*
+
+# Your secrets stay on your machine; `docker run --env-file .env` passes them in
+.env
+.env.*
+
+# Not needed to run the addon
+.git
+.github
+.claude
+test
+coverage
+*.md
+vitest.config.mjs
+Dockerfile
