@@ -12,9 +12,6 @@
 process.env.CONFIG_SECRET = 'test-secret-for-unit-tests';
 process.env.ALLOW_PRIVATE_NETWORKS = 'true';
 
-const test = require('node:test');
-const assert = require('node:assert');
-
 const {
     app,
     getManifest,
@@ -25,7 +22,7 @@ const {
     seriesStreamsCache,
     liveStreamsCache,
     categoryStreamsCache
-} = require('../index.js');
+} = require('./support/internals.js');
 
 const realFetch = global.fetch;
 
@@ -67,17 +64,17 @@ function clearCaches() {
 let server;
 let base;
 
-test.before(async () => {
+beforeAll(async () => {
     await new Promise(resolve => { server = app.listen(0, '127.0.0.1', resolve); });
     base = `http://127.0.0.1:${server.address().port}`;
 });
 
-test.after(async () => {
+afterAll(async () => {
     global.fetch = realFetch;
     await new Promise(resolve => server.close(resolve));
 });
 
-test.beforeEach(() => clearCaches());
+beforeEach(() => clearCaches());
 
 const genreOf = (catalog) => (catalog.extra || []).find(e => e.name === 'genre');
 const GENRE_CATALOGS = [
@@ -95,10 +92,10 @@ test('no catalog ever declares a required genre with nothing to choose', () => {
         for (const catalog of manifest.catalogs) {
             const genre = genreOf(catalog);
             if (!genre) continue;
-            assert.ok(
-                genre.options?.length > 0,
+            expect(
+                genre.options?.length,
                 `${label}: ${catalog.id} offers a genre with no options`
-            );
+            ).toBeGreaterThan(0);
         }
     };
     return (async () => {
@@ -114,15 +111,15 @@ test('total category failure still advertises all nine catalogs, without genres'
     stubProvider({ working: [] });
     const manifest = await getManifest(CFG_ARGS);
 
-    assert.equal(manifest.catalogs.length, 9, 'the catalogs themselves must not disappear');
+    expect(manifest.catalogs.length, 'the catalogs themselves must not disappear').toBe(9);
     for (const id of GENRE_CATALOGS) {
         const catalog = manifest.catalogs.find(c => c.id === id);
-        assert.ok(catalog, `${id} is missing`);
-        assert.equal(genreOf(catalog), undefined, `${id} still offers a genre`);
+        expect(catalog, `${id} is missing`).toBeTruthy();
+        expect(genreOf(catalog), `${id} still offers a genre`).toBeUndefined();
         // skip survives: paginating does not need a genre. search does not: a
         // catalog whose only optional extra is search joins Stremio's global
         // search, so seven shelves would duplicate the two search catalogs (M3).
-        assert.deepEqual((catalog.extra || []).map(e => e.name), ['skip'], id);
+        expect((catalog.extra || []).map(e => e.name), id).toStrictEqual(['skip']);
     }
 });
 
@@ -136,9 +133,8 @@ test('the two search catalogs are unaffected either way', async () => {
             const catalog = manifest.catalogs.find(c => c.id === id);
             // `skip` too: Stremio sends only declared extras, so without it a
             // search could never reach its second page.
-            assert.deepEqual(catalog.extra, [{ name: 'search', isRequired: true }, { name: 'skip' }],
-                `${id} working=[${working}]`);
-            assert.deepEqual(catalog.searchProperties, ['name']);
+            expect(catalog.extra, `${id} working=[${working}]`).toStrictEqual([{ name: 'search', isRequired: true }, { name: 'skip' }]);
+            expect(catalog.searchProperties).toStrictEqual(['name']);
         }
     }
 });
@@ -149,10 +145,10 @@ test('a partial failure degrades only the kinds that failed', async () => {
     const manifest = await getManifest(CFG_ARGS);
 
     for (const id of ['xtremio_movies_popular', 'xtremio_movies_new', 'xtremio_movies_featured']) {
-        assert.deepEqual(genreOf(manifest.catalogs.find(c => c.id === id))?.options, ['Action'], id);
+        expect(genreOf(manifest.catalogs.find(c => c.id === id))?.options, id).toStrictEqual(['Action']);
     }
     for (const id of ['xtremio_live', 'xtremio_series_popular']) {
-        assert.equal(genreOf(manifest.catalogs.find(c => c.id === id)), undefined, id);
+        expect(genreOf(manifest.catalogs.find(c => c.id === id)), id).toBeUndefined();
     }
 });
 
@@ -160,14 +156,13 @@ test('a healthy provider is unchanged', async () => {
     stubProvider();
     const manifest = await getManifest(CFG_ARGS);
 
-    assert.equal(manifest.catalogs.length, 9);
-    assert.deepEqual(genreOf(manifest.catalogs.find(c => c.id === 'xtremio_live')), {
+    expect(manifest.catalogs.length).toBe(9);
+    expect(genreOf(manifest.catalogs.find(c => c.id === 'xtremio_live'))).toStrictEqual({
         name: 'genre', options: ['News'], isRequired: true
     });
-    assert.deepEqual(
-        (manifest.catalogs.find(c => c.id === 'xtremio_movies_new').extra || []).map(e => e.name),
-        ['genre', 'skip']
-    );
+    expect(
+        (manifest.catalogs.find(c => c.id === 'xtremio_movies_new').extra || []).map(e => e.name)
+    ).toStrictEqual(['genre', 'skip']);
 });
 
 test('only the two search catalogs are searchable, degraded or not', async () => {
@@ -182,7 +177,7 @@ test('only the two search catalogs are searchable, degraded or not', async () =>
             .filter(c => (c.extra || []).some(e => e.name === 'search'))
             .filter(c => !(c.extra || []).some(e => e.name !== 'search' && e.isRequired))
             .map(c => c.id);
-        assert.deepEqual(searchable, ['xtremio_search_movies', 'xtremio_search_series'], `working=[${working}]`);
+        expect(searchable, `working=[${working}]`).toStrictEqual(['xtremio_search_movies', 'xtremio_search_series']);
     }
 });
 
@@ -191,10 +186,10 @@ test('the manifest keeps its catalog order', async () => {
     // silently rearranges the user's home screen.
     stubProvider();
     const manifest = await getManifest(CFG_ARGS);
-    assert.deepEqual(manifest.catalogs.map(c => c.id), [
+    expect(manifest.catalogs.map(c => c.id)).toStrictEqual([
         ...GENRE_CATALOGS, 'xtremio_search_movies', 'xtremio_search_series'
     ]);
-    assert.deepEqual(manifest.catalogs.map(c => c.type), [
+    expect(manifest.catalogs.map(c => c.type)).toStrictEqual([
         'Live TV', 'XT-Movies', 'XT-Movies', 'XT-Movies',
         'XT-Series', 'XT-Series', 'XT-Series', 'XT-Movies', 'XT-Series'
     ]);
@@ -208,9 +203,9 @@ test('getCategories resolves even when every upstream call fails', async () => {
     // above stops being the degraded one.
     stubProvider({ working: [] });
     const cats = await getCategories(CFG_ARGS);
-    assert.deepEqual(cats.live, []);
-    assert.deepEqual(cats.movies, []);
-    assert.deepEqual(cats.series, []);
+    expect(cats.live).toStrictEqual([]);
+    expect(cats.movies).toStrictEqual([]);
+    expect(cats.series).toStrictEqual([]);
 });
 
 // --- and the shelf actually opens ------------------------------------------
@@ -223,8 +218,8 @@ test('a genre-less catalog serves the full list rather than an empty shelf', asy
     const res = await realFetch(`${base}/${CFG}/catalog/XT-Movies/xtremio_movies_new/skip=0.json`);
     const body = await res.json();
 
-    assert.equal(res.status, 200);
-    assert.deepEqual(body.metas.map(m => m.id), ['xtremio_movie_102', 'xtremio_movie_101']);
+    expect(res.status).toBe(200);
+    expect(body.metas.map(m => m.id)).toStrictEqual(['xtremio_movie_102', 'xtremio_movie_101']);
 });
 
 test('search still works on a degraded catalog', async () => {
@@ -233,5 +228,5 @@ test('search still works on a degraded catalog', async () => {
         `${base}/${CFG}/catalog/XT-Movies/xtremio_movies_new/${encodeURIComponent('search=alpha')}.json`
     );
     const body = await res.json();
-    assert.deepEqual(body.metas.map(m => m.name), ['Alpha']);
+    expect(body.metas.map(m => m.name)).toStrictEqual(['Alpha']);
 });

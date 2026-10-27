@@ -2,10 +2,7 @@
 // an unbounded JSON read lets a hostile or broken provider exhaust memory.
 process.env.CONFIG_SECRET = 'test-secret-for-unit-tests';
 
-const test = require('node:test');
-const assert = require('node:assert');
-
-const { readJsonCapped, estimateBytes, MAX_UPSTREAM_BYTES, MAX_PARSED_TO_BODY_RATIO } = require('../index.js');
+const { readJsonCapped, estimateBytes, MAX_UPSTREAM_BYTES, MAX_PARSED_TO_BODY_RATIO } = require('./support/internals.js');
 
 // Builds a fetch-like Response whose body streams `chunkCount` chunks of
 // `chunkSize` bytes, and records whether the reader was cancelled early.
@@ -46,43 +43,43 @@ function streamingResponse({ chunkSize, chunkCount, contentLength = null, payloa
 
 test('a declared content-length over the cap is rejected before reading', async () => {
     const { res, state } = streamingResponse({ chunkSize: 10, chunkCount: 1, contentLength: '999999' });
-    await assert.rejects(
-        () => readJsonCapped(res, 'test', 1000),
-        /too large: 999999 bytes exceeds 1000/
-    );
-    assert.strictEqual(state.chunksRead, 0, 'must not read the body at all');
+    await expect(readJsonCapped(res, 'test', 1000)).rejects.toThrow(/too large: 999999 bytes exceeds 1000/);
+    expect(state.chunksRead, 'must not read the body at all').toBe(0);
 });
 
 test('a body that exceeds the cap mid-stream is aborted', async () => {
     // 10 chunks of 100 bytes against a 250-byte cap: should stop after 3.
     const { res, state } = streamingResponse({ chunkSize: 100, chunkCount: 10 });
-    await assert.rejects(() => readJsonCapped(res, 'test', 250), /exceeded 250 bytes/);
-    assert.ok(state.cancelled, 'must cancel the reader rather than drain the socket');
-    assert.ok(state.chunksRead < 10, `should stop early, read ${state.chunksRead} of 10 chunks`);
+    await expect(readJsonCapped(res, 'test', 250)).rejects.toThrow(/exceeded 250 bytes/);
+    expect(state.cancelled, 'must cancel the reader rather than drain the socket').toBeTruthy();
+    expect(
+        state.chunksRead,
+        `should stop early, read ${state.chunksRead} of 10 chunks`
+    ).toBeLessThan(10);
 });
 
 test('a lying content-length does not bypass the streamed check', async () => {
     // Claims to be small, actually streams far more.
     const { res, state } = streamingResponse({ chunkSize: 100, chunkCount: 50, contentLength: '10' });
-    await assert.rejects(() => readJsonCapped(res, 'test', 250), /exceeded 250 bytes/);
-    assert.ok(state.cancelled);
+    await expect(readJsonCapped(res, 'test', 250)).rejects.toThrow(/exceeded 250 bytes/);
+    expect(state.cancelled).toBeTruthy();
 });
 
 test('a body within the cap parses normally', async () => {
     const { res } = streamingResponse({ payload: JSON.stringify([{ a: 1 }, { b: 2 }]) });
-    assert.deepStrictEqual(await readJsonCapped(res, 'test', 1000), [{ a: 1 }, { b: 2 }]);
+    expect(await readJsonCapped(res, 'test', 1000)).toStrictEqual([{ a: 1 }, { b: 2 }]);
 });
 
 test('a body exactly at the cap is allowed', async () => {
     const payload = JSON.stringify('x'.repeat(20));
     const { res } = streamingResponse({ payload });
     const size = Buffer.byteLength(payload);
-    assert.strictEqual(await readJsonCapped(res, 'test', size), 'x'.repeat(20));
+    expect(await readJsonCapped(res, 'test', size)).toBe('x'.repeat(20));
 });
 
 test('invalid JSON inside the cap still raises a parse error', async () => {
     const { res } = streamingResponse({ payload: '{not json' });
-    await assert.rejects(() => readJsonCapped(res, 'test', 1000), SyntaxError);
+    await expect(readJsonCapped(res, 'test', 1000)).rejects.toThrow(SyntaxError);
 });
 
 test('a response with no readable body falls back to json()', async () => {
@@ -93,13 +90,13 @@ test('a response with no readable body falls back to json()', async () => {
         headers: { get: () => null },
         json: async () => ({ fallback: true })
     };
-    assert.deepStrictEqual(await readJsonCapped(res, 'test', 1000), { fallback: true });
+    expect(await readJsonCapped(res, 'test', 1000)).toStrictEqual({ fallback: true });
 });
 
 test('the default cap is generous enough for a large real provider', () => {
     // A 50k-title VOD list at ~500 bytes each is ~25MB; the cap must clear that
     // comfortably or legitimate providers break.
-    assert.ok(MAX_UPSTREAM_BYTES >= 32 * 1024 * 1024, `cap is ${MAX_UPSTREAM_BYTES}`);
+    expect(MAX_UPSTREAM_BYTES, `cap is ${MAX_UPSTREAM_BYTES}`).toBeGreaterThanOrEqual(32 * 1024 * 1024);
 });
 
 // --- transient peak while parsing (audit L-5) -------------------------------
@@ -140,7 +137,7 @@ test('a body split across many chunks parses to exactly the same value', async (
     // 7 bytes so boundaries land inside tokens rather than between them.
     const value = Array.from({ length: 200 }, (_, i) => ({ stream_id: i, name: `Title ${i}` }));
     const res = chunkedResponse(JSON.stringify(value), 7);
-    assert.deepStrictEqual(await readJsonCapped(res, 'test', 1024 * 1024), value);
+    expect(await readJsonCapped(res, 'test', 1024 * 1024)).toStrictEqual(value);
 });
 
 test('a multi-byte character split across a chunk boundary survives', async () => {
@@ -150,7 +147,7 @@ test('a multi-byte character split across a chunk boundary survives', async () =
     const text = JSON.stringify(value);
     for (let chunkSize = 1; chunkSize <= 4; chunkSize++) {
         const res = chunkedResponse(text, chunkSize);
-        assert.deepStrictEqual(await readJsonCapped(res, 'test', 1024), value, `chunk size ${chunkSize}`);
+        expect(await readJsonCapped(res, 'test', 1024), `chunk size ${chunkSize}`).toStrictEqual(value);
     }
 });
 
@@ -174,11 +171,22 @@ test('each copy of the body is released before the next is allocated', () => {
     const release = fn.indexOf('buf = null');
     const parse = fn.indexOf('JSON.parse(');
 
-    assert.ok(concat > 0 && drop > 0 && stringify > 0 && release > 0 && parse > 0,
-        'readJsonCapped no longer has the staged shape this test describes');
-    assert.ok(drop > concat && drop < stringify, 'chunks must be released between the concat and the stringify');
-    assert.ok(release > stringify && release < parse, 'the buffer must be released between the stringify and the parse');
-    assert.ok(!/JSON\.parse\(Buffer\.concat/.test(fn), 'the one-expression form keeps every copy alive');
+    expect(
+        concat > 0 && drop > 0 && stringify > 0 && release > 0 && parse > 0,
+        'readJsonCapped no longer has the staged shape this test describes'
+    ).toBeTruthy();
+    expect(
+        drop > concat && drop < stringify,
+        'chunks must be released between the concat and the stringify'
+    ).toBeTruthy();
+    expect(
+        release > stringify && release < parse,
+        'the buffer must be released between the stringify and the parse'
+    ).toBeTruthy();
+    expect(
+        /JSON\.parse\(Buffer\.concat/.test(fn),
+        'the one-expression form keeps every copy alive'
+    ).toBeFalsy();
 });
 
 // --- what a body parses to (audit S4) ----------------------------------------
@@ -225,19 +233,16 @@ test('a body shaped to inflate is refused mid-stream, inside its byte cap', asyn
     // body. Stopping early is also the proof that it was never parsed: JSON.parse
     // runs only once the read loop has finished.
     const text = '[' + new Array(Math.floor((MB - 2) / 3)).fill('{}').join(',') + ']';
-    assert.ok(Buffer.byteLength(text) <= MB);
+    expect(Buffer.byteLength(text)).toBeLessThanOrEqual(MB);
     const { res, state } = trackedResponse(text, 16 * 1024);
 
     const allowedMb = MAX_PARSED_TO_BODY_RATIO;
-    await assert.rejects(
-        () => readJsonCapped(res, 'test', MB),
-        new RegExp(`shaped to parse to more than ${allowedMb} MB`)
-    );
-    assert.ok(state.cancelled, 'the socket is released rather than drained');
-    assert.ok(
-        state.chunksRead < state.totalChunks / 4,
+    await expect(readJsonCapped(res, 'test', MB)).rejects.toThrow(new RegExp(`shaped to parse to more than ${allowedMb} MB`));
+    expect(state.cancelled, 'the socket is released rather than drained').toBeTruthy();
+    expect(
+        state.chunksRead,
         `stopped after ${state.chunksRead} of ${state.totalChunks} chunks`
-    );
+    ).toBeLessThan(state.totalChunks / 4);
 });
 
 test('a realistic list up to its byte cap is never refused by the shape check', async () => {
@@ -270,7 +275,7 @@ test('a realistic list up to its byte cap is never refused by the shape check', 
         const { res } = trackedResponse(text, 16 * 1024);
         // The byte cap is the body's exact size: as close to refusal as a real list gets.
         const parsed = await readJsonCapped(res, 'test', Buffer.byteLength(text));
-        assert.equal(parsed.length, items.length, `${kind} list parsed whole`);
+        expect(parsed.length, `${kind} list parsed whole`).toBe(items.length);
     }
 });
 
@@ -286,5 +291,8 @@ test('a parsed payload is weighed from its whole body, not from a sample', async
 
     const fromBody = estimateBytes(await readJsonCapped(res, 'test', MB));
     const fromSample = estimateBytes(JSON.parse(text));
-    assert.ok(fromBody > 3 * fromSample, `whole body weighed ${fromBody}, the steered sample ${fromSample}`);
+    expect(
+        fromBody,
+        `whole body weighed ${fromBody}, the steered sample ${fromSample}`
+    ).toBeGreaterThan(3 * fromSample);
 });

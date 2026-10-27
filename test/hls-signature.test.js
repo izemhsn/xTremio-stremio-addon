@@ -13,9 +13,6 @@
 process.env.CONFIG_SECRET = 'test-secret-for-unit-tests';
 process.env.ALLOW_PRIVATE_NETWORKS = 'true';
 
-const test = require('node:test');
-const assert = require('node:assert');
-
 const {
     app,
     encodeConfig,
@@ -24,7 +21,7 @@ const {
     signHlsTarget,
     signTokenBody,
     HLS_SIGNATURE_TTL_MS
-} = require('../index.js');
+} = require('./support/internals.js');
 
 const realFetch = global.fetch;
 
@@ -39,8 +36,8 @@ test('a signature minted for one account does not verify for another', () => {
     // capability was minted for may use it.
     const { u, s, e } = encodeHlsTarget(TARGET, ALICE);
 
-    assert.equal(decodeHlsTarget(u, s, e, ALICE)?.url, TARGET, 'the owner can still use it');
-    assert.equal(decodeHlsTarget(u, s, e, BOB), null, 'another account must not');
+    expect(decodeHlsTarget(u, s, e, ALICE)?.url, 'the owner can still use it').toBe(TARGET);
+    expect(decodeHlsTarget(u, s, e, BOB), 'another account must not').toBeNull();
 });
 
 test('reconfiguring kills the outstanding capabilities', () => {
@@ -48,10 +45,10 @@ test('reconfiguring kills the outstanding capabilities', () => {
     // links from the previous configuration stop verifying — which is what a
     // user revoking access would reasonably expect.
     const reissued = encodeConfig({ serverUrl: 'http://provider.test:8080', username: 'alice', password: 'secret' });
-    assert.notEqual(reissued, ALICE, 'tokens are non-deterministic');
+    expect(reissued, 'tokens are non-deterministic').not.toBe(ALICE);
 
     const { u, s, e } = encodeHlsTarget(TARGET, ALICE);
-    assert.equal(decodeHlsTarget(u, s, e, reissued), null);
+    expect(decodeHlsTarget(u, s, e, reissued)).toBeNull();
 });
 
 // --- expiry ----------------------------------------------------------------
@@ -60,9 +57,9 @@ test('a lapsed signature is refused even though the MAC is correct', () => {
     const now = Date.now();
     const { u, s, e } = encodeHlsTarget(TARGET, ALICE, now);
 
-    assert.equal(decodeHlsTarget(u, s, e, ALICE, now + HLS_SIGNATURE_TTL_MS - 1000)?.url, TARGET);
-    assert.equal(decodeHlsTarget(u, s, e, ALICE, now + HLS_SIGNATURE_TTL_MS), null, 'exactly at the expiry');
-    assert.equal(decodeHlsTarget(u, s, e, ALICE, now + HLS_SIGNATURE_TTL_MS + 1000), null);
+    expect(decodeHlsTarget(u, s, e, ALICE, now + HLS_SIGNATURE_TTL_MS - 1000)?.url).toBe(TARGET);
+    expect(decodeHlsTarget(u, s, e, ALICE, now + HLS_SIGNATURE_TTL_MS), 'exactly at the expiry').toBeNull();
+    expect(decodeHlsTarget(u, s, e, ALICE, now + HLS_SIGNATURE_TTL_MS + 1000)).toBeNull();
 });
 
 test('the expiry cannot be extended without the key', () => {
@@ -72,7 +69,7 @@ test('the expiry cannot be extended without the key', () => {
     const { u, s } = encodeHlsTarget(TARGET, ALICE, now);
     const later = String(now + 10 * 365 * 24 * 60 * 60 * 1000);
 
-    assert.equal(decodeHlsTarget(u, s, later, ALICE, now), null);
+    expect(decodeHlsTarget(u, s, later, ALICE, now)).toBeNull();
 });
 
 test('a malformed expiry is refused rather than coerced', () => {
@@ -85,14 +82,17 @@ test('a malformed expiry is refused rather than coerced', () => {
 
     for (const expiry of ['12e9', ` ${valid} `, `+${valid}`, '', 'soon', null, undefined, Number(valid), '0'.repeat(20)]) {
         const signature = signHlsTarget(u, ALICE, expiry);
-        assert.equal(decodeHlsTarget(u, signature, expiry, ALICE, now), null, `expiry ${JSON.stringify(expiry)}`);
+        expect(
+            decodeHlsTarget(u, signature, expiry, ALICE, now),
+            `expiry ${JSON.stringify(expiry)}`
+        ).toBeNull();
     }
 });
 
 test('a missing expiry is not treated as no expiry', () => {
     const { u, s } = encodeHlsTarget(TARGET, ALICE);
-    assert.equal(decodeHlsTarget(u, s, undefined, ALICE), null);
-    assert.equal(decodeHlsTarget(u, s, null, ALICE), null);
+    expect(decodeHlsTarget(u, s, undefined, ALICE)).toBeNull();
+    expect(decodeHlsTarget(u, s, null, ALICE)).toBeNull();
 });
 
 // --- S1: the target itself is confidential ---------------------------------
@@ -109,12 +109,12 @@ test('the link does not carry the provider credentials it points at', () => {
     // the bytes that do not form characters instead of comparing them.
     const decoded = Buffer.from(u, 'base64url').toString('latin1');
 
-    assert.ok(!query.includes('secret'), 'no credential in the link as written');
-    assert.ok(!decoded.includes('secret'), 'and none once the payload is decoded');
-    assert.ok(!decoded.includes('cdn.test'), 'the host it names is not readable either');
+    expect(query, 'no credential in the link as written').not.toContain('secret');
+    expect(decoded, 'and none once the payload is decoded').not.toContain('secret');
+    expect(decoded, 'the host it names is not readable either').not.toContain('cdn.test');
 
     // And it still works for the account it was minted for.
-    assert.equal(decodeHlsTarget(u, s, e, ALICE)?.url, TARGET);
+    expect(decodeHlsTarget(u, s, e, ALICE)?.url).toBe(TARGET);
 });
 
 test('the ciphertext is bound to the token and the expiry, not only the MAC', () => {
@@ -124,10 +124,10 @@ test('the ciphertext is bound to the token and the expiry, not only the MAC', ()
     // pushed out, does not decrypt.
     const { u, e } = encodeHlsTarget(TARGET, ALICE);
 
-    assert.equal(decodeHlsTarget(u, signHlsTarget(u, BOB, e), e, BOB), null, 'another token');
+    expect(decodeHlsTarget(u, signHlsTarget(u, BOB, e), e, BOB), 'another token').toBeNull();
 
     const later = String(Number(e) + 60000);
-    assert.equal(decodeHlsTarget(u, signHlsTarget(u, ALICE, later), later, ALICE), null, 'a later deadline');
+    expect(decodeHlsTarget(u, signHlsTarget(u, ALICE, later), later, ALICE), 'a later deadline').toBeNull();
 });
 
 test('a tampered payload is rejected even when the MAC agrees', () => {
@@ -136,7 +136,7 @@ test('a tampered payload is rejected even when the MAC agrees', () => {
     raw[raw.length - 1] ^= 0x01;
     const tampered = raw.toString('base64url');
 
-    assert.equal(decodeHlsTarget(tampered, signHlsTarget(tampered, ALICE, e), e, ALICE), null);
+    expect(decodeHlsTarget(tampered, signHlsTarget(tampered, ALICE, e), e, ALICE)).toBeNull();
 });
 
 test('a payload too short to hold a nonce, a tag and a target is rejected', () => {
@@ -144,11 +144,10 @@ test('a payload too short to hold a nonce, a tag and a target is rejected', () =
     // nonce and tag alone would be a well-formed link to nowhere.
     const e = String(Date.now() + 60000);
     for (const short of ['', 'AAAA', Buffer.alloc(28).toString('base64url')]) {
-        assert.equal(
+        expect(
             decodeHlsTarget(short, signHlsTarget(short, ALICE, e), e, ALICE),
-            null,
             `payload ${JSON.stringify(short)}`
-        );
+        ).toBeNull();
     }
 });
 
@@ -159,16 +158,16 @@ test('the earlier guarantees still hold', () => {
     const { u, s, e } = encodeHlsTarget(TARGET, ALICE, now);
     const evil = Buffer.from('http://attacker.test/', 'utf8').toString('base64url');
 
-    assert.equal(decodeHlsTarget(evil, s, e, ALICE, now), null, 'signature for a different payload');
-    assert.equal(decodeHlsTarget(u, 'forged', e, ALICE, now), null);
+    expect(decodeHlsTarget(evil, s, e, ALICE, now), 'signature for a different payload').toBeNull();
+    expect(decodeHlsTarget(u, 'forged', e, ALICE, now)).toBeNull();
 
     // Still domain-separated from config-token MACs, which no longer share the
     // key either.
     const body = 'v3.aaa.bbb.ccc';
-    assert.notEqual(signHlsTarget(body, ALICE, e), signTokenBody(body));
+    expect(signHlsTarget(body, ALICE, e)).not.toBe(signTokenBody(body));
 
     // And the three signed fields cannot be shifted into one another.
-    assert.notEqual(signHlsTarget('a', 'b:c', e), signHlsTarget('a:b', 'c', e));
+    expect(signHlsTarget('a', 'b:c', e)).not.toBe(signHlsTarget('a:b', 'c', e));
 });
 
 // --- end to end ------------------------------------------------------------
@@ -176,14 +175,14 @@ test('the earlier guarantees still hold', () => {
 let server;
 let base;
 
-test.before(async () => {
+beforeAll(async () => {
     server = await new Promise((resolve) => {
         const s = app.listen(0, '127.0.0.1', () => resolve(s));
     });
     base = `http://127.0.0.1:${server.address().port}`;
 });
 
-test.after(async () => {
+afterAll(async () => {
     global.fetch = realFetch;
     await new Promise(r => server.close(r));
 });
@@ -195,9 +194,9 @@ test('the route refuses a capability minted for a different token', async () => 
     const { u, s, e } = encodeHlsTarget(TARGET, ALICE);
     const res = await realFetch(`${base}/${BOB}/proxy/hls?u=${u}&s=${s}&e=${e}`);
 
-    assert.equal(res.status, 400);
-    assert.equal(await res.text(), 'bad target');
-    assert.equal(upstreamCalls, 0, 'rejected before any outbound call');
+    expect(res.status).toBe(400);
+    expect(await res.text()).toBe('bad target');
+    expect(upstreamCalls, 'rejected before any outbound call').toBe(0);
 });
 
 test('the route refuses a lapsed capability', async () => {
@@ -210,13 +209,13 @@ test('the route refuses a lapsed capability', async () => {
     const s = signHlsTarget(u, ALICE, e);
 
     const res = await realFetch(`${base}/${ALICE}/proxy/hls?u=${u}&s=${s}&e=${e}`);
-    assert.equal(res.status, 400);
-    assert.equal(upstreamCalls, 0);
+    expect(res.status).toBe(400);
+    expect(upstreamCalls).toBe(0);
 });
 
 test('an array-typed expiry degrades rather than throwing', async () => {
     // ?e=1&e=2 makes req.query.e an array; the strict type check has to hold.
     const { u, s } = encodeHlsTarget(TARGET, ALICE);
     const res = await realFetch(`${base}/${ALICE}/proxy/hls?u=${u}&s=${s}&e=1&e=2`);
-    assert.equal(res.status, 400);
+    expect(res.status).toBe(400);
 });

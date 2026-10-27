@@ -18,8 +18,6 @@
 process.env.CONFIG_SECRET = 'test-secret-for-unit-tests';
 process.env.ALLOW_PRIVATE_NETWORKS = 'true';
 
-const test = require('node:test');
-const assert = require('node:assert');
 const v8 = require('node:v8');
 const vm = require('node:vm');
 
@@ -41,7 +39,7 @@ const {
     seriesStreamsCache,
     liveStreamsCache,
     FEATURED_PERIOD_MS
-} = require('../index.js');
+} = require('./support/internals.js');
 
 // A view's lifetime is the whole of M-5, and only a collection can show it. The
 // flag is set at runtime so `npm test` needs no node options; a context created
@@ -108,8 +106,8 @@ test('the same shelf, asked twice, is sorted once', () => {
 
     // Identity, not deepEqual: a second sort would produce an equal array, so
     // only reference equality distinguishes a memo hit from a repeat of the work.
-    assert.strictEqual(second, first, 'the second request re-sorted the list');
-    assert.deepStrictEqual(viewKeys(items), ['new\nall']);
+    expect(second, 'the second request re-sorted the list').toBe(first);
+    expect(viewKeys(items)).toStrictEqual(['new\nall']);
 });
 
 test('the memoised order is the order the sort produces', () => {
@@ -117,9 +115,9 @@ test('the memoised order is the order the sort produces', () => {
     const items = movies(40);
     const expected = [...items].sort(catalogComparator(MOVIE_KIND, 'popular'));
 
-    assert.deepStrictEqual(sortedOf(route, items).map(s => s.stream_id), expected.map(s => s.stream_id));
+    expect(sortedOf(route, items).map(s => s.stream_id)).toStrictEqual(expected.map(s => s.stream_id));
     // And again, from the cache this time.
-    assert.deepStrictEqual(sortedOf(route, items).map(s => s.stream_id), expected.map(s => s.stream_id));
+    expect(sortedOf(route, items).map(s => s.stream_id)).toStrictEqual(expected.map(s => s.stream_id));
 });
 
 test('the source list is never mutated', () => {
@@ -127,7 +125,7 @@ test('the source list is never mutated', () => {
     const items = movies(20);
     const before = items.map(s => s.stream_id);
     sortedOf(route, items);
-    assert.deepStrictEqual(items.map(s => s.stream_id), before, 'sorted in place');
+    expect(items.map(s => s.stream_id), 'sorted in place').toStrictEqual(before);
 });
 
 // --- invalidation ---------------------------------------------------------
@@ -145,9 +143,9 @@ test('a refetched list invalidates the sorted view in the same instant', () => {
     });
     const second = sortedOf(route, refetched);
 
-    assert.notStrictEqual(second, first);
-    assert.equal(second[0].stream_id, 999, 'the newest item from the refetched list should lead');
-    assert.deepStrictEqual(viewKeys(refetched), ['new\nall']);
+    expect(second).not.toBe(first);
+    expect(second[0].stream_id, 'the newest item from the refetched list should lead').toBe(999);
+    expect(viewKeys(refetched)).toStrictEqual(['new\nall']);
 });
 
 test('an equal-but-different array is not treated as the same source', () => {
@@ -160,8 +158,8 @@ test('an equal-but-different array is not treated as the same source', () => {
 
     const first = sortedOf(route, items);
     const second = sortedOf(route, clone);
-    assert.notStrictEqual(second, first, 'reused a view derived from a different array');
-    assert.deepStrictEqual(second.map(s => s.stream_id), first.map(s => s.stream_id));
+    expect(second, 'reused a view derived from a different array').not.toBe(first);
+    expect(second.map(s => s.stream_id)).toStrictEqual(first.map(s => s.stream_id));
 });
 
 // --- key separation -------------------------------------------------------
@@ -178,15 +176,15 @@ test('variant and selection separate views over one source; search does not', ()
     const bySelection = sortedOf(newRoute, items.filter(s => s.rating === 1), {
         source: items, selection: 'category:20', now
     });
-    assert.notStrictEqual(byVariant, base, 'the variant did not separate the views');
-    assert.notStrictEqual(bySelection, base, 'the selection did not separate the views');
-    assert.equal(bySelection.length, 6, 'a category view was served the whole list');
+    expect(byVariant, 'the variant did not separate the views').not.toBe(base);
+    expect(bySelection, 'the selection did not separate the views').not.toBe(base);
+    expect(bySelection.length, 'a category view was served the whole list').toBe(6);
 
     // Search over the full list is sorted `new`, which is exactly the view the
     // no-categories shelf already holds — one sort, not two.
-    assert.strictEqual(sortedOf(search, items, { now }), base);
+    expect(sortedOf(search, items, { now })).toBe(base);
 
-    assert.deepStrictEqual(viewKeys(items), ['new\nall', 'popular\nall', 'new\ncategory:20']);
+    expect(viewKeys(items)).toStrictEqual(['new\nall', 'popular\nall', 'new\ncategory:20']);
 });
 
 test("a new period drops the previous period's views", () => {
@@ -194,12 +192,12 @@ test("a new period drops the previous period's views", () => {
     const t0 = Date.UTC(2026, 0, 1, 12);
     sortedOf(parseCatalogId('xtremio_movies_featured'), items, { now: t0 });
     sortedOf(parseCatalogId('xtremio_movies_new'), items, { now: t0 });
-    assert.equal(viewKeys(items).length, 2);
+    expect(viewKeys(items).length).toBe(2);
 
     // A list can stay cached across the boundary; the previous featured order must
     // not stay with it.
     sortedOf(parseCatalogId('xtremio_movies_featured'), items, { now: t0 + PERIOD_MS });
-    assert.deepStrictEqual(viewKeys(items), ['featured\nall']);
+    expect(viewKeys(items)).toStrictEqual(['featured\nall']);
 });
 
 test("the featured shuffle still changes with the period, through the cache", () => {
@@ -214,9 +212,11 @@ test("the featured shuffle still changes with the period, through the cache", ()
 
     // Within the period, same source: the memo must hold the order still while
     // paginating — including a day later, which used to be a different order.
-    assert.deepStrictEqual(sortedOf(route, items, { now: t0 + 3600_000 }).map(s => s.stream_id), today);
-    assert.deepStrictEqual(sortedOf(route, items, { now: t0 + DAY_MS }).map(s => s.stream_id), today,
-        'a day is now inside the period, so the order must not move');
+    expect(sortedOf(route, items, { now: t0 + 3600_000 }).map(s => s.stream_id)).toStrictEqual(today);
+    expect(
+        sortedOf(route, items, { now: t0 + DAY_MS }).map(s => s.stream_id),
+        'a day is now inside the period, so the order must not move'
+    ).toStrictEqual(today);
 
     // A handful of items land on the same index by coincidence in any
     // permutation — the expected number of fixed points is 1 whatever the list
@@ -224,7 +224,7 @@ test("the featured shuffle still changes with the period, through the cache", ()
     // that nothing coincides.
     let held = 0;
     for (let i = 0; i < today.length; i++) if (today[i] === tomorrow[i]) held++;
-    assert.ok(held < today.length * 0.1, `a day later, ${held}/${today.length} items held their position`);
+    expect(held, `a day later, ${held}/${today.length} items held their position`).toBeLessThan(today.length * 0.1);
 });
 
 // --- shelves with no comparator -------------------------------------------
@@ -239,8 +239,8 @@ test('an unsorted shelf is passed through and keeps no order', () => {
     const items = [{ stream_id: 3 }, { stream_id: 1 }];
     const out = sortedCatalogItems(CATALOG_KINDS.live, route, { items, source: items, selection: 'all' });
 
-    assert.strictEqual(out, items);
-    assert.equal(sortedCatalogViews.has(items), false);
+    expect(out).toBe(items);
+    expect(sortedCatalogViews.has(items)).toBe(false);
 });
 
 // --- lifetime (M-5) -------------------------------------------------------
@@ -254,8 +254,8 @@ test('a view does not keep the list it was sorted from alive', async () => {
     const viewRef = new WeakRef(sortedOf(route, list));
     list = null;
 
-    assert.ok(await collected(listRef), 'the sorted view kept its source list reachable');
-    assert.ok(await collected(viewRef), 'the view outlived the list it was sorted from');
+    expect(await collected(listRef), 'the sorted view kept its source list reachable').toBeTruthy();
+    expect(await collected(viewRef), 'the view outlived the list it was sorted from').toBeTruthy();
 });
 
 // --- through the route ----------------------------------------------------
@@ -306,12 +306,12 @@ const idsOf = shelf => shelf.metas.map(m => Number(m.id.replace('xtremio_movie_'
 let server;
 let base;
 
-test.before(async () => {
+beforeAll(async () => {
     await new Promise(resolve => { server = app.listen(0, '127.0.0.1', resolve); });
     base = `http://127.0.0.1:${server.address().port}`;
 });
 
-test.after(async () => {
+afterAll(async () => {
     global.fetch = realFetch;
     await new Promise(resolve => server.close(resolve));
 });
@@ -332,19 +332,19 @@ test('paginating a shelf sorts once and pages consistently', async () => {
     const page2 = await getCatalog('xtremio_movies_new', 'skip=100');
     const page3 = await getCatalog('xtremio_movies_new', 'skip=200');
 
-    assert.equal(page1.metas.length, 100);
-    assert.equal(page3.metas.length, 50);
+    expect(page1.metas.length).toBe(100);
+    expect(page3.metas.length).toBe(50);
 
     const ids = [...page1.metas, ...page2.metas, ...page3.metas].map(m => m.id);
-    assert.equal(new Set(ids).size, 250, 'the three pages overlap or drop items');
+    expect(new Set(ids).size, 'the three pages overlap or drop items').toBe(250);
 
     // Newest first, across the page boundaries as well as within a page.
     const added = ids.map(id => Number(id.replace('xtremio_movie_', '')));
-    assert.deepStrictEqual(added, [...added].sort((a, b) => b - a));
+    expect(added).toStrictEqual([...added].sort((a, b) => b - a));
 
     // One sorted view for the shelf, reused by all three pages. The full list is
     // cold, so the genre-less shelf was served from its first category's list.
-    assert.deepStrictEqual(viewKeys(cachedCategoryList(20)), ['new\ncategory:20']);
+    expect(viewKeys(cachedCategoryList(20))).toStrictEqual(['new\ncategory:20']);
 });
 
 test('search is filtered from the sorted list and returns the same items as before', async () => {
@@ -361,8 +361,8 @@ test('search is filtered from the sorted list and returns the same items as befo
         .sort(catalogComparator(MOVIE_KIND, 'new'))
         .map(s => `xtremio_movie_${s.stream_id}`);
 
-    assert.ok(expected.length > 1, 'the fixture should match more than one title');
-    assert.deepStrictEqual(searched.metas.map(m => m.id), expected);
+    expect(expected.length, 'the fixture should match more than one title').toBeGreaterThan(1);
+    expect(searched.metas.map(m => m.id)).toStrictEqual(expected);
 });
 
 test('a genre shelf and the search shelf do not serve each other', async () => {
@@ -377,17 +377,17 @@ test('a genre shelf and the search shelf do not serve each other', async () => {
     // one source, and only the selection tells the two views apart.
     const warmSearch = await getCatalog('xtremio_search_movies', 'search=Movie');
     const warmGenre = await getCatalog('xtremio_movies_new', 'genre=Action');
-    assert.ok(!idsOf(warmSearch).every(isEven), 'search should span both categories');
-    assert.ok(idsOf(warmGenre).every(isEven), 'the genre shelf was served the search view');
-    assert.deepStrictEqual(viewKeys(vodStreamsCache.get(CFG_ARGS)), ['new\nall', 'new\ncategory:20']);
+    expect(idsOf(warmSearch).every(isEven), 'search should span both categories').toBeFalsy();
+    expect(idsOf(warmGenre).every(isEven), 'the genre shelf was served the search view').toBeTruthy();
+    expect(viewKeys(vodStreamsCache.get(CFG_ARGS))).toStrictEqual(['new\nall', 'new\ncategory:20']);
 
     // And the other way round, where the genre shelf comes from a per-category
     // fetch and the two views sit on different sources.
     clearCaches();
     const coldGenre = await getCatalog('xtremio_movies_new', 'genre=Action');
     const coldSearch = await getCatalog('xtremio_search_movies', 'search=Movie');
-    assert.ok(idsOf(coldGenre).every(isEven), 'the genre shelf was served the search view');
-    assert.ok(!idsOf(coldSearch).every(isEven), 'search was served the genre view');
+    expect(idsOf(coldGenre).every(isEven), 'the genre shelf was served the search view').toBeTruthy();
+    expect(idsOf(coldSearch).every(isEven), 'search was served the genre view').toBeFalsy();
 });
 
 test('a list refetched after its TTL is served, not the memoised old order', async () => {
@@ -396,7 +396,7 @@ test('a list refetched after its TTL is served, not the memoised old order', asy
     provided = movies(10);
 
     const before = await getCatalog('xtremio_movies_new', 'skip=0');
-    assert.equal(before.metas.length, 10);
+    expect(before.metas.length).toBe(10);
 
     // The provider gains a title and the lists behind the shelf expire — both of
     // them, because a genre-less shelf resolves to the first category and is
@@ -410,8 +410,8 @@ test('a list refetched after its TTL is served, not the memoised old order', asy
     categoryStreamsCache.map.clear();
 
     const after = await getCatalog('xtremio_movies_new', 'skip=0');
-    assert.equal(after.metas.length, 11);
-    assert.equal(after.metas[0].id, 'xtremio_movie_999', 'served a sorted view of the old list');
+    expect(after.metas.length).toBe(11);
+    expect(after.metas[0].id, 'served a sorted view of the old list').toBe('xtremio_movie_999');
 });
 
 // --- L-11: the key is what was selected, not what was asked for -----------
@@ -425,9 +425,9 @@ test('a genre that search ignores does not mint a view per distinct string', asy
     // filled a cache every account shared with sorts of one list.
     for (let i = 0; i < 20; i++) {
         const page = await getCatalog('xtremio_search_movies', `search=Movie&genre=ignored-${i}`);
-        assert.equal(page.metas.length, 100);
+        expect(page.metas.length).toBe(100);
     }
-    assert.deepStrictEqual(viewKeys(vodStreamsCache.get(CFG_ARGS)), ['new\nall']);
+    expect(viewKeys(vodStreamsCache.get(CFG_ARGS))).toStrictEqual(['new\nall']);
 });
 
 test('a kind with no categories holds one view whatever genre is sent, shared with search', async () => {
@@ -441,12 +441,12 @@ test('a kind with no categories holds one view whatever genre is sent, shared wi
         // The degraded shelf serves the full list for any genre, advertised or not.
         for (const extra of ['genre=Action', 'genre=anything-at-all', `genre=${'x'.repeat(40)}`]) {
             const page = await getCatalog('xtremio_movies_new', extra);
-            assert.equal(page.metas.length, 100, `${extra} should serve the full list`);
+            expect(page.metas.length, `${extra} should serve the full list`).toBe(100);
         }
-        assert.equal((await getCatalog('xtremio_movies_new')).metas.length, 100);
-        assert.equal((await getCatalog('xtremio_search_movies', 'search=Movie')).metas.length, 100);
+        expect((await getCatalog('xtremio_movies_new')).metas.length).toBe(100);
+        expect((await getCatalog('xtremio_search_movies', 'search=Movie')).metas.length).toBe(100);
 
-        assert.deepStrictEqual(viewKeys(vodStreamsCache.get(CFG_ARGS)), ['new\nall']);
+        expect(viewKeys(vodStreamsCache.get(CFG_ARGS))).toStrictEqual(['new\nall']);
     } finally {
         CATS.movies = listed;
     }
@@ -462,12 +462,14 @@ test('evicting a stream list releases it, sorted views and all', async () => {
     await getCatalog('xtremio_search_movies', 'search=Movie');
     await getCatalog('xtremio_movies_popular', 'genre=Action');
     const listRef = new WeakRef(vodStreamsCache.get(CFG_ARGS));
-    assert.deepStrictEqual(viewKeys(listRef.deref()), ['new\nall', 'popular\ncategory:20']);
+    expect(viewKeys(listRef.deref())).toStrictEqual(['new\nall', 'popular\ncategory:20']);
 
     // What the stream cache does to stay within CACHE_MAX_STREAM_MB.
     vodStreamsCache.map.clear();
-    assert.ok(await collected(listRef),
-        'an evicted list stayed reachable — the stream cache bound no longer bounds memory');
+    expect(
+        await collected(listRef),
+        'an evicted list stayed reachable — the stream cache bound no longer bounds memory'
+    ).toBeTruthy();
 });
 
 // --- L-13: search pages past its first 100 matches -------------------------
@@ -483,11 +485,11 @@ test('a search paginates with skip, without overlap and in one order', async () 
     for (const skip of [0, 100, 200]) {
         pages.push(await getCatalog('xtremio_search_movies', `search=Movie&skip=${skip}`));
     }
-    assert.deepStrictEqual(pages.map(p => p.metas.length), [100, 100, 50]);
+    expect(pages.map(p => p.metas.length)).toStrictEqual([100, 100, 50]);
 
     const ids = pages.flatMap(idsOf);
-    assert.equal(new Set(ids).size, 250, 'the pages overlap or drop matches');
-    assert.deepStrictEqual(ids, [...ids].sort((a, b) => b - a), 'newest first across page boundaries');
+    expect(new Set(ids).size, 'the pages overlap or drop matches').toBe(250);
+    expect(ids, 'newest first across page boundaries').toStrictEqual([...ids].sort((a, b) => b - a));
 });
 
 // --- the selection memo (audit Perf) ---------------------------------------
@@ -502,16 +504,18 @@ test('a filtered selection is remembered apart from any order', () => {
     const source = movies(5);
     const items = source.filter(s => s.stream_id % 2 === 0);
 
-    assert.strictEqual(cachedCatalogSelection(source, 'category:20'), null);
-    assert.strictEqual(rememberCatalogSelection(source, 'category:20', items), items,
-        'it returns what it stored, so a call site can do both in one expression');
-    assert.strictEqual(cachedCatalogSelection(source, 'category:20'), items);
+    expect(cachedCatalogSelection(source, 'category:20')).toBeNull();
+    expect(
+        rememberCatalogSelection(source, 'category:20', items),
+        'it returns what it stored, so a call site can do both in one expression'
+    ).toBe(items);
+    expect(cachedCatalogSelection(source, 'category:20')).toBe(items);
 
     // Scoped to the selection, not to the source as a whole.
-    assert.strictEqual(cachedCatalogSelection(source, 'category:21'), null);
+    expect(cachedCatalogSelection(source, 'category:21')).toBeNull();
     // And kept out of the sorted-view key space, which a selection could collide
     // with: a live selection contains the same separator a view key uses.
-    assert.deepStrictEqual(viewKeys(source), []);
+    expect(viewKeys(source)).toStrictEqual([]);
 });
 
 test('cachedCatalogSelection creates nothing when there is none', () => {
@@ -519,8 +523,8 @@ test('cachedCatalogSelection creates nothing when there is none', () => {
     // an entry — empty ones would make the WeakMap grow with misses.
     const source = movies(3);
 
-    assert.strictEqual(cachedCatalogSelection(source, 'category:20'), null);
-    assert.equal(sortedCatalogViews.has(source), false);
+    expect(cachedCatalogSelection(source, 'category:20')).toBeNull();
+    expect(sortedCatalogViews.has(source)).toBe(false);
 });
 
 // Counts the filters run over one cached list without changing its identity: the
@@ -546,7 +550,7 @@ test('a genre shelf filters once, whatever is asked of it afterwards', async () 
 
     await getCatalog('xtremio_search_movies', 'search=Movie');
     const full = vodStreamsCache.get(CFG_ARGS);
-    assert.ok(full, 'the full list should be warm');
+    expect(full, 'the full list should be warm').toBeTruthy();
     const filters = countFilters(full);
 
     const page1 = await getCatalog('xtremio_movies_new', 'genre=Action&skip=0');
@@ -555,21 +559,18 @@ test('a genre shelf filters once, whatever is asked of it afterwards', async () 
     // which is exactly why the two are remembered separately.
     const page3 = await getCatalog('xtremio_movies_popular', 'genre=Action&skip=0');
 
-    assert.equal(page1.metas.length, 100);
-    assert.equal(page2.metas.length, 100);
-    assert.equal(page3.metas.length, 100);
-    assert.equal(
-        filters.n, 1,
+    expect(page1.metas.length).toBe(100);
+    expect(page2.metas.length).toBe(100);
+    expect(page3.metas.length).toBe(100);
+    expect(
+        filters.n,
         `the whole list was filtered ${filters.n} times for three pages of one selection`
-    );
-    assert.deepStrictEqual(
-        viewKeys(full).slice().sort(),
-        [
-            SEARCH_VIEW(),
-            viewKeyFor('xtremio_movies_new', 'category:20'),
-            viewKeyFor('xtremio_movies_popular', 'category:20')
-        ].sort()
-    );
+    ).toBe(1);
+    expect(viewKeys(full).slice().sort()).toStrictEqual([
+        SEARCH_VIEW(),
+        viewKeyFor('xtremio_movies_new', 'category:20'),
+        viewKeyFor('xtremio_movies_popular', 'category:20')
+    ].sort());
 });
 
 test('a refetched list is filtered again, not answered from the old selection', async () => {
@@ -582,20 +583,20 @@ test('a refetched list is filtered again, not answered from the old selection', 
     const filters = countFilters(first);
     await getCatalog('xtremio_movies_new', 'genre=Action');
     await getCatalog('xtremio_movies_new', 'genre=Action');
-    assert.equal(filters.n, 1);
+    expect(filters.n).toBe(1);
 
     // A refetch replaces the array, and identity is what invalidates the memo.
     vodStreamsCache.map.clear();
     provided = movies(120);
     await getCatalog('xtremio_search_movies', 'search=Movie');
     const second = vodStreamsCache.get(CFG_ARGS);
-    assert.notStrictEqual(second, first, 'the test needs a genuinely new array');
+    expect(second, 'the test needs a genuinely new array').not.toBe(first);
 
     const refilters = countFilters(second);
     const page = await getCatalog('xtremio_movies_new', 'genre=Action');
-    assert.equal(refilters.n, 1, 'the new list has to be filtered on its own');
-    assert.equal(page.metas.length, 100);
-    assert.equal(filters.n, 1, 'and the old array was not touched again');
+    expect(refilters.n, 'the new list has to be filtered on its own').toBe(1);
+    expect(page.metas.length).toBe(100);
+    expect(filters.n, 'and the old array was not touched again').toBe(1);
 });
 
 test('the selection memo does not mask the empty-category fallback', async () => {
@@ -618,9 +619,9 @@ test('the selection memo does not mask the empty-category fallback', async () =>
         await getCatalog('xtremio_movies_new', 'genre=Drama');
         await getCatalog('xtremio_movies_new', 'genre=Drama');
 
-        assert.equal(filters.n, 2, 'a category with nothing in the warm list is re-checked');
-        assert.strictEqual(cachedCatalogSelection(full, 'category:21'), null);
-        assert.deepStrictEqual(viewKeys(full), [SEARCH_VIEW()], 'no order was kept for it either');
+        expect(filters.n, 'a category with nothing in the warm list is re-checked').toBe(2);
+        expect(cachedCatalogSelection(full, 'category:21')).toBeNull();
+        expect(viewKeys(full), 'no order was kept for it either').toStrictEqual([SEARCH_VIEW()]);
     } finally {
         CATS.movies = listed;
     }

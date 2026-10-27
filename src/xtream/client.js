@@ -16,7 +16,7 @@ const { CACHE_FAILURE_TTL } = require('../cache/layers.js');
 const LOG_REQUESTS = process.env.LOG_REQUESTS === 'true';
 
 
-// Three deadlines for one upstream call (audit R5): headers, an idle deadline every
+// Three deadlines for one upstream call: headers, an idle deadline every
 // chunk resets so a slow but moving download completes, and an overall one so a
 // trickle cannot hold the request open indefinitely.
 const UPSTREAM_HEADER_TIMEOUT_MS = Math.max(100, Number(process.env.UPSTREAM_HEADER_TIMEOUT_MS) || 15000);
@@ -40,7 +40,7 @@ async function xtremioGet(cfg, action, params = {}, { timeoutMs = UPSTREAM_HEADE
             // The body of an error response is never read, so it has to be
             // cancelled: undici holds that connection out of its pool until the
             // response is garbage collected, and a panel answering every call
-            // with a 5xx HTML page can tie up a socket per call (audit F3).
+            // with a 5xx HTML page can tie up a socket per call.
             discardBody(res);
             throw new Error(`xtremio ${action} failed: HTTP ${res.status}`);
         }

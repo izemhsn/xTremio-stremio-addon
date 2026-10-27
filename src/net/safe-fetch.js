@@ -95,7 +95,7 @@ const PINNED_DISPATCHER = ALLOW_PRIVATE_NETWORKS
 // The pinned dispatcher comes from the undici dependency and fetch() from Node's
 // bundled undici, and not every pairing works. Measured: 6 and 7 interoperate with
 // the fetch in Node 20.18.1, 22 and 24; an undici 8 dispatcher fails every request
-// on 22 and 24. Only pairings outside the measured set warn (audit D2). The versions
+// on 22 and 24. Only pairings outside the measured set warn. The versions
 // are parameters so each branch can be tested.
 const UNDICI_INTEROPERABLE_MAJORS = new Set(['6', '7']);
 
@@ -125,7 +125,7 @@ function blockedOutbound(message) {
     return Object.assign(new Error(message), { code: 'OUTBOUND_BLOCKED' });
 }
 
-// DNS resolution for the SSRF check, with a deadline (audit S6). dns.lookup runs on
+// DNS resolution for the SSRF check, with a deadline. dns.lookup runs on
 // libuv's four-thread pool and cannot be cancelled, so one dead nameserver stalled
 // everyone's relays. c-ares runs off the pool, one resolver per lookup, cancelled
 // at the deadline. It does not read /etc/hosts, hence the localhost check in
@@ -238,7 +238,7 @@ async function assertSafeOutboundUrl(inputUrl, { resolve = resolveHostAddresses 
         throw blockedOutbound(`Blocked private outbound address for ${hostname}`);
     }
     const directIp = net.isIP(hostname) ? [{ address: hostname }] : null;
-    // A host vetted within the pin window is not resolved again (audit P4), which
+    // A host vetted within the pin window is not resolved again, which
     // keeps the resolver off the relay hot path. Only vetted addresses are pinned,
     // and reuse does not extend the pin.
     const pinned = directIp ? null : dnsPins.get(hostname);

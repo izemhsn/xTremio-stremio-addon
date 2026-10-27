@@ -10,12 +10,10 @@
 process.env.CONFIG_SECRET = 'test-secret-for-unit-tests';
 process.env.ALLOW_PRIVATE_NETWORKS = 'true';
 
-const test = require('node:test');
-const assert = require('node:assert');
 const http = require('node:http');
 const net = require('node:net');
 
-const { app, encodeConfig, applyServerTimeouts, proxyInFlight } = require('../index.js');
+const { app, encodeConfig, applyServerTimeouts, proxyInFlight } = require('./support/internals.js');
 
 let provider;
 let server;
@@ -30,7 +28,7 @@ function providerHandler(req, res) {
     setTimeout(() => res.socket.destroy(), 100);
 }
 
-test.before(async () => {
+beforeAll(async () => {
     provider = http.createServer(providerHandler);
     await new Promise(resolve => provider.listen(0, '127.0.0.1', resolve));
     CFG = encodeConfig({
@@ -45,7 +43,7 @@ test.before(async () => {
     applyServerTimeouts(server);
 });
 
-test.after(async () => {
+afterAll(async () => {
     await new Promise(resolve => server.close(resolve));
     await new Promise(resolve => provider.close(resolve));
 });
@@ -86,19 +84,19 @@ function rawGet(path, waitMs) {
 
 test('an upstream that dies mid-body closes the client connection', async () => {
     const r = await rawGet(`/${CFG}/proxy/movie/1.mp4`, 3000);
-    assert.match(r.head, /^HTTP\/1\.1 200/);
-    assert.ok(r.body.length < 1000, `sent ${r.body.length} of the 1,000 bytes promised`);
-    assert.equal(r.how, 'closed', 'the connection stayed open with the response unfinished');
+    expect(r.head).toMatch(/^HTTP\/1\.1 200/);
+    expect(r.body.length, `sent ${r.body.length} of the 1,000 bytes promised`).toBeLessThan(1000);
+    expect(r.how, 'the connection stayed open with the response unfinished').toBe('closed');
 
     // The destroyed response still releases its concurrency slot.
     await new Promise(resolve => setImmediate(resolve));
-    assert.equal(proxyInFlight.size, 0, 'a destroyed relay kept its slot');
+    expect(proxyInFlight.size, 'a destroyed relay kept its slot').toBe(0);
 });
 
 test('an upstream that dies before its first byte gets a complete 502', async () => {
     const r = await rawGet(`/${CFG}/proxy/movie/2.mp4`, 3000);
-    assert.match(r.head, /^HTTP\/1\.1 502/);
-    assert.equal(r.how, 'complete', 'the 502 never finished');
-    assert.equal(r.declared, r.body.length, 'the 502 promised a length it did not deliver');
-    assert.doesNotMatch(r.head, /content-type: *video\/mp4/i, "the 502 kept the movie's content type");
+    expect(r.head).toMatch(/^HTTP\/1\.1 502/);
+    expect(r.how, 'the 502 never finished').toBe('complete');
+    expect(r.declared, 'the 502 promised a length it did not deliver').toBe(r.body.length);
+    expect(r.head, "the 502 kept the movie's content type").not.toMatch(/content-type: *video\/mp4/i);
 });

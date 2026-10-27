@@ -18,14 +18,12 @@ function asString(value) {
     return typeof value === 'string' ? value : '';
 }
 
-// The scheme is matched case-insensitively and then lowercased, because every
-// later test of it is a case-sensitive string comparison: schemeOf, the http ->
-// https upgrade in validateXtremioCredentials, describeDowngrade. A phone's
-// auto-capitalized `Http://` matched none of them and none of this either, so it
-// was prefixed again and became `http://Http://panel`, and /configure went on to
-// look up a host called `http`. Lowercasing here rather than adding an `i` flag
-// at each of those sites is what keeps a typed `HTTPS://` from counting as http
-// and being tried over http, which is the rule audit S7 exists for.
+// Adds `http://` when no scheme was typed, and lowercases a scheme that was.
+// The lowercasing matters: every later check of the scheme (schemeOf,
+// describeDowngrade, the https upgrade in validateXtremioCredentials) is a
+// case-sensitive comparison. Without it, a phone's auto-capitalized `Http://`
+// would become `http://Http://panel`, and a typed `HTTPS://` would be treated
+// as http — and a URL typed as https must never be tried over http.
 function normalizeUrl(url) {
     url = String(url || '').trim().replace(/\/+$/, '');
     if (!url) throw new Error('serverUrl is required');
@@ -146,7 +144,7 @@ function splitList(value) {
 
 // Stremio has no `trailer` meta field: a trailer is an entry in `trailers`,
 // `{ source, type }`, where source is the YouTube video id — so the old key was
-// simply ignored and the button never appeared (audit L2). Panels put either a
+// simply ignored and the button never appeared. Panels put either a
 // bare id or a watch/share URL in `youtube_trailer`, and both are accepted.
 // Anything that does not reduce to an id is dropped rather than passed on: a
 // trailer button that cannot play is worse than no button.

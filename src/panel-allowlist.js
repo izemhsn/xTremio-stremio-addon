@@ -2,7 +2,7 @@
 // module because two separate policies read it — ALLOWED_PANEL_HOSTS here and
 // HLS_TARGET_ALLOWED_HOSTS in the HLS code — and because decodeConfig depends on it:
 // the panel check is enforced inside the token decode so that no route can reach a
-// token without it (audit S3), which makes this a dependency of the crypto rather
+// token without it, which makes this a dependency of the crypto rather
 // than the other way round.
 
 // The hostname a host-list entry or a server URL names, or null. Forgiving about
@@ -44,7 +44,7 @@ function parseHostList(value, name) {
     return hosts;
 }
 
-// Which Xtream panels this instance will serve (audit S3). Empty means any, which
+// Which Xtream panels this instance will serve. Empty means any, which
 // leaves the server usable as a relay through a fake panel; nothing stateless can
 // tell such a panel from a real one, but a list of the real ones can. Set, it is
 // enforced at /configure, on server_info origins and in decodeConfig, since any one

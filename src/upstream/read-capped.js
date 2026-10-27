@@ -54,7 +54,7 @@ async function readJsonCapped(res, label, maxBytes = MAX_UPSTREAM_BYTES, { onChu
     if (Number.isFinite(declared) && declared > maxBytes) {
         // Refused before a byte is read, which means the body is still pending:
         // cancel it, or undici keeps that connection out of its pool until the
-        // response is collected (audit F3). The two caps below already cancel
+        // response is collected. The two caps below already cancel
         // through the reader; this is the one exit that never takes one.
         discardBody(res);
         throw new Error(`${label} response too large: ${declared} bytes exceeds ${maxBytes}`);

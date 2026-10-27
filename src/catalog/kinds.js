@@ -85,7 +85,7 @@ function catalogTypesFor(id) {
 // "no categories" is a fact about an account and a kind, but selectCatalogSource
 // runs on every catalog request, so an account whose category calls are failing
 // wrote the same line for every shelf the client opened — dozens per refresh, and
-// the interesting lines around them scrolled away (audit L6). Once per account and
+// the interesting lines around them scrolled away. Once per account and
 // kind per interval says exactly as much. Bounded and evicted oldest-first,
 // because the accounts come from install URLs rather than from configuration:
 // dropping an entry only re-arms its warning, which is the safe direction.
@@ -112,7 +112,7 @@ function noteDegradedCatalog(cfg, categoryKey, now = Date.now()) {
 // depends only on the source list and the selection — so it is remembered under
 // the selection and consulted before the filter runs. A remembered selection is
 // also proof that the filter found items, which settles the "has items" question
-// below: an empty result is never remembered (audit Perf).
+// below: an empty result is never remembered.
 async function selectCatalogSource(cfg, kind, genre, now = Date.now()) {
     const cats = await getCategories(cfg);
     const categories = cats[kind.categoryKey] || [];
@@ -129,7 +129,7 @@ async function selectCatalogSource(cfg, kind, genre, now = Date.now()) {
     // Stremio marks genre required, but a bare catalog request still falls back
     // to the first category rather than showing an empty shelf.
     const selectedGenre = genre || (categories[0] && categories[0].category_name);
-    // Every category with that name, not the first (audit C3): the manifest offers
+    // Every category with that name, not the first: the manifest offers
     // each name once.
     const ids = [...new Set(categories
         .filter(c => c.category_name === selectedGenre)

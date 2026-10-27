@@ -10,8 +10,6 @@
 process.env.CONFIG_SECRET = 'test-secret-for-unit-tests';
 process.env.ALLOW_PRIVATE_NETWORKS = 'true';
 
-const test = require('node:test');
-const assert = require('node:assert');
 const util = require('node:util');
 
 const {
@@ -20,7 +18,7 @@ const {
     validateXtremioCredentials,
     serverInfoOrigin,
     terminalErrorHandler
-} = require('../index.js');
+} = require('./support/internals.js');
 
 const realFetch = global.fetch;
 
@@ -43,32 +41,29 @@ async function captureConsole(fn) {
     return lines.join('\n');
 }
 
-test.after(() => { global.fetch = realFetch; });
+afterAll(() => { global.fetch = realFetch; });
 
 // --- serverInfoOrigin -------------------------------------------------------
 
 test('a well-formed server_info becomes its origin', () => {
-    assert.equal(serverInfoOrigin({ url: 'line.example.com', port: '8080' }), 'http://line.example.com:8080');
-    assert.equal(
-        serverInfoOrigin({ url: 'line.example.com', server_protocol: 'https', https_port: '8443', port: '8080' }),
-        'https://line.example.com:8443'
-    );
-    assert.equal(serverInfoOrigin({ url: 'line.example.com' }), 'http://line.example.com');
+    expect(serverInfoOrigin({ url: 'line.example.com', port: '8080' })).toBe('http://line.example.com:8080');
+    expect(
+        serverInfoOrigin({ url: 'line.example.com', server_protocol: 'https', https_port: '8443', port: '8080' })
+    ).toBe('https://line.example.com:8443');
+    expect(serverInfoOrigin({ url: 'line.example.com' })).toBe('http://line.example.com');
     // A url that carries its own port is fine, as long as nothing appends another.
-    assert.equal(serverInfoOrigin({ url: 'line.example.com:8080' }), 'http://line.example.com:8080');
+    expect(serverInfoOrigin({ url: 'line.example.com:8080' })).toBe('http://line.example.com:8080');
 });
 
 test('https server_info without an https_port uses the https default, not the http port', () => {
     // Audit S8. It borrowed `port`, giving https://line.example.com:80 — TLS spoken to
     // the http port, which never connects.
-    assert.equal(
-        serverInfoOrigin({ url: 'line.example.com', server_protocol: 'https', https_port: '', port: '80' }),
-        'https://line.example.com'
-    );
-    assert.equal(
-        serverInfoOrigin({ url: 'line.example.com', server_protocol: 'https', port: '8080' }),
-        'https://line.example.com'
-    );
+    expect(
+        serverInfoOrigin({ url: 'line.example.com', server_protocol: 'https', https_port: '', port: '80' })
+    ).toBe('https://line.example.com');
+    expect(
+        serverInfoOrigin({ url: 'line.example.com', server_protocol: 'https', port: '8080' })
+    ).toBe('https://line.example.com');
 });
 
 test('server_info that does not form a bare http(s) origin is refused', () => {
@@ -82,10 +77,10 @@ test('server_info that does not form a bare http(s) origin is refused', () => {
         ['non-http protocol', { url: 'line.example.com', server_protocol: 'ftp' }],
         ['non-numeric port', { url: 'line.example.com', port: 'eighty' }]
     ]) {
-        assert.equal(serverInfoOrigin(si), null, label);
+        expect(serverInfoOrigin(si), label).toBeNull();
     }
-    assert.equal(serverInfoOrigin(null), null);
-    assert.equal(serverInfoOrigin({}), null);
+    expect(serverInfoOrigin(null)).toBeNull();
+    expect(serverInfoOrigin({})).toBeNull();
 });
 
 // --- validation keeps the URL that worked -----------------------------------
@@ -111,10 +106,12 @@ test('an unusable server_info is ignored in favour of the URL that connected', a
         const logged = await captureConsole(async () => {
             result = await validateXtremioCredentials('http://provider.test:8080', 'alice', SECRET);
         });
-        assert.equal(result.valid, true);
-        assert.equal(result.resolvedUrl, 'http://provider.test:8080',
-            `${JSON.stringify(serverInfo)} was baked into the token`);
-        assert.match(logged, /server_info/, 'the operator should hear that the provider named a bad URL');
+        expect(result.valid).toBe(true);
+        expect(
+            result.resolvedUrl,
+            `${JSON.stringify(serverInfo)} was baked into the token`
+        ).toBe('http://provider.test:8080');
+        expect(logged, 'the operator should hear that the provider named a bad URL').toMatch(/server_info/);
     }
 });
 
@@ -126,8 +123,8 @@ test('a panel answering a JSON null is not a valid server, not an unreachable on
         headers: { 'Content-Type': 'application/json' }
     });
     const result = await validateXtremioCredentials('http://provider.test:8080', 'alice', SECRET);
-    assert.equal(result.valid, false);
-    assert.equal(result.error, 'Not a valid xTremio server');
+    expect(result.valid).toBe(false);
+    expect(result.error).toBe('Not a valid xTremio server');
 });
 
 test('every failed attempt is logged, including the http one that is retried', async () => {
@@ -141,11 +138,11 @@ test('every failed attempt is logged, including the http one that is retried', a
     const logged = await captureConsole(async () => {
         result = await validateXtremioCredentials('http://provider.test:8080', 'alice', SECRET);
     });
-    assert.equal(result.valid, false);
-    assert.match(result.error, /^Cannot reach that server/, 'nothing answered, so it really is unreachable');
-    assert.match(logged, /http:\/\/provider\.test:8080 failed: ECONNREFUSED; trying https/);
-    assert.match(logged, /https:\/\/provider\.test:8080 failed: ECONNREFUSED/);
-    assert.ok(!logged.includes(SECRET), 'the log names the origin, never the credentials');
+    expect(result.valid).toBe(false);
+    expect(result.error, 'nothing answered, so it really is unreachable').toMatch(/^Cannot reach that server/);
+    expect(logged).toMatch(/http:\/\/provider\.test:8080 failed: ECONNREFUSED; trying https/);
+    expect(logged).toMatch(/https:\/\/provider\.test:8080 failed: ECONNREFUSED/);
+    expect(logged, 'the log names the origin, never the credentials').not.toContain(SECRET);
 });
 
 test('a server that answers with something other than a panel is not called unreachable', async () => {
@@ -162,9 +159,9 @@ test('a server that answers with something other than a panel is not called unre
         const logged = await captureConsole(async () => {
             result = await validateXtremioCredentials('http://provider.test:8080', 'alice', SECRET);
         });
-        assert.equal(result.valid, false, label);
-        assert.equal(result.error, 'Not a valid xTremio server', label);
-        assert.match(logged, /answered, but not as a panel/, label);
+        expect(result.valid, label).toBe(false);
+        expect(result.error, label).toBe('Not a valid xTremio server');
+        expect(logged, label).toMatch(/answered, but not as a panel/);
     }
 });
 
@@ -179,13 +176,13 @@ test('an http answer still counts when the https retry cannot connect', async ()
     await captureConsole(async () => {
         result = await validateXtremioCredentials('http://provider.test:8080', 'alice', SECRET);
     });
-    assert.equal(result.error, 'Not a valid xTremio server');
+    expect(result.error).toBe('Not a valid xTremio server');
 });
 
 test('a usable server_info is still honoured', async () => {
     stubProvider({ url: 'cdn.provider.test', port: '25461' });
     const result = await validateXtremioCredentials('http://provider.test:8080', 'alice', SECRET);
-    assert.equal(result.resolvedUrl, 'http://cdn.provider.test:25461');
+    expect(result.resolvedUrl).toBe('http://cdn.provider.test:25461');
 });
 
 // --- a named origin has to work before it is adopted (audit S8) ---------------
@@ -224,8 +221,8 @@ test('a named origin is adopted once the credentials have worked there too', asy
 
     const result = await validateXtremioCredentials('http://provider.test:8080', 'alice', SECRET);
 
-    assert.equal(result.resolvedUrl, 'http://cdn.provider.test:25461');
-    assert.deepEqual(asked, ['http://provider.test:8080', 'http://cdn.provider.test:25461']);
+    expect(result.resolvedUrl).toBe('http://cdn.provider.test:25461');
+    expect(asked).toStrictEqual(['http://provider.test:8080', 'http://cdn.provider.test:25461']);
 });
 
 test('a named origin that cannot be reached is not adopted', async () => {
@@ -238,11 +235,11 @@ test('a named origin that cannot be reached is not adopted', async () => {
         result = await validateXtremioCredentials('http://provider.test:8080', 'alice', SECRET);
     });
 
-    assert.equal(result.valid, true, 'the account itself is fine');
-    assert.equal(result.resolvedUrl, 'http://provider.test:8080', 'kept the URL that connected');
-    assert.deepEqual(asked, ['http://provider.test:8080', 'http://10.0.0.5:8080'], 'the named origin was tried');
-    assert.match(logged, /server_info/, 'and the operator hears why it was not used');
-    assert.ok(!logged.includes(SECRET), `the password reached the log:\n${logged}`);
+    expect(result.valid, 'the account itself is fine').toBe(true);
+    expect(result.resolvedUrl, 'kept the URL that connected').toBe('http://provider.test:8080');
+    expect(asked, 'the named origin was tried').toStrictEqual(['http://provider.test:8080', 'http://10.0.0.5:8080']);
+    expect(logged, 'and the operator hears why it was not used').toMatch(/server_info/);
+    expect(logged, `the password reached the log:\n${logged}`).not.toContain(SECRET);
 });
 
 test('a named origin where the credentials do not work is not adopted', async () => {
@@ -253,7 +250,7 @@ test('a named origin where the credentials do not work is not adopted', async ()
 
     const result = await validateXtremioCredentials('http://provider.test:8080', 'alice', SECRET);
 
-    assert.equal(result.resolvedUrl, 'http://provider.test:8080');
+    expect(result.resolvedUrl).toBe('http://provider.test:8080');
 });
 
 test('a server_info naming the origin that connected costs no second request', async () => {
@@ -261,8 +258,8 @@ test('a server_info naming the origin that connected costs no second request', a
 
     const result = await validateXtremioCredentials('http://provider.test:8080', 'alice', SECRET);
 
-    assert.equal(result.resolvedUrl, 'http://provider.test:8080');
-    assert.equal(asked.length, 1);
+    expect(result.resolvedUrl).toBe('http://provider.test:8080');
+    expect(asked.length).toBe(1);
 });
 
 // --- a token that already holds a bad URL -----------------------------------
@@ -280,9 +277,9 @@ test('the proxy answers 502 for a server URL that does not parse, and logs no pa
             res = await realFetch(`http://127.0.0.1:${server.address().port}/${token}/proxy/movie/1.mp4`);
             await res.text();
         });
-        assert.equal(res.status, 502);
-        assert.equal(fetches, 0, 'nothing should have been fetched from a URL that does not parse');
-        assert.ok(!logged.includes(SECRET), `the password reached the log:\n${logged}`);
+        expect(res.status).toBe(502);
+        expect(fetches, 'nothing should have been fetched from a URL that does not parse').toBe(0);
+        expect(logged, `the password reached the log:\n${logged}`).not.toContain(SECRET);
     } finally {
         await new Promise(resolve => server.close(resolve));
     }
@@ -309,7 +306,7 @@ test("the terminal error handler logs a stack, never an error's own properties",
         terminalErrorHandler(err, { method: 'GET', originalUrl: '/proxy/movie/1.mp4' }, res, () => {});
     });
 
-    assert.equal(sentStatus, 500);
-    assert.match(logged, /TypeError: Invalid URL/, 'the stack should still be logged');
-    assert.ok(!logged.includes(SECRET), `the error's input reached the log:\n${logged}`);
+    expect(sentStatus).toBe(500);
+    expect(logged, 'the stack should still be logged').toMatch(/TypeError: Invalid URL/);
+    expect(logged, `the error's input reached the log:\n${logged}`).not.toContain(SECRET);
 });

@@ -72,7 +72,7 @@ function ipv6MatchesPrefix(bytes, prefixBytes, bits) {
 
 const IPV6_PRIVATE_PREFIXES = [
     // ::/96 covers the unspecified address, loopback, and the deprecated
-    // IPv4-compatible form (audit L4). Unlike the wrappers below it is blocked
+    // IPv4-compatible form. Unlike the wrappers below it is blocked
     // whole rather than judged by the IPv4 it embeds: RFC 4291 deprecated the
     // format outright, so nothing legitimate is reached through it, while
     // `::127.0.0.1` is loopback on any host that still accepts one.
@@ -91,7 +91,7 @@ const IPV6_PRIVATE_PREFIXES = [
 // `64:ff9b::7f00:1` is the one that matters — on a NAT64 network it reaches
 // 127.0.0.1, and the old check let it straight through.
 //
-// The IPv4-translated form is the same gap one prefix over (audit F4):
+// The IPv4-translated form is the same gap one prefix over:
 // `::ffff:0:7f00:1` is 127.0.0.1 and `::ffff:0:a9fe:a9fe` is the cloud metadata
 // address, and both read as public while the row was missing. It is only
 // reachable behind a stateless translator, which is why it went unnoticed, but

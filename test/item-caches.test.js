@@ -14,9 +14,6 @@
 process.env.CONFIG_SECRET = 'test-secret-for-unit-tests';
 process.env.ALLOW_PRIVATE_NETWORKS = 'true';
 
-const test = require('node:test');
-const assert = require('node:assert');
-
 const {
     app,
     encodeConfig,
@@ -31,7 +28,7 @@ const {
     liveStreamsCache,
     sweepCaches,
     CACHE_TTL
-} = require('../index.js');
+} = require('./support/internals.js');
 
 const realFetch = global.fetch;
 
@@ -94,17 +91,17 @@ const countOf = (prefix) => calls.filter(c => c === prefix || c.startsWith(`${pr
 let server;
 let base;
 
-test.before(async () => {
+beforeAll(async () => {
     await new Promise(resolve => { server = app.listen(0, '127.0.0.1', resolve); });
     base = `http://127.0.0.1:${server.address().port}`;
 });
 
-test.after(async () => {
+afterAll(async () => {
     global.fetch = realFetch;
     await new Promise(resolve => server.close(resolve));
 });
 
-test.beforeEach(() => { clearCaches(); stubProvider(); });
+beforeEach(() => { clearCaches(); stubProvider(); });
 
 // --- get_vod_info ----------------------------------------------------------
 
@@ -113,8 +110,8 @@ test('repeated getVodInfo calls hit upstream once', async () => {
     await getVodInfo(CFG_ARGS, '101');
     const third = await getVodInfo(CFG_ARGS, '101');
 
-    assert.equal(countOf('get_vod_info'), 1, 'sequential calls must not refetch');
-    assert.deepEqual(third, first);
+    expect(countOf('get_vod_info'), 'sequential calls must not refetch').toBe(1);
+    expect(third).toStrictEqual(first);
 });
 
 test('concurrent getVodInfo calls collapse into one', async () => {
@@ -129,41 +126,41 @@ test('concurrent getVodInfo calls collapse into one', async () => {
     release();
     const results = await all;
 
-    assert.equal(countOf('get_vod_info'), 1, 'five concurrent callers, one upstream call');
-    for (const r of results) assert.deepEqual(r, results[0]);
+    expect(countOf('get_vod_info'), 'five concurrent callers, one upstream call').toBe(1);
+    for (const r of results) expect(r).toStrictEqual(results[0]);
 });
 
 test('different movies and different accounts are cached separately', async () => {
     await getVodInfo(CFG_ARGS, '101');
     await getVodInfo(CFG_ARGS, '102');
-    assert.equal(countOf('get_vod_info'), 2, 'a second movie is a separate entry');
+    expect(countOf('get_vod_info'), 'a second movie is a separate entry').toBe(2);
 
     // Two accounts on the same host can see different content, so a shared key
     // would serve one user's metadata to the other.
     await getVodInfo(OTHER, '101');
-    assert.equal(countOf('get_vod_info'), 3, 'accounts must not share an entry');
+    expect(countOf('get_vod_info'), 'accounts must not share an entry').toBe(3);
 });
 
 test('opening a movie costs one get_vod_info, not two', async () => {
     // The finding in one assertion: meta and stream both need the payload.
     await realFetch(`${base}/${CFG}/meta/XT-Movies/xtremio_movie_101.json`);
     await realFetch(`${base}/${CFG}/stream/XT-Movies/xtremio_movie_101.json`);
-    assert.equal(countOf('get_vod_info'), 1, 'meta + stream must share one call');
+    expect(countOf('get_vod_info'), 'meta + stream must share one call').toBe(1);
 
     // And re-opening it is free until the TTL lapses.
     await realFetch(`${base}/${CFG}/meta/XT-Movies/xtremio_movie_101.json`);
     await realFetch(`${base}/${CFG}/stream/XT-Movies/xtremio_movie_101.json`);
-    assert.equal(countOf('get_vod_info'), 1, 'reopening the same movie must not refetch');
+    expect(countOf('get_vod_info'), 'reopening the same movie must not refetch').toBe(1);
 });
 
 test('the routes still return what they returned before', async () => {
     // Caching must not change the payloads — only how many calls produce them.
     const meta = await (await realFetch(`${base}/${CFG}/meta/XT-Movies/xtremio_movie_101.json`)).json();
-    assert.equal(meta.meta.id, 'xtremio_movie_101');
-    assert.equal(meta.meta.name, 'Movie 101');
+    expect(meta.meta.id).toBe('xtremio_movie_101');
+    expect(meta.meta.name).toBe('Movie 101');
 
     const stream = await (await realFetch(`${base}/${CFG}/stream/XT-Movies/xtremio_movie_101.json`)).json();
-    assert.match(stream.streams[0].url, /\/proxy\/movie\/101\.mp4$/);
+    expect(stream.streams[0].url).toMatch(/\/proxy\/movie\/101\.mp4$/);
 });
 
 // --- L-14: a successful stream answer is cacheable --------------------------
@@ -180,14 +177,14 @@ test('movie and episode stream answers carry cache hints, as the live one does',
     ]) {
         const res = await realFetch(`${base}/${CFG}${path}`);
         const body = await res.json();
-        assert.ok(body.streams.length > 0, `${path} served no stream`);
-        assert.equal(body.cacheMaxAge, 3600, `${path} lost its cacheMaxAge`);
-        assert.equal(res.headers.get('cache-control'), 'private, max-age=3600', path);
+        expect(body.streams.length, `${path} served no stream`).toBeGreaterThan(0);
+        expect(body.cacheMaxAge, `${path} lost its cacheMaxAge`).toBe(3600);
+        expect(res.headers.get('cache-control'), path).toBe('private, max-age=3600');
     }
 
     // A failure is still never cacheable.
     const bad = await realFetch(`${base}/${CFG}/stream/XT-Movies/xtremio_movie_abc.json`);
-    assert.equal(bad.headers.get('cache-control'), 'no-store');
+    expect(bad.headers.get('cache-control')).toBe('no-store');
 });
 
 // --- the per-category fetch ------------------------------------------------
@@ -195,12 +192,12 @@ test('movie and episode stream answers carry cache hints, as the live one does',
 test('repeated per-category fetches hit upstream once', async () => {
     await getCategoryStreams(CFG_ARGS, 'get_vod_streams', '20');
     await getCategoryStreams(CFG_ARGS, 'get_vod_streams', '20');
-    assert.equal(countOf('get_vod_streams'), 1);
+    expect(countOf('get_vod_streams')).toBe(1);
 
     // A different category is a different key, and so is a different account.
     await getCategoryStreams(CFG_ARGS, 'get_vod_streams', '21');
     await getCategoryStreams(OTHER, 'get_vod_streams', '20');
-    assert.equal(countOf('get_vod_streams'), 3);
+    expect(countOf('get_vod_streams')).toBe(3);
 });
 
 test('concurrent per-category fetches collapse into one', async () => {
@@ -210,7 +207,7 @@ test('concurrent per-category fetches collapse into one', async () => {
     );
     release();
     await all;
-    assert.equal(countOf('get_vod_streams'), 1, 'six concurrent callers, one upstream call');
+    expect(countOf('get_vod_streams'), 'six concurrent callers, one upstream call').toBe(1);
 });
 
 test('paginating a genre no longer refetches the category', async () => {
@@ -221,10 +218,10 @@ test('paginating a genre no longer refetches the category', async () => {
 
     for (const skip of [0, 100, 200, 0]) {
         const res = await realFetch(url(skip));
-        assert.equal(res.status, 200);
+        expect(res.status).toBe(200);
     }
-    assert.equal(countOf('get_vod_streams'), 1, 'one category fetch across four page loads');
-    assert.equal(countOf('get_vod_categories'), 1, 'categories are cached too');
+    expect(countOf('get_vod_streams'), 'one category fetch across four page loads').toBe(1);
+    expect(countOf('get_vod_categories'), 'categories are cached too').toBe(1);
 });
 
 test('a warm full list is still preferred over the per-category cache', async () => {
@@ -236,8 +233,8 @@ test('a warm full list is still preferred over the per-category cache', async ()
     );
     const body = await res.json();
 
-    assert.equal(body.metas.length, 2);
-    assert.equal(countOf('get_vod_streams'), 0, 'a warm full list must not trigger a category fetch');
+    expect(body.metas.length).toBe(2);
+    expect(countOf('get_vod_streams'), 'a warm full list must not trigger a category fetch').toBe(0);
 });
 
 // --- the cache primitive ---------------------------------------------------
@@ -246,16 +243,16 @@ test('createKeyedCache bounds entries and expires by TTL', async () => {
     const cache = createKeyedCache({ maxEntries: 3, ttl: 50 });
     for (const key of ['a', 'b', 'c', 'd']) await cache.load(key, async () => key);
 
-    assert.equal(cache.map.size, 3, 'the bound is enforced');
-    assert.equal(cache.get('a'), null, 'the least recently used entry was evicted');
-    assert.equal(cache.get('d'), 'd');
+    expect(cache.map.size, 'the bound is enforced').toBe(3);
+    expect(cache.get('a'), 'the least recently used entry was evicted').toBeNull();
+    expect(cache.get('d')).toBe('d');
 
     await new Promise(r => setTimeout(r, 60));
-    assert.equal(cache.get('d'), null, 'a lapsed entry is not served');
+    expect(cache.get('d'), 'a lapsed entry is not served').toBeNull();
 
     let runs = 0;
     await cache.load('d', async () => { runs++; return 'refetched'; });
-    assert.equal(runs, 1, 'a lapsed entry is refetched');
+    expect(runs, 'a lapsed entry is refetched').toBe(1);
 });
 
 test('createKeyedCache treats a null payload as a hit, not a miss', async () => {
@@ -265,17 +262,17 @@ test('createKeyedCache treats a null payload as a hit, not a miss', async () => 
     let runs = 0;
     const fetcher = async () => { runs++; return null; };
 
-    assert.equal(await cache.load('k', fetcher), null);
-    assert.equal(await cache.load('k', fetcher), null);
-    assert.equal(runs, 1);
+    expect(await cache.load('k', fetcher)).toBeNull();
+    expect(await cache.load('k', fetcher)).toBeNull();
+    expect(runs).toBe(1);
 });
 
 test('a failed fetch is not cached', async () => {
     const cache = createKeyedCache({ maxEntries: 4 });
     let runs = 0;
-    await assert.rejects(() => cache.load('k', async () => { runs++; throw new Error('upstream down'); }));
-    assert.equal(await cache.load('k', async () => { runs++; return 'ok'; }), 'ok');
-    assert.equal(runs, 2, 'the next caller must retry rather than inherit the failure');
+    await expect(cache.load('k', async () => { runs++; throw new Error('upstream down'); })).rejects.toThrow();
+    expect(await cache.load('k', async () => { runs++; return 'ok'; })).toBe('ok');
+    expect(runs, 'the next caller must retry rather than inherit the failure').toBe(2);
 });
 
 test('the sweeper reaches both new caches', async () => {
@@ -283,11 +280,11 @@ test('the sweeper reaches both new caches', async () => {
     // something new arrives, which for an idle instance is never.
     await getVodInfo(CFG_ARGS, '101');
     await getCategoryStreams(CFG_ARGS, 'get_vod_streams', '20');
-    assert.equal(vodInfoCache.map.size, 1);
-    assert.equal(categoryStreamsCache.map.size, 1);
+    expect(vodInfoCache.map.size).toBe(1);
+    expect(categoryStreamsCache.map.size).toBe(1);
 
     const dropped = sweepCaches(Date.now() + CACHE_TTL + 1);
-    assert.ok(dropped >= 2, `expected both entries swept, dropped ${dropped}`);
-    assert.equal(vodInfoCache.map.size, 0);
-    assert.equal(categoryStreamsCache.map.size, 0);
+    expect(dropped, `expected both entries swept, dropped ${dropped}`).toBeGreaterThanOrEqual(2);
+    expect(vodInfoCache.map.size).toBe(0);
+    expect(categoryStreamsCache.map.size).toBe(0);
 });

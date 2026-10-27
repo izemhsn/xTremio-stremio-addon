@@ -2,29 +2,26 @@
 // The keys are derived at module load, so the secret must be set before require.
 process.env.CONFIG_SECRET = 'test-secret-for-unit-tests';
 
-const test = require('node:test');
-const assert = require('node:assert');
-
-const { encodeConfig, decodeConfig, validateConfig, CONFIG_TOKEN_VERSION } = require('../index.js');
+const { encodeConfig, decodeConfig, validateConfig, CONFIG_TOKEN_VERSION } = require('./support/internals.js');
 
 const CFG = { serverUrl: 'http://example.com:8080', username: 'user', password: 'pass' };
 
 test('a token round-trips back to the original config', () => {
     const decoded = decodeConfig(encodeConfig(CFG));
-    assert.deepStrictEqual(decoded, CFG);
+    expect(decoded).toStrictEqual(CFG);
 });
 
 test('encoding is non-deterministic (fresh IV per token)', () => {
     // Two tokens for the same config must differ, or the IV is being reused.
-    assert.notStrictEqual(encodeConfig(CFG), encodeConfig(CFG));
-    assert.deepStrictEqual(decodeConfig(encodeConfig(CFG)), CFG);
+    expect(encodeConfig(CFG)).not.toBe(encodeConfig(CFG));
+    expect(decodeConfig(encodeConfig(CFG))).toStrictEqual(CFG);
 });
 
 test('token has the expected five-part shape, stamped with the current version', () => {
     const parts = encodeConfig(CFG).split('.');
-    assert.strictEqual(parts.length, 5);
-    assert.strictEqual(parts[0], CONFIG_TOKEN_VERSION);
-    assert.ok(parts.every(p => p.length > 0));
+    expect(parts.length).toBe(5);
+    expect(parts[0]).toBe(CONFIG_TOKEN_VERSION);
+    expect(parts.every(p => p.length > 0)).toBeTruthy();
 });
 
 test('a v2 token no longer decodes', () => {
@@ -34,16 +31,16 @@ test('a v2 token no longer decodes', () => {
     const v2 = 'v2.q9Vf9SN04Nl0bBlH.BTym1Up_IjiRPlPBX-l-sw.2fiyK_ckFA51bHtKufoGX7o2'
         + 'HG5gKhCJhMNvA5qwca-EZAVeN3aauwJCao9Ftl-hWZlLEoEBiklnzLCPTEPM8H19_SfLGFO80Q'
         + '.qCaWmtL9bYh8pG9JnBiWPum4zzaHvZ75N6YTlmCtFtA';
-    assert.notStrictEqual(CONFIG_TOKEN_VERSION, 'v2');
-    assert.strictEqual(decodeConfig(v2), null);
+    expect(CONFIG_TOKEN_VERSION).not.toBe('v2');
+    expect(decodeConfig(v2)).toBeNull();
 });
 
 test('credentials do not appear in plaintext anywhere in the token', () => {
     const token = encodeConfig(CFG);
-    assert.ok(!token.includes('pass'));
-    assert.ok(!token.includes('user'));
-    assert.ok(!token.includes('example.com'));
-    assert.ok(!Buffer.from(token, 'base64url').toString('utf8').includes('pass'));
+    expect(token).not.toContain('pass');
+    expect(token).not.toContain('user');
+    expect(token).not.toContain('example.com');
+    expect(Buffer.from(token, 'base64url').toString('utf8')).not.toContain('pass');
 });
 
 test('tampering with any part is rejected', () => {
@@ -53,25 +50,25 @@ test('tampering with any part is rejected', () => {
         const mangled = [...parts];
         const original = mangled[i];
         mangled[i] = (original[0] === 'A' ? 'B' : 'A') + original.slice(1);
-        assert.strictEqual(decodeConfig(mangled.join('.')), null, `part ${i} tamper not rejected`);
+        expect(decodeConfig(mangled.join('.')), `part ${i} tamper not rejected`).toBeNull();
     }
 });
 
 test('a stripped or altered version prefix is rejected', () => {
     const parts = encodeConfig(CFG).split('.');
     parts[0] = 'v1';
-    assert.strictEqual(decodeConfig(parts.join('.')), null);
+    expect(decodeConfig(parts.join('.'))).toBeNull();
 });
 
 test('malformed input is rejected without throwing', () => {
     const V = CONFIG_TOKEN_VERSION;
     for (const bad of ['', null, undefined, 'notatoken', `${V}.a.b.c`, `${V}.a.b.c.d.e`, {}, 42]) {
-        assert.strictEqual(decodeConfig(bad), null, `not rejected: ${String(bad)}`);
+        expect(decodeConfig(bad), `not rejected: ${String(bad)}`).toBeNull();
     }
 });
 
 test('over-long input is rejected before any crypto work', () => {
-    assert.strictEqual(decodeConfig(`${CONFIG_TOKEN_VERSION}.` + 'A'.repeat(5000)), null);
+    expect(decodeConfig(`${CONFIG_TOKEN_VERSION}.` + 'A'.repeat(5000))).toBeNull();
 });
 
 test('a token minted under a different secret does not decode', () => {
@@ -80,31 +77,34 @@ test('a token minted under a different secret does not decode', () => {
     // that a version bump would silently reduce to a version-mismatch test.
     const { execFileSync } = require('node:child_process');
     const foreign = execFileSync(process.execPath, ['-e', `
-        const m = require(${JSON.stringify(require.resolve('../index.js'))});
+        const m = require(${JSON.stringify(require.resolve('./support/internals.js'))});
         process.stdout.write(m.encodeConfig(${JSON.stringify(CFG)}));
     `], {
         env: { ...process.env, CONFIG_SECRET: 'a-completely-different-secret-value-here' },
         encoding: 'utf8'
     }).trim();
 
-    assert.ok(foreign.startsWith(`${CONFIG_TOKEN_VERSION}.`), `expected a current-version token, got ${foreign.slice(0, 16)}`);
-    assert.strictEqual(decodeConfig(foreign), null);
+    expect(
+        foreign.startsWith(`${CONFIG_TOKEN_VERSION}.`),
+        `expected a current-version token, got ${foreign.slice(0, 16)}`
+    ).toBeTruthy();
+    expect(decodeConfig(foreign)).toBeNull();
 });
 
 test('validateConfig requires all three fields as non-empty strings', () => {
-    assert.deepStrictEqual(validateConfig(CFG), CFG);
-    assert.strictEqual(validateConfig({ serverUrl: 'x', username: 'y' }), null);
-    assert.strictEqual(validateConfig({ serverUrl: 'x', username: 'y', password: '' }), null);
-    assert.strictEqual(validateConfig({ serverUrl: 'x', username: 'y', password: 123 }), null);
-    assert.strictEqual(validateConfig(null), null);
-    assert.strictEqual(validateConfig('string'), null);
+    expect(validateConfig(CFG)).toStrictEqual(CFG);
+    expect(validateConfig({ serverUrl: 'x', username: 'y' })).toBeNull();
+    expect(validateConfig({ serverUrl: 'x', username: 'y', password: '' })).toBeNull();
+    expect(validateConfig({ serverUrl: 'x', username: 'y', password: 123 })).toBeNull();
+    expect(validateConfig(null)).toBeNull();
+    expect(validateConfig('string')).toBeNull();
 });
 
 test('validateConfig drops unexpected fields', () => {
     const extra = { ...CFG, admin: true, __proto__: { polluted: true } };
-    assert.deepStrictEqual(validateConfig(extra), CFG);
+    expect(validateConfig(extra)).toStrictEqual(CFG);
 });
 
 test('encodeConfig refuses an invalid config', () => {
-    assert.throws(() => encodeConfig({ serverUrl: 'x' }), /Invalid config/);
+    expect(() => encodeConfig({ serverUrl: 'x' })).toThrow(/Invalid config/);
 });

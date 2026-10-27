@@ -14,16 +14,13 @@ process.env.CONFIG_SECRET = 'test-secret-for-unit-tests';
 process.env.ALLOW_PRIVATE_NETWORKS = 'true';
 process.env.HLS_TARGET_ALLOWED_HOSTS = 'extra-cdn.example.net';
 
-const test = require('node:test');
-const assert = require('node:assert');
-
 const {
     makeHlsProxyMapper,
     hlsTargetOrigins,
     rewriteHlsPlaylist,
     decodeHlsTarget,
     HLS_TARGET_ALLOWED_HOSTS
-} = require('../index.js');
+} = require('./support/internals.js');
 
 const PANEL = 'http://panel.example.com:8080';
 const CDN = 'http://185.217.39.88';
@@ -37,11 +34,11 @@ function mapper() {
 }
 
 test('the derived set is origins, not URLs', () => {
-    assert.deepEqual([...ALLOWED].sort(), [CDN, PANEL].sort());
+    expect([...ALLOWED].sort()).toStrictEqual([CDN, PANEL].sort());
     // A path on an allowed origin contributes that origin and nothing more.
-    assert.deepEqual([...hlsTargetOrigins('http://a.test/deep/path?q=1')], ['http://a.test']);
+    expect([...hlsTargetOrigins('http://a.test/deep/path?q=1')]).toStrictEqual(['http://a.test']);
     // Unusable candidates are skipped rather than throwing.
-    assert.deepEqual([...hlsTargetOrigins(null, undefined, '', 'not a url')], []);
+    expect([...hlsTargetOrigins(null, undefined, '', 'not a url')]).toStrictEqual([]);
 });
 
 test('the CDN the playlist actually came from is signable', async () => {
@@ -49,21 +46,23 @@ test('the CDN the playlist actually came from is signable', async () => {
     // 302 the playlist to a different host, and this account's segments arrive
     // from a bare IP that is not the panel hostname at all.
     const signed = await mapper()(`${CDN}/hls/abc/28939_5867.ts`);
-    assert.ok(signed?.startsWith('https://addon.test/CFG/proxy/hls?'), `unexpected: ${signed}`);
+    expect(
+        signed?.startsWith('https://addon.test/CFG/proxy/hls?'),
+        `unexpected: ${signed}`
+    ).toBeTruthy();
 
     const { searchParams } = new URL(signed);
-    assert.equal(
-        decodeHlsTarget(searchParams.get('u'), searchParams.get('s'), searchParams.get('e'), 'CFG')?.url,
-        `${CDN}/hls/abc/28939_5867.ts`
-    );
+    expect(
+        decodeHlsTarget(searchParams.get('u'), searchParams.get('s'), searchParams.get('e'), 'CFG')?.url
+    ).toBe(`${CDN}/hls/abc/28939_5867.ts`);
 });
 
 test('the account panel is signable, including its own port', async () => {
-    assert.ok(await mapper()(`${PANEL}/live/u/p/2.ts`));
+    expect(await mapper()(`${PANEL}/live/u/p/2.ts`)).toBeTruthy();
     // A different port is a different origin, and is not the configured panel.
-    assert.equal(await mapper()('http://panel.example.com:9090/live/u/p/2.ts'), null);
+    expect(await mapper()('http://panel.example.com:9090/live/u/p/2.ts')).toBeNull();
     // Nor is the same host over a different scheme.
-    assert.equal(await mapper()('https://panel.example.com:8080/live/u/p/2.ts'), null);
+    expect(await mapper()('https://panel.example.com:8080/live/u/p/2.ts')).toBeNull();
 });
 
 test('an unrelated public host is refused, which is the finding', async () => {
@@ -73,27 +72,27 @@ test('an unrelated public host is refused, which is the finding', async () => {
         'https://www.iana.org/unrelated/asset.ts',
         'http://attacker.example.org/4gb-of-egress.bin'
     ]) {
-        assert.equal(await mapper()(target), null, `${target} must not be signed`);
+        expect(await mapper()(target), `${target} must not be signed`).toBeNull();
     }
 });
 
 test('HLS_TARGET_ALLOWED_HOSTS is the operator escape hatch', async () => {
-    assert.ok(HLS_TARGET_ALLOWED_HOSTS.has('extra-cdn.example.net'));
+    expect(HLS_TARGET_ALLOWED_HOSTS.has('extra-cdn.example.net')).toBeTruthy();
     // Matched by hostname, so one entry covers both schemes and any port — a
     // provider serving playlists over http and segments over https needs one.
-    assert.ok(await mapper()('http://extra-cdn.example.net/seg.ts'));
-    assert.ok(await mapper()('https://extra-cdn.example.net:8443/seg.ts'));
+    expect(await mapper()('http://extra-cdn.example.net/seg.ts')).toBeTruthy();
+    expect(await mapper()('https://extra-cdn.example.net:8443/seg.ts')).toBeTruthy();
     // And it is not a substring match.
-    assert.equal(await mapper()('http://evil-extra-cdn.example.net/seg.ts'), null);
-    assert.equal(await mapper()('http://extra-cdn.example.net.evil.test/seg.ts'), null);
+    expect(await mapper()('http://evil-extra-cdn.example.net/seg.ts')).toBeNull();
+    expect(await mapper()('http://extra-cdn.example.net.evil.test/seg.ts')).toBeNull();
 });
 
 test('a mapper built without an origin set signs nothing', async () => {
     // Fail closed: a call site that forgets the argument must not silently
     // restore the open relay. Every real caller passes one.
     const forgetful = makeHlsProxyMapper('https://addon.test', 'CFG');
-    assert.equal(await forgetful(`${CDN}/hls/abc/1.ts`), null);
-    assert.equal(await forgetful(`${PANEL}/live/u/p/1.ts`), null);
+    expect(await forgetful(`${CDN}/hls/abc/1.ts`)).toBeNull();
+    expect(await forgetful(`${PANEL}/live/u/p/1.ts`)).toBeNull();
 });
 
 test('a playlist naming a host it may not proxy is refused whole', async () => {
@@ -116,10 +115,9 @@ test('a playlist naming a host it may not proxy is refused whole', async () => {
         ''
     ].join('\n');
 
-    await assert.rejects(
-        () => rewriteHlsPlaylist(playlist, `${CDN}/hls/abc/1.m3u8`, mapper()),
-        (e) => e.code === 'PLAYLIST_TARGET_REFUSED'
-    );
+    await expect(rewriteHlsPlaylist(playlist, `${CDN}/hls/abc/1.m3u8`, mapper())).rejects.toMatchObject({
+        code: 'PLAYLIST_TARGET_REFUSED'
+    });
 });
 
 test('a playlist naming only allowed origins is rewritten in full', async () => {
@@ -137,7 +135,7 @@ test('a playlist naming only allowed origins is rewritten in full', async () => 
 
     const out = await rewriteHlsPlaylist(playlist, `${CDN}/hls/abc/1.m3u8`, mapper());
 
-    assert.equal((out.match(/proxy\/hls\?/g) || []).length, 3, 'key and both segments signed');
-    assert.ok(!out.includes(`${CDN}/hls/abc/1.ts`), 'the provider segment must not be relayed raw');
-    assert.ok(!out.includes(`${PANEL}/live/u/p/2.ts`), 'the panel URL must not be relayed raw');
+    expect((out.match(/proxy\/hls\?/g) || []).length, 'key and both segments signed').toBe(3);
+    expect(out, 'the provider segment must not be relayed raw').not.toContain(`${CDN}/hls/abc/1.ts`);
+    expect(out, 'the panel URL must not be relayed raw').not.toContain(`${PANEL}/live/u/p/2.ts`);
 });

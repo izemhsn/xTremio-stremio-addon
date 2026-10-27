@@ -4,9 +4,6 @@
 process.env.CONFIG_SECRET = 'test-secret-for-unit-tests';
 process.env.ALLOW_PRIVATE_NETWORKS = 'true';
 
-const test = require('node:test');
-const assert = require('node:assert');
-
 const {
     validateXtremioCredentials,
     describeDowngrade,
@@ -14,7 +11,7 @@ const {
     renderConfigPage,
     CONFIGURE_TIMEOUT_MS,
     CONFIGURE_PROBE_TIMEOUT_MS
-} = require('../index.js');
+} = require('./support/internals.js');
 
 const realFetch = global.fetch;
 
@@ -41,28 +38,31 @@ function stubProvider({ works = ['https'], serverInfo = null } = {}) {
     return attempted;
 }
 
-test.after(() => { global.fetch = realFetch; });
+afterAll(() => { global.fetch = realFetch; });
 
 // --- the pure helpers ------------------------------------------------------
 
 test('schemeOf reads the scheme, defaulting to http', () => {
-    assert.strictEqual(schemeOf('https://a.test'), 'https');
-    assert.strictEqual(schemeOf('http://a.test'), 'http');
-    assert.strictEqual(schemeOf(''), 'http');
-    assert.strictEqual(schemeOf(undefined), 'http');
+    expect(schemeOf('https://a.test')).toBe('https');
+    expect(schemeOf('http://a.test')).toBe('http');
+    expect(schemeOf('')).toBe('http');
+    expect(schemeOf(undefined)).toBe('http');
 });
 
 test('describeDowngrade only fires on a real https to http drop', () => {
-    assert.deepStrictEqual(
-        describeDowngrade('https://a.test', 'http://a.test', 'fallback'),
-        { from: 'https', to: 'http', source: 'fallback' }
-    );
-    assert.strictEqual(describeDowngrade('http://a.test', 'http://a.test', 'fallback'), null,
-        'http to http is not a downgrade');
-    assert.strictEqual(describeDowngrade('https://a.test', 'https://a.test', 'fallback'), null,
-        'https preserved is not a downgrade');
-    assert.strictEqual(describeDowngrade('http://a.test', 'https://a.test', 'fallback'), null,
-        'an upgrade is not a downgrade');
+    expect(describeDowngrade('https://a.test', 'http://a.test', 'fallback')).toStrictEqual({ from: 'https', to: 'http', source: 'fallback' });
+    expect(
+        describeDowngrade('http://a.test', 'http://a.test', 'fallback'),
+        'http to http is not a downgrade'
+    ).toBeNull();
+    expect(
+        describeDowngrade('https://a.test', 'https://a.test', 'fallback'),
+        'https preserved is not a downgrade'
+    ).toBeNull();
+    expect(
+        describeDowngrade('http://a.test', 'https://a.test', 'fallback'),
+        'an upgrade is not a downgrade'
+    ).toBeNull();
 });
 
 // --- the fallback route ----------------------------------------------------
@@ -77,10 +77,10 @@ test('an https request that falls back to http is reported', async () => {
     // cleartext on the user's behalf.
     const result = await validateXtremioCredentials('https://provider.test', 'u', 'p');
 
-    assert.strictEqual(result.valid, false, 'https that fails is never retried over http');
-    assert.deepStrictEqual(attempted, ['https'], 'no request went out over http');
-    assert.match(result.error, /over https/);
-    assert.match(result.error, /http:\/\//, 'and the user is told how to choose http themselves');
+    expect(result.valid, 'https that fails is never retried over http').toBe(false);
+    expect(attempted, 'no request went out over http').toStrictEqual(['https']);
+    expect(result.error).toMatch(/over https/);
+    expect(result.error, 'and the user is told how to choose http themselves').toMatch(/http:\/\//);
 });
 
 test('without a scheme, https is tried before the password can go out in cleartext', async () => {
@@ -92,10 +92,10 @@ test('without a scheme, https is tried before the password can go out in clearte
 
     const result = await validateXtremioCredentials('provider.test', 'u', 'p');
 
-    assert.deepStrictEqual(attempted, ['https'], 'nothing went out over http');
-    assert.strictEqual(result.valid, true);
-    assert.match(result.resolvedUrl, /^https:/);
-    assert.strictEqual(result.downgrade, null);
+    expect(attempted, 'nothing went out over http').toStrictEqual(['https']);
+    expect(result.valid).toBe(true);
+    expect(result.resolvedUrl).toMatch(/^https:/);
+    expect(result.downgrade).toBeNull();
 });
 
 test('a scheme-less URL still reaches an http-only panel, just second', async () => {
@@ -105,11 +105,11 @@ test('a scheme-less URL still reaches an http-only panel, just second', async ()
 
     const result = await validateXtremioCredentials('provider.test', 'u', 'p');
 
-    assert.deepStrictEqual(attempted, ['https', 'http'], 'https first, then what works');
-    assert.strictEqual(result.valid, true);
-    assert.match(result.resolvedUrl, /^http:/, 'the panel that answered is the one baked into the token');
+    expect(attempted, 'https first, then what works').toStrictEqual(['https', 'http']);
+    expect(result.valid).toBe(true);
+    expect(result.resolvedUrl, 'the panel that answered is the one baked into the token').toMatch(/^http:/);
     // Not a downgrade: they never asked for https, so there is nothing they lost.
-    assert.strictEqual(result.downgrade, null);
+    expect(result.downgrade).toBeNull();
 });
 
 test('a typed http:// is still tried first, with https only as the upgrade', async () => {
@@ -118,8 +118,8 @@ test('a typed http:// is still tried first, with https only as the upgrade', asy
 
     const result = await validateXtremioCredentials('http://provider.test', 'u', 'p');
 
-    assert.strictEqual(result.valid, true);
-    assert.deepStrictEqual(attempted, ['http'], 'what the user asked for is what is used');
+    expect(result.valid).toBe(true);
+    expect(attempted, 'what the user asked for is what is used').toStrictEqual(['http']);
 });
 
 // Audit F1. The two halves of the case fix, asserted where the scheme order is
@@ -132,9 +132,9 @@ test('a typed Http:// reaches the panel over http, not a host called http', asyn
 
     const result = await validateXtremioCredentials('Http://provider.test', 'u', 'p');
 
-    assert.strictEqual(result.valid, true);
-    assert.deepStrictEqual(attempted, ['http'], 'the typed scheme is honoured, not re-prefixed');
-    assert.strictEqual(result.resolvedUrl, 'http://provider.test');
+    expect(result.valid).toBe(true);
+    expect(attempted, 'the typed scheme is honoured, not re-prefixed').toStrictEqual(['http']);
+    expect(result.resolvedUrl).toBe('http://provider.test');
 });
 
 test('a typed HTTPS:// is never tried over http', async () => {
@@ -142,8 +142,8 @@ test('a typed HTTPS:// is never tried over http', async () => {
 
     const result = await validateXtremioCredentials('HTTPS://provider.test', 'u', 'p');
 
-    assert.strictEqual(result.valid, false, 'https that fails is never retried over http');
-    assert.deepStrictEqual(attempted, ['https'], 'the password never went out in cleartext');
+    expect(result.valid, 'https that fails is never retried over http').toBe(false);
+    expect(attempted, 'the password never went out in cleartext').toStrictEqual(['https']);
 });
 
 test('the guessed scheme is bounded by the shorter deadline, not the full one', async () => {
@@ -151,10 +151,10 @@ test('the guessed scheme is bounded by the shorter deadline, not the full one', 
     // behind a firewalled 443 hangs instead — and that wait is paid by every
     // scheme-less /configure. The attempt the user did not ask for gets the probe
     // deadline; the one they did gets the full one.
-    assert.ok(
-        CONFIGURE_PROBE_TIMEOUT_MS < CONFIGURE_TIMEOUT_MS,
+    expect(
+        CONFIGURE_PROBE_TIMEOUT_MS,
         'a guess must not cost as much as a request the user actually made'
-    );
+    ).toBeLessThan(CONFIGURE_TIMEOUT_MS);
 
     const deadlines = [];
     const realSetTimeout = global.setTimeout;
@@ -173,7 +173,7 @@ test('the guessed scheme is bounded by the shorter deadline, not the full one', 
     const attemptDeadlines = deadlines.filter(
         ms => ms === CONFIGURE_PROBE_TIMEOUT_MS || ms === CONFIGURE_TIMEOUT_MS
     );
-    assert.deepStrictEqual(attemptDeadlines, [CONFIGURE_PROBE_TIMEOUT_MS, CONFIGURE_TIMEOUT_MS]);
+    expect(attemptDeadlines).toStrictEqual([CONFIGURE_PROBE_TIMEOUT_MS, CONFIGURE_TIMEOUT_MS]);
 });
 
 test('https that works is never reported as downgraded', async () => {
@@ -181,8 +181,8 @@ test('https that works is never reported as downgraded', async () => {
 
     const result = await validateXtremioCredentials('https://provider.test', 'u', 'p');
 
-    assert.strictEqual(result.valid, true);
-    assert.strictEqual(result.downgrade, null, 'nothing to warn about');
+    expect(result.valid).toBe(true);
+    expect(result.downgrade, 'nothing to warn about').toBeNull();
 });
 
 test('a user who asked for http is not warned about getting http', async () => {
@@ -190,8 +190,8 @@ test('a user who asked for http is not warned about getting http', async () => {
 
     const result = await validateXtremioCredentials('http://provider.test', 'u', 'p');
 
-    assert.strictEqual(result.valid, true);
-    assert.strictEqual(result.downgrade, null, 'they never asked for https');
+    expect(result.valid).toBe(true);
+    expect(result.downgrade, 'they never asked for https').toBeNull();
 });
 
 // --- the provider-controlled route -----------------------------------------
@@ -207,9 +207,9 @@ test('a provider cannot move someone who asked for https onto http', async () =>
 
     const result = await validateXtremioCredentials('https://provider.test', 'u', 'p');
 
-    assert.strictEqual(result.valid, true);
-    assert.strictEqual(result.downgrade, null);
-    assert.match(result.resolvedUrl, /^https:\/\/provider\.test/, 'the https URL that connected is kept');
+    expect(result.valid).toBe(true);
+    expect(result.downgrade).toBeNull();
+    expect(result.resolvedUrl, 'the https URL that connected is kept').toMatch(/^https:\/\/provider\.test/);
 });
 
 test('a provider downgrade is still reported where the user never asked for https', async () => {
@@ -227,9 +227,8 @@ test('a provider downgrade is still reported where the user never asked for http
 
     const result = await validateXtremioCredentials('provider.test', 'u', 'p');
 
-    assert.deepStrictEqual(result.downgrade, { from: 'https', to: 'http', source: 'provider' },
-        'attributed to the provider, not the fallback');
-    assert.match(result.resolvedUrl, /^http:\/\/provider\.test:8080/);
+    expect(result.downgrade, 'attributed to the provider, not the fallback').toStrictEqual({ from: 'https', to: 'http', source: 'provider' });
+    expect(result.resolvedUrl).toMatch(/^http:\/\/provider\.test:8080/);
 });
 
 test('a provider that keeps https is not reported', async () => {
@@ -239,7 +238,7 @@ test('a provider that keeps https is not reported', async () => {
     });
 
     const result = await validateXtremioCredentials('https://provider.test', 'u', 'p');
-    assert.strictEqual(result.downgrade, null);
+    expect(result.downgrade).toBeNull();
 });
 
 // --- what the user actually sees -------------------------------------------
@@ -254,10 +253,10 @@ test('the configure page warns when the connection was downgraded', () => {
 
     // Match the banner markup, not the class name — the stylesheet mentions
     // `status-warning` on every render whether or not a banner is shown.
-    assert.match(html, /status-banner status-warning/, 'a warning banner is rendered');
-    assert.match(html, /Connected over http, not https/);
-    assert.match(html, /cleartext/, 'the actual consequence is spelled out');
-    assert.match(html, /https connection failed/, 'and the fallback cause is named');
+    expect(html, 'a warning banner is rendered').toMatch(/status-banner status-warning/);
+    expect(html).toMatch(/Connected over http, not https/);
+    expect(html, 'the actual consequence is spelled out').toMatch(/cleartext/);
+    expect(html, 'and the fallback cause is named').toMatch(/https connection failed/);
 });
 
 test('the page explains a provider-caused downgrade differently', () => {
@@ -268,8 +267,8 @@ test('the page explains a provider-caused downgrade differently', () => {
         status: { valid: true, userInfo: OK_USER, downgrade: { from: 'https', to: 'http', source: 'provider' } }
     });
 
-    assert.match(html, /provider asked for http/, 'the cause is attributed correctly');
-    assert.doesNotMatch(html, /https connection failed/, 'and not blamed on a failed connection');
+    expect(html, 'the cause is attributed correctly').toMatch(/provider asked for http/);
+    expect(html, 'and not blamed on a failed connection').not.toMatch(/https connection failed/);
 });
 
 test('a clean connection renders no warning at all', () => {
@@ -280,7 +279,7 @@ test('a clean connection renders no warning at all', () => {
         status: { valid: true, userInfo: OK_USER, downgrade: null }
     });
 
-    assert.doesNotMatch(html, /status-banner status-warning/, 'no warning banner');
-    assert.doesNotMatch(html, /cleartext/, 'and no scare text anywhere');
-    assert.match(html, /status-banner status-success/, 'just the success banner');
+    expect(html, 'no warning banner').not.toMatch(/status-banner status-warning/);
+    expect(html, 'and no scare text anywhere').not.toMatch(/cleartext/);
+    expect(html, 'just the success banner').toMatch(/status-banner status-success/);
 });

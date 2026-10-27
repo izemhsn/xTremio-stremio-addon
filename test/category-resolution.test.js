@@ -11,9 +11,6 @@
 process.env.CONFIG_SECRET = 'test-secret-for-unit-tests';
 process.env.ALLOW_PRIVATE_NETWORKS = 'true';
 
-const test = require('node:test');
-const assert = require('node:assert');
-
 const {
     app,
     encodeConfig,
@@ -22,7 +19,7 @@ const {
     vodStreamsCache,
     seriesStreamsCache,
     liveStreamsCache
-} = require('../index.js');
+} = require('./support/internals.js');
 
 const realFetch = global.fetch;
 const CFG = encodeConfig({ serverUrl: 'http://provider.test:8080', username: 'alice', password: 'secret' });
@@ -93,17 +90,17 @@ function clearCaches() {
 let server;
 let base;
 
-test.before(async () => {
+beforeAll(async () => {
     await new Promise(resolve => { server = app.listen(0, '127.0.0.1', resolve); });
     base = `http://127.0.0.1:${server.address().port}`;
 });
 
-test.after(async () => {
+afterAll(async () => {
     global.fetch = realFetch;
     await new Promise(resolve => server.close(resolve));
 });
 
-test.beforeEach(() => {
+beforeEach(() => {
     clearCaches();
     stubProvider();
 });
@@ -119,7 +116,7 @@ const channels = (...ids) => ids.map(i => `xtremio_live_${i}`).sort();
 // Fills the full movie list the way a real user does: by searching.
 async function warmMovies() {
     await shelf('XT-Movies', 'xtremio_search_movies', 'search=a');
-    assert.ok(vodStreamsCache.map.size > 0, 'the full list is cached');
+    expect(vodStreamsCache.map.size, 'the full list is cached').toBeGreaterThan(0);
     calls = [];
 }
 
@@ -129,30 +126,29 @@ test('the manifest still offers a shared category name once', async () => {
     const manifest = await (await realFetch(`${base}/${CFG}/manifest.json`)).json();
     const catalog = manifest.catalogs.find(c => c.id === 'xtremio_movies_new');
     const options = catalog.extra.find(e => e.name === 'genre').options;
-    assert.deepEqual(options.filter(g => g === 'Action'), ['Action']);
+    expect(options.filter(g => g === 'Action')).toStrictEqual(['Action']);
 });
 
 test('a shared name shows every category that has it, with a cold cache', async () => {
     // It resolved to category 20 alone, so Bravo — filed only under 21 — could not be
     // reached from anywhere.
-    assert.deepEqual(await shelf('XT-Movies', 'xtremio_movies_new', 'genre=Action'), movies(101, 102, 105));
-    assert.deepEqual(
+    expect(await shelf('XT-Movies', 'xtremio_movies_new', 'genre=Action')).toStrictEqual(movies(101, 102, 105));
+    expect(
         calls.filter(c => c.startsWith('get_vod_streams:')).sort(),
-        ['get_vod_streams:20', 'get_vod_streams:21'],
         'each category was asked for'
-    );
+    ).toStrictEqual(['get_vod_streams:20', 'get_vod_streams:21']);
 });
 
 test('a shared name shows every category that has it, with a warm full list', async () => {
     await warmMovies();
-    assert.deepEqual(await shelf('XT-Movies', 'xtremio_movies_new', 'genre=Action'), movies(101, 102, 105));
-    assert.deepEqual(calls.filter(c => c.startsWith('get_vod_streams')), [], 'served from the warm list');
+    expect(await shelf('XT-Movies', 'xtremio_movies_new', 'genre=Action')).toStrictEqual(movies(101, 102, 105));
+    expect(calls.filter(c => c.startsWith('get_vod_streams')), 'served from the warm list').toStrictEqual([]);
 });
 
 test('an item in both categories of a shared name appears once', async () => {
     // Echo is in category 20's list and in 21's; the merge must not show it twice.
     const ids = await shelf('XT-Movies', 'xtremio_movies_new', 'genre=Action');
-    assert.equal(ids.filter(id => id === 'xtremio_movie_105').length, 1);
+    expect(ids.filter(id => id === 'xtremio_movie_105').length).toBe(1);
 });
 
 // --- C4: an item filed under several categories -------------------------------
@@ -166,13 +162,13 @@ test('an item filed under several categories is on each shelf, warm or cold', as
     await warmMovies();
     const warm = await shelf('XT-Movies', 'xtremio_movies_new', 'genre=Kids');
 
-    assert.deepEqual(cold, movies(103, 104));
-    assert.deepEqual(warm, cold, 'what a shelf shows no longer depends on whether a search filled the cache');
+    expect(cold).toStrictEqual(movies(103, 104));
+    expect(warm, 'what a shelf shows no longer depends on whether a search filled the cache').toStrictEqual(cold);
 });
 
 test('an item is still on the shelf of its own category_id', async () => {
     await warmMovies();
-    assert.deepEqual(await shelf('XT-Movies', 'xtremio_movies_new', 'genre=Drama'), movies(103));
+    expect(await shelf('XT-Movies', 'xtremio_movies_new', 'genre=Drama')).toStrictEqual(movies(103));
 });
 
 // --- live: ids, category_ids and names together --------------------------------
@@ -183,6 +179,6 @@ test('live resolves a shared name to every category, by id, category_ids or name
 
     // 301 and 302 by the two News ids; 303 by name, having no id at all; 304 by
     // category_ids, since its own category_id is Sport.
-    assert.deepEqual(await shelf('Live TV', liveCatalog.id, 'genre=News'), channels(301, 302, 303, 304));
-    assert.deepEqual(await shelf('Live TV', liveCatalog.id, 'genre=Sport'), channels(304));
+    expect(await shelf('Live TV', liveCatalog.id, 'genre=News')).toStrictEqual(channels(301, 302, 303, 304));
+    expect(await shelf('Live TV', liveCatalog.id, 'genre=Sport')).toStrictEqual(channels(304));
 });

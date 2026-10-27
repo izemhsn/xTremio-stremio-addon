@@ -22,8 +22,6 @@
 process.env.CONFIG_SECRET = 'test-secret-for-unit-tests';
 delete process.env.ALLOW_PRIVATE_NETWORKS;
 
-const test = require('node:test');
-const assert = require('node:assert');
 const http = require('node:http');
 const fs = require('node:fs');
 
@@ -36,10 +34,9 @@ const {
     pinResolvedAddresses,
     dnsPins,
     PINNED_DISPATCHER
-} = require('../index.js');
+} = require('./support/internals.js');
 
 const realFetch = global.fetch;
-const INDEX = require.resolve('../index.js');
 // The guard and the pin live here now. The two assertions below read source
 // rather than behaviour — the properties they pin are invisible from outside —
 // so they have to name the file the code is actually written in.
@@ -75,7 +72,7 @@ test('a private or link-local target is never signed', async () => {
         'http://10.0.0.5/x',
         'http://192.168.1.1/x'
     ]) {
-        assert.equal(await map(target), null, `${target} must not be signed`);
+        expect(await map(target), `${target} must not be signed`).toBeNull();
     }
 });
 
@@ -83,12 +80,14 @@ test('a public target is still signed and still round-trips', async () => {
     const map = makeHlsProxyMapper('https://addon.test', 'CFG', ALLOWED);
     const proxied = await map(`http://${PUBLIC_IP}/a/seg1.ts`);
 
-    assert.ok(proxied?.startsWith('https://addon.test/CFG/proxy/hls?'), `unexpected: ${proxied}`);
+    expect(
+        proxied?.startsWith('https://addon.test/CFG/proxy/hls?'),
+        `unexpected: ${proxied}`
+    ).toBeTruthy();
     const { searchParams } = new URL(proxied);
-    assert.equal(
-        decodeHlsTarget(searchParams.get('u'), searchParams.get('s'), searchParams.get('e'), 'CFG')?.url,
-        `http://${PUBLIC_IP}/a/seg1.ts`
-    );
+    expect(
+        decodeHlsTarget(searchParams.get('u'), searchParams.get('s'), searchParams.get('e'), 'CFG')?.url
+    ).toBe(`http://${PUBLIC_IP}/a/seg1.ts`);
 });
 
 test('a playlist naming a refused target is refused whole, not half-rewritten', async () => {
@@ -106,14 +105,13 @@ test('a playlist naming a refused target is refused whole, not half-rewritten', 
         ''
     ].join('\n');
 
-    await assert.rejects(
-        () => rewriteHlsPlaylist(
-            playlist,
-            `http://${PUBLIC_IP}/a/play.m3u8`,
-            makeHlsProxyMapper('https://addon.test', 'CFG', ALLOWED)
-        ),
-        (e) => e.code === 'PLAYLIST_TARGET_REFUSED'
-    );
+    await expect(rewriteHlsPlaylist(
+        playlist,
+        `http://${PUBLIC_IP}/a/play.m3u8`,
+        makeHlsProxyMapper('https://addon.test', 'CFG', ALLOWED)
+    )).rejects.toMatchObject({
+        code: 'PLAYLIST_TARGET_REFUSED'
+    });
 });
 
 test('a playlist whose targets all pass is still rewritten in full', async () => {
@@ -125,15 +123,15 @@ test('a playlist whose targets all pass is still rewritten in full', async () =>
         makeHlsProxyMapper('https://addon.test', 'CFG', ALLOWED)
     );
 
-    assert.equal((out.match(/proxy\/hls\?/g) || []).length, 1);
-    assert.ok(!out.includes(`http://${PUBLIC_IP}/ok/seg2.ts`), 'nothing may be relayed raw');
+    expect((out.match(/proxy\/hls\?/g) || []).length).toBe(1);
+    expect(out, 'nothing may be relayed raw').not.toContain(`http://${PUBLIC_IP}/ok/seg2.ts`);
 });
 
 test('the fetch-time check still refuses those targets too', async () => {
     // Signing-time validation is defence in depth, not a replacement: a target
     // signed by an older build must still be refused when it is fetched.
     for (const target of ['http://169.254.169.254/x', 'http://127.0.0.1:1234/x']) {
-        await assert.rejects(() => assertSafeOutboundUrl(target), /Blocked private outbound address/);
+        await expect(assertSafeOutboundUrl(target)).rejects.toThrow(/Blocked private outbound address/);
     }
 });
 
@@ -144,8 +142,8 @@ test('assertSafeOutboundUrl is the only thing that can pin an address', () => {
     // anything else writing to it would be handing out the exemption.
     const src = fs.readFileSync(SAFE_FETCH_SRC, 'utf8');
     const writes = src.match(/pinResolvedAddresses\(/g) || [];
-    assert.equal(writes.length, 2, 'expected one definition and exactly one call site');
-    assert.match(src, /if \(!directIp\) pinResolvedAddresses\(hostname, addresses\);/);
+    expect(writes.length, 'expected one definition and exactly one call site').toBe(2);
+    expect(src).toMatch(/if \(!directIp\) pinResolvedAddresses\(hostname, addresses\);/);
 });
 
 test('safeFetch connects through the pinning dispatcher', () => {
@@ -153,9 +151,9 @@ test('safeFetch connects through the pinning dispatcher', () => {
     // as before, it just resolves the hostname a second time — so it is asserted
     // against the source, and against the dispatcher actually existing when the
     // guard is on.
-    assert.ok(PINNED_DISPATCHER, 'the guard is on, so there must be a dispatcher');
+    expect(PINNED_DISPATCHER, 'the guard is on, so there must be a dispatcher').toBeTruthy();
     const src = fs.readFileSync(SAFE_FETCH_SRC, 'utf8');
-    assert.match(src, /PINNED_DISPATCHER \? \{ dispatcher: PINNED_DISPATCHER \} : \{\}/);
+    expect(src).toMatch(/PINNED_DISPATCHER \? \{ dispatcher: PINNED_DISPATCHER \} : \{\}/);
 });
 
 test('a pinned host connects to the pinned address, never a fresh lookup', async () => {
@@ -171,7 +169,7 @@ test('a pinned host connects to the pinned address, never a fresh lookup', async
     try {
         pinResolvedAddresses('cdn.pinned.test', [{ address: '127.0.0.1', family: 4 }]);
         const res = await realFetch(`http://cdn.pinned.test:${port}/seg.ts`, { dispatcher: PINNED_DISPATCHER });
-        assert.equal(await res.text(), 'reached-the-pinned-address');
+        expect(await res.text()).toBe('reached-the-pinned-address');
     } finally {
         server.close();
     }
@@ -179,14 +177,13 @@ test('a pinned host connects to the pinned address, never a fresh lookup', async
 
 test('an unpinned host fails closed rather than resolving', async () => {
     dnsPins.delete('cdn.unpinned.test');
-    await assert.rejects(
-        () => realFetch('http://cdn.unpinned.test/seg.ts', { dispatcher: PINNED_DISPATCHER }),
-        (err) => {
-            // The rejection is fetch's own TypeError; the reason is the cause.
-            assert.match(String(err.cause?.message || err.message), /No vetted address pinned/);
-            return true;
-        }
-    );
+    await expect(
+        realFetch('http://cdn.unpinned.test/seg.ts', { dispatcher: PINNED_DISPATCHER })
+    ).rejects.toSatisfy((err) => {
+        // The rejection is fetch's own TypeError; the reason is the cause.
+        expect(String(err.cause?.message || err.message)).toMatch(/No vetted address pinned/);
+        return true;
+    });
 });
 
 test('an expired pin is not a usable pin', () => {
@@ -197,7 +194,7 @@ test('an expired pin is not a usable pin', () => {
 
     let error;
     pinnedLookup('stale.test', {}, (err) => { error = err; });
-    assert.equal(error?.code, 'ENOTFOUND');
+    expect(error?.code).toBe('ENOTFOUND');
 });
 
 test('pinnedLookup answers in whichever shape the connector asked for', () => {
@@ -209,8 +206,8 @@ test('pinnedLookup answers in whichever shape the connector asked for', () => {
     // Happy-eyeballs asks for every address at once...
     let all;
     pinnedLookup('multi.test', { all: true }, (err, result) => { all = { err, result }; });
-    assert.equal(all.err, null);
-    assert.deepEqual(all.result, [
+    expect(all.err).toBeNull();
+    expect(all.result).toStrictEqual([
         { address: '203.0.113.9', family: 4 },
         { address: '2001:db8::1', family: 6 }
     ]);
@@ -218,17 +215,17 @@ test('pinnedLookup answers in whichever shape the connector asked for', () => {
     // ...and a plain connect asks for one, as two positional arguments.
     let single;
     pinnedLookup('multi.test', {}, (err, address, family) => { single = { err, address, family }; });
-    assert.deepEqual(single, { err: null, address: '203.0.113.9', family: 4 });
+    expect(single).toStrictEqual({ err: null, address: '203.0.113.9', family: 4 });
 
     // A family filter narrows it, and narrowing to nothing fails closed.
     let v6;
     pinnedLookup('multi.test', { family: 6 }, (err, address) => { v6 = { err, address }; });
-    assert.equal(v6.address, '2001:db8::1');
+    expect(v6.address).toBe('2001:db8::1');
 
     pinResolvedAddresses('v4only.test', [{ address: '203.0.113.9', family: 4 }]);
     let none;
     pinnedLookup('v4only.test', { family: 6 }, (err) => { none = err; });
-    assert.equal(none?.code, 'ENOTFOUND');
+    expect(none?.code).toBe('ENOTFOUND');
 });
 
 test('the pin map is bounded', () => {
@@ -238,10 +235,10 @@ test('the pin map is bounded', () => {
     for (let i = 0; i < 1200; i++) {
         pinResolvedAddresses(`host${i}.test`, [{ address: '203.0.113.9', family: 4 }]);
     }
-    assert.ok(dnsPins.size <= 1000, `pin map grew to ${dnsPins.size}`);
+    expect(dnsPins.size, `pin map grew to ${dnsPins.size}`).toBeLessThanOrEqual(1000);
     // Eviction is by age, so the newest pin is the one that survives.
-    assert.ok(dnsPins.has('host1199.test'));
-    assert.ok(!dnsPins.has('host0.test'));
+    expect(dnsPins.has('host1199.test')).toBeTruthy();
+    expect(dnsPins.has('host0.test')).toBeFalsy();
 });
 
-test.after(() => PINNED_DISPATCHER?.close());
+afterAll(() => PINNED_DISPATCHER?.close());

@@ -6,8 +6,8 @@
   "scripts": {
     "start": "node index.js",
     "dev": "node --watch index.js",
-    "test": "node --test",
-    "test:watch": "node --test --watch"
+    "test": "vitest run",
+    "test:watch": "vitest"
   },
   "keywords": [
     "stremio",
@@ -34,6 +34,10 @@
   "homepage": "https://github.com/izemhsn/xTremio-stremio-addon#readme",
   "dependencies": {
     "express": "^5.2.1",
-    "undici": "^7.29.1"
+    "undici": "^7.30.1"
+  },
+  "devDependencies": {
+    "vite": "^6.4.5",
+    "vitest": "^4.1.12"
   }
 }

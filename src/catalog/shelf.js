@@ -49,7 +49,7 @@ function parseCatalogId(id) {
 
 // How long one featured order lasts. Seeded on a period rather than on the clock
 // so the shuffle holds still while a client pages through it — but a day was too
-// short (audit L14): Stremio caches catalog pages (max-age 300,
+// short: Stremio caches catalog pages (max-age 300,
 // stale-while-revalidate 600), so for up to fifteen minutes either side of a
 // boundary a paginated shelf could mix two orders. A week cuts the number of
 // boundaries by 52 without making the shelf feel fixed. It does not remove the
@@ -66,7 +66,7 @@ function featuredEpoch(now) {
 }
 
 // Every comparator ends in the item id, making each sort a total order, so a page
-// does not depend on which source served the list (audit L3). `now` is a parameter
+// does not depend on which source served the list. `now` is a parameter
 // only for testing the featured shuffle across periods.
 function catalogComparator(kind, variant, now = Date.now()) {
     const idOf = s => parseInt(s[kind.idField]) || 0;
@@ -144,7 +144,7 @@ function toCatalogMetas(items, kind) {
 
 // Which categories an item is filed under: `category_id`, plus `category_ids` on
 // many panels. Both count, so a warm full list matches what the per-category call
-// returns (audit C4).
+// returns.
 function hasCategoryIds(item) {
     return (item.category_id != null && item.category_id !== '')
         || (Array.isArray(item.category_ids) && item.category_ids.length > 0);
@@ -206,7 +206,7 @@ function catalogMemoFor(source, epoch, create) {
 // filter that would produce them, and creating nothing. Filtering is the expensive
 // half of a genre shelf and its result depends only on the source and the
 // selection, so only the sort was being saved while the filter ran on every page
-// (audit Perf). Keyed apart from the sorted views because it outlives all of them:
+//. Keyed apart from the sorted views because it outlives all of them:
 // three variants over one selection share one filtered array.
 function cachedCatalogSelection(source, selection, now = Date.now()) {
     const memo = catalogMemoFor(source, featuredEpoch(now), false);

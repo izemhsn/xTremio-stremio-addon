@@ -6,15 +6,12 @@
 // are silently refused, so a handler added that way looks fine and does nothing.
 // Behaviour belongs in the nonced <script> block, hover states in <style>.
 //
-// The server URL field is deliberately type="text" and not type="url". The
-// server has careful handling for an address typed with no scheme — https is
-// tried first, so the password is never put on the wire in cleartext before the
-// panel's TLS port has been tried (audit L9) — and type="url" made the browser
-// refuse to submit one, so only a direct POST could ever reach it. The
-// autocapitalize/autocorrect/spellcheck attributes are the other half of that:
-// a phone capitalizing the first letter of the field is where a typed `Http://`
-// comes from, which normalizeUrl now lowercases rather than mistaking for no
-// scheme at all.
+// The server URL field is deliberately type="text" and not type="url":
+// type="url" makes the browser refuse an address typed without `http://`, and
+// the server handles those on purpose (it tries https first, so the password is
+// never sent in cleartext before the panel's TLS port has been tried). The
+// autocapitalize/autocorrect/spellcheck attributes stop a phone from turning
+// `http://` into `Http://`.
 const { escapeHtml } = require('../html.js');
 // The page shows the install URL, which means minting a token from the fields
 // just submitted.
@@ -25,7 +22,7 @@ const { encodeConfig } = require('../config-token.js');
 const PORT = process.env.PORT || 3000;
 
 
-// `nonce` comes from setPrivateHeaders and is the only thing that lets this
+// `nonce` comes from setPrivateHeaders (src/routes/configure.js) and is the only thing that lets this
 // page's one script run under its CSP. Rendering without one (a caller that
 // forgot, or a test) still produces a working page — only the click-to-copy
 // convenience goes quiet, since the link is selectable text either way.

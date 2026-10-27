@@ -14,31 +14,28 @@
 process.env.CONFIG_SECRET = 'test-secret-for-unit-tests';
 process.env.ALLOW_PRIVATE_NETWORKS = 'true';
 
-const test = require('node:test');
-const assert = require('node:assert');
-
-const { app, encodeConfig, asString, redactConfigInPath } = require('../index.js');
+const { app, encodeConfig, asString, redactConfigInPath } = require('./support/internals.js');
 
 const realFetch = global.fetch;
 
 let server;
 let base;
 
-test.before(async () => {
+beforeAll(async () => {
     server = await new Promise((resolve) => {
         const s = app.listen(0, '127.0.0.1', () => resolve(s));
     });
     base = `http://127.0.0.1:${server.address().port}`;
 });
 
-test.after(() => server?.close());
+afterAll(() => server?.close());
 
 // Everything the old handler disclosed. Asserted as a set on every error
 // response, so a future handler that reverts to sending `err.stack` fails here
 // whatever shape the stack happens to take.
 function assertNoDisclosure(body, label) {
     for (const marker of ['index.js', 'node_modules', 'TypeError', 'URIError', ' at ', 'D:\\', '/xTremio']) {
-        assert.ok(!body.includes(marker), `${label} leaked ${JSON.stringify(marker)}: ${body.slice(0, 200)}`);
+        expect(body, `${label} leaked ${JSON.stringify(marker)}: ${body.slice(0, 200)}`).not.toContain(marker);
     }
 }
 
@@ -62,7 +59,7 @@ test('POST /configure survives a body that is not three strings', async () => {
             body: form.toString()
         });
         const body = await res.text();
-        assert.equal(res.status, 200, `${label} should render the page, not fail`);
+        expect(res.status, `${label} should render the page, not fail`).toBe(200);
         assertNoDisclosure(body, label);
     }
 });
@@ -80,20 +77,20 @@ test('POST /configure survives a body nothing parsed', async () => {
             body: '{"serverUrl":"http://x"}'
         });
         const body = await res.text();
-        assert.equal(res.status, 200, `${label} should render the page, not fail`);
+        expect(res.status, `${label} should render the page, not fail`).toBe(200);
         assertNoDisclosure(body, label);
     }
 });
 
 test('asString treats a non-string as absent rather than coercing it', () => {
-    assert.equal(asString('http://a.b'), 'http://a.b');
+    expect(asString('http://a.b')).toBe('http://a.b');
     // The point of not using String(): these would otherwise become "a,b" and
     // "[object Object]", both of which look like input a user typed.
-    assert.equal(asString(['a', 'b']), '');
-    assert.equal(asString({ a: '1' }), '');
-    assert.equal(asString(undefined), '');
-    assert.equal(asString(null), '');
-    assert.equal(asString(7), '');
+    expect(asString(['a', 'b'])).toBe('');
+    expect(asString({ a: '1' })).toBe('');
+    expect(asString(undefined)).toBe('');
+    expect(asString(null)).toBe('');
+    expect(asString(7)).toBe('');
 });
 
 // --- the router route ------------------------------------------------------
@@ -111,7 +108,7 @@ test('a malformed percent-escape is a clean 400 on every route shape', async () 
     for (const path of paths) {
         const res = await realFetch(base + path);
         const body = await res.text();
-        assert.equal(res.status, 400, `${path} should be a bad request`);
+        expect(res.status, `${path} should be a bad request`).toBe(400);
         assertNoDisclosure(body, path);
     }
 });
@@ -119,10 +116,10 @@ test('a malformed percent-escape is a clean 400 on every route shape', async () 
 test('an unknown path gets a plain 404, not Express default HTML', async () => {
     const res = await realFetch(`${base}/no/such/route`);
     const body = await res.text();
-    assert.equal(res.status, 404);
+    expect(res.status).toBe(404);
     assertNoDisclosure(body, 'unknown path');
     // The default handler names the method and the path in an HTML page.
-    assert.ok(!body.includes('<'), `404 body should not be HTML: ${body}`);
+    expect(body, `404 body should not be HTML: ${body}`).not.toContain('<');
 });
 
 // --- logging ---------------------------------------------------------------
@@ -130,13 +127,13 @@ test('an unknown path gets a plain 404, not Express default HTML', async () => {
 test('a config token is redacted out of a logged path', () => {
     const cfg = encodeConfig({ serverUrl: 'http://provider.test:8080', username: 'alice', password: 'secret' });
     const redacted = redactConfigInPath(`/${cfg}/meta/series/xtremio_series_1.json`);
-    assert.ok(!redacted.includes(cfg), 'the token is a bearer credential and must not reach the log');
-    assert.equal(redacted, '/<config>/meta/series/xtremio_series_1.json');
+    expect(redacted, 'the token is a bearer credential and must not reach the log').not.toContain(cfg);
+    expect(redacted).toBe('/<config>/meta/series/xtremio_series_1.json');
 
     // Short first segments are route names, not tokens, and stay readable.
-    assert.equal(redactConfigInPath('/manifest.json'), '/manifest.json');
-    assert.equal(redactConfigInPath('/configure'), '/configure');
-    assert.equal(redactConfigInPath('/health'), '/health');
+    expect(redactConfigInPath('/manifest.json')).toBe('/manifest.json');
+    expect(redactConfigInPath('/configure')).toBe('/configure');
+    expect(redactConfigInPath('/health')).toBe('/health');
 });
 
 // L13 — the redaction was one greedy run of non-slash characters, which does not
@@ -146,27 +143,21 @@ test('a config token in the query string is redacted, and the path survives it',
     const cfg = encodeConfig({ serverUrl: 'http://provider.test:8080', username: 'alice', password: 'secret' });
 
     // The route that really takes a token this way.
-    assert.equal(redactConfigInPath(`/configure?config=${cfg}`), '/configure?config=<config>');
+    expect(redactConfigInPath(`/configure?config=${cfg}`)).toBe('/configure?config=<config>');
 
     // An early slash used to end the match before it reached the query, and the
     // token was logged in full.
     const nested = redactConfigInPath(`/a/b?config=${cfg}`);
-    assert.ok(!nested.includes(cfg), 'the token must not reach the log from a nested path');
-    assert.equal(nested, '/a/b?config=<config>');
+    expect(nested, 'the token must not reach the log from a nested path').not.toContain(cfg);
+    expect(nested).toBe('/a/b?config=<config>');
 
     // Other parameters are left alone, and a token is still redacted when it is
     // not the first of them.
-    assert.equal(
-        redactConfigInPath(`/configure?lang=en&config=${cfg}&next=/x`),
-        '/configure?lang=en&config=<config>&next=/x'
-    );
+    expect(redactConfigInPath(`/configure?lang=en&config=${cfg}&next=/x`)).toBe('/configure?lang=en&config=<config>&next=/x');
 
     // Both halves at once: a tokened path that also carries one in its query.
-    assert.equal(
-        redactConfigInPath(`/${cfg}/configure?config=${cfg}`),
-        '/<config>/configure?config=<config>'
-    );
+    expect(redactConfigInPath(`/${cfg}/configure?config=${cfg}`)).toBe('/<config>/configure?config=<config>');
 
     // A query with no token is untouched.
-    assert.equal(redactConfigInPath('/catalog.json?skip=100'), '/catalog.json?skip=100');
+    expect(redactConfigInPath('/catalog.json?skip=100')).toBe('/catalog.json?skip=100');
 });

@@ -3,12 +3,15 @@
 // Every request path begins with one of these tokens, so this module is what
 // decides whether a request has an account at all. It depends on the panel
 // allowlist rather than the other way round: the ALLOWED_PANEL_HOSTS check is
-// enforced inside decodeConfig so that no route can reach a token without it
-// (audit S3).
+// enforced inside decodeConfig so that no route can reach a token without it.
 //
-// Keys are derived from the environment at require time, which is why index.js
-// requires this near the top and why a test that needs a particular secret sets
-// CONFIG_SECRET before requiring anything.
+// Keys are derived from the environment when this module is first required, so
+// a test that needs a particular secret sets CONFIG_SECRET before requiring
+// anything.
+//
+// The token format is `v3.<iv>.<tag>.<ciphertext>.<mac>`: the account's
+// { serverUrl, username, password } as JSON, encrypted with AES-256-GCM and
+// then signed with HMAC-SHA256. Both keys come from CONFIG_SECRET.
 const crypto = require('node:crypto');
 const { panelHostAllowed, noteRefusedPanel } = require('./panel-allowlist.js');
 
@@ -42,7 +45,7 @@ function deriveConfigKeys(secret) {
     };
 }
 
-// Rotation (audit S11): install URLs sealed under the previous secret keep decoding
+// Rotation: install URLs sealed under the previous secret keep decoding
 // while users reinstall, and every new one is sealed under the current secret. Only
 // the config-token keys are derived for it — HLS links are re-minted on every
 // playlist fetch.
@@ -66,7 +69,7 @@ function notePreviousSecretUse() {
     );
 }
 
-// Install URLs shaped like this server's tokens that will not open (audit R6). The
+// Install URLs shaped like this server's tokens that will not open. The
 // routes degrade them quietly for the user, so this is what tells the operator that
 // CONFIG_SECRET changed. Reported in aggregate at most once per interval, and only
 // for well-formed tokens, so scanners do not raise it.
@@ -207,7 +210,7 @@ function decodeConfig(encoded) {
         const parts = encoded.split('.');
         if (parts.length !== 5) return null;
         const [version, ivPart, tagPart, ciphertextPart, macPart] = parts;
-        // The shape is what decides whether this is counted at all (audit L5). The
+        // The shape is what decides whether this is counted at all. The
         // report noteUndecodableToken writes is the operator's signal that
         // CONFIG_SECRET changed, so it must only count strings this server could
         // really have issued: `v3.a.b.c.d` is five parts and a version prefix and

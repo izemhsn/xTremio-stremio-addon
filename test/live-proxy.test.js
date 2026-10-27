@@ -15,8 +15,6 @@
 process.env.CONFIG_SECRET = 'test-secret-for-unit-tests';
 process.env.ALLOW_PRIVATE_NETWORKS = 'true';
 
-const test = require('node:test');
-const assert = require('node:assert');
 const http = require('node:http');
 
 const {
@@ -29,7 +27,7 @@ const {
     decodeHlsTarget,
     signHlsTarget,
     hlsPrefixVerdict
-} = require('../index.js');
+} = require('./support/internals.js');
 
 const realFetch = global.fetch;
 
@@ -241,7 +239,7 @@ function providerHandler(req, res) {
     res.writeHead(404).end('nope');
 }
 
-test.before(async () => {
+beforeAll(async () => {
     provider = http.createServer(providerHandler);
     await new Promise(resolve => provider.listen(0, '127.0.0.1', resolve));
     providerBase = `http://127.0.0.1:${provider.address().port}`;
@@ -252,13 +250,13 @@ test.before(async () => {
     base = `http://127.0.0.1:${server.address().port}`;
 });
 
-test.after(async () => {
+afterAll(async () => {
     global.fetch = realFetch;
     await new Promise(resolve => server.close(resolve));
     await new Promise(resolve => provider.close(resolve));
 });
 
-test.beforeEach(() => { providerHits = []; providerEncodings = []; });
+beforeEach(() => { providerHits = []; providerEncodings = []; });
 
 // The addon's own outbound calls go through global.fetch; the test client must
 // not, so it uses the reference saved before any stubbing.
@@ -283,10 +281,10 @@ test('rewriteHlsPlaylist rewrites segment URI lines', async () => {
         'http://cdn.test/a/play.m3u8',
         proxied
     );
-    assert.match(out, /PROXY\(http:\/\/cdn\.test\/a\/seg1\.ts\)/);
+    expect(out).toMatch(/PROXY\(http:\/\/cdn\.test\/a\/seg1\.ts\)/);
     // Tags without a URI are untouched.
-    assert.match(out, /^#EXTM3U$/m);
-    assert.match(out, /^#EXTINF:8\.000,$/m);
+    expect(out).toMatch(/^#EXTM3U$/m);
+    expect(out).toMatch(/^#EXTINF:8\.000,$/m);
 });
 
 test('relative URIs resolve against the playlist URL, not the requested one', async () => {
@@ -298,7 +296,7 @@ test('relative URIs resolve against the playlist URL, not the requested one', as
         'http://cdn.test/deep/path/play.m3u8',
         proxied
     );
-    assert.match(out, /PROXY\(http:\/\/cdn\.test\/deep\/path\/seg2\.ts\)/);
+    expect(out).toMatch(/PROXY\(http:\/\/cdn\.test\/deep\/path\/seg2\.ts\)/);
 });
 
 test('URI="..." attributes are rewritten too', async () => {
@@ -309,11 +307,11 @@ test('URI="..." attributes are rewritten too', async () => {
         'http://cdn.test/play.m3u8',
         proxied
     );
-    assert.match(out, /URI="PROXY\(http:\/\/cdn\.test\/k\.bin\)"/);
-    assert.match(out, /URI="PROXY\(http:\/\/cdn\.test\/alt\.m3u8\)"/);
+    expect(out).toMatch(/URI="PROXY\(http:\/\/cdn\.test\/k\.bin\)"/);
+    expect(out).toMatch(/URI="PROXY\(http:\/\/cdn\.test\/alt\.m3u8\)"/);
     // Other attributes on the same line survive intact.
-    assert.match(out, /METHOD=AES-128/);
-    assert.match(out, /IV=0x1/);
+    expect(out).toMatch(/METHOD=AES-128/);
+    expect(out).toMatch(/IV=0x1/);
 });
 
 test('blank lines and CRLF endings are preserved', async () => {
@@ -324,9 +322,9 @@ test('blank lines and CRLF endings are preserved', async () => {
         'http://cdn.test/p.m3u8',
         proxied
     );
-    assert.ok(out.includes('#EXTM3U\r\n'));
-    assert.ok(out.includes('PROXY(http://cdn.test/seg.ts)\r\n'));
-    assert.ok(out.includes('\r\n\r\n'), 'blank line kept');
+    expect(out).toContain('#EXTM3U\r\n');
+    expect(out).toContain('PROXY(http://cdn.test/seg.ts)\r\n');
+    expect(out, 'blank line kept').toContain('\r\n\r\n');
 });
 
 test('unresolvable or non-http URIs are left alone rather than dropped', async () => {
@@ -335,26 +333,26 @@ test('unresolvable or non-http URIs are left alone rather than dropped', async (
         'http://cdn.test/p.m3u8',
         proxied
     );
-    assert.match(out, /URI="data:text\/plain;base64,AAAA"/);
-    assert.ok(!out.includes('PROXY('));
+    expect(out).toMatch(/URI="data:text\/plain;base64,AAAA"/);
+    expect(out).not.toContain('PROXY(');
 });
 
 test('looksLikePlaylist keys off the extension or the content type', () => {
     // Providers routinely mislabel playlists as text/plain, so the extension
     // has to be enough on its own.
-    assert.ok(looksLikePlaylist('m3u8', 'text/plain'));
-    assert.ok(looksLikePlaylist('M3U8', null));
-    assert.ok(looksLikePlaylist(null, 'application/vnd.apple.mpegurl'));
-    assert.ok(looksLikePlaylist(null, 'application/x-mpegURL; charset=utf-8'));
-    assert.ok(!looksLikePlaylist('ts', 'video/mp2t'));
-    assert.ok(!looksLikePlaylist(null, 'video/mp2t'));
+    expect(looksLikePlaylist('m3u8', 'text/plain')).toBeTruthy();
+    expect(looksLikePlaylist('M3U8', null)).toBeTruthy();
+    expect(looksLikePlaylist(null, 'application/vnd.apple.mpegurl')).toBeTruthy();
+    expect(looksLikePlaylist(null, 'application/x-mpegURL; charset=utf-8')).toBeTruthy();
+    expect(looksLikePlaylist('ts', 'video/mp2t')).toBeFalsy();
+    expect(looksLikePlaylist(null, 'video/mp2t')).toBeFalsy();
 });
 
 // --- signed sub-resource targets -------------------------------------------
 
 test('a signed target round-trips', () => {
     const { u, s, e } = encodeHlsTarget('http://cdn.test/a/seg1.ts?tok=9', CFG);
-    assert.strictEqual(decodeHlsTarget(u, s, e, CFG)?.url, 'http://cdn.test/a/seg1.ts?tok=9');
+    expect(decodeHlsTarget(u, s, e, CFG)?.url).toBe('http://cdn.test/a/seg1.ts?tok=9');
 });
 
 test('an unsigned or forged target is rejected', () => {
@@ -363,10 +361,10 @@ test('an unsigned or forged target is rejected', () => {
     const { u, s, e } = encodeHlsTarget('http://cdn.test/seg.ts', CFG);
     const evil = Buffer.from('http://attacker.test/', 'utf8').toString('base64url');
 
-    assert.strictEqual(decodeHlsTarget(u, 'not-a-signature', e, CFG), null);
-    assert.strictEqual(decodeHlsTarget(evil, s, e, CFG), null, 'signature for a different payload');
-    assert.strictEqual(decodeHlsTarget(u, undefined, e, CFG), null);
-    assert.strictEqual(decodeHlsTarget(undefined, undefined, e, CFG), null);
+    expect(decodeHlsTarget(u, 'not-a-signature', e, CFG)).toBeNull();
+    expect(decodeHlsTarget(evil, s, e, CFG), 'signature for a different payload').toBeNull();
+    expect(decodeHlsTarget(u, undefined, e, CFG)).toBeNull();
+    expect(decodeHlsTarget(undefined, undefined, e, CFG)).toBeNull();
 });
 
 test('non-http targets are rejected even when correctly signed', () => {
@@ -374,7 +372,7 @@ test('non-http targets are rejected even when correctly signed', () => {
     // own ciphertext: a hand-built one would be turned away by the MAC or the
     // GCM tag first and never reach the protocol check this test is about.
     const { u, s, e } = encodeHlsTarget('file:///etc/passwd', CFG);
-    assert.strictEqual(decodeHlsTarget(u, s, e, CFG), null);
+    expect(decodeHlsTarget(u, s, e, CFG)).toBeNull();
 });
 
 test('HLS signatures are domain-separated from config-token MACs', () => {
@@ -382,56 +380,56 @@ test('HLS signatures are domain-separated from config-token MACs', () => {
     // strings as well, so a value valid in one position cannot be replayed in
     // the other however either format changes.
     const body = 'v3.aaa.bbb.ccc';
-    assert.notStrictEqual(signHlsTarget(body), signTokenBody(body));
+    expect(signHlsTarget(body)).not.toBe(signTokenBody(body));
 });
 
 // --- the M9 regression itself ----------------------------------------------
 
 test('the live stream route hands out no credentials', async () => {
     const res = await get('/stream/Live%20TV/xtremio_live_5.json');
-    assert.strictEqual(res.status, 200);
+    expect(res.status).toBe(200);
     const body = await res.text();
 
-    assert.ok(!body.includes(PASSWORD), 'password must not reach the player');
-    assert.ok(!body.includes(USERNAME), 'username must not reach the player');
+    expect(body, 'password must not reach the player').not.toContain(PASSWORD);
+    expect(body, 'username must not reach the player').not.toContain(USERNAME);
 
     const { streams } = JSON.parse(body);
-    assert.strictEqual(streams.length, 2, 'both HLS and MPEG-TS still offered');
+    expect(streams.length, 'both HLS and MPEG-TS still offered').toBe(2);
     for (const s of streams) {
-        assert.ok(s.url.startsWith(`${base}/${CFG}/proxy/live/5.`), `proxied: ${s.url}`);
+        expect(s.url.startsWith(`${base}/${CFG}/proxy/live/5.`), `proxied: ${s.url}`).toBeTruthy();
         // Neither format is MP4, so the player must not treat it as web-ready —
         // getting this wrong makes playback stop after about a minute.
-        assert.strictEqual(s.behaviorHints.notWebReady, true);
+        expect(s.behaviorHints.notWebReady).toBe(true);
     }
     // No upstream call is needed to answer this.
-    assert.deepStrictEqual(providerHits, []);
+    expect(providerHits).toStrictEqual([]);
 });
 
 test('the .ts proxy relays the stream and authenticates upstream itself', async () => {
     const res = await get('/proxy/live/5.ts');
-    assert.strictEqual(res.status, 200);
-    assert.strictEqual(await res.text(), 'TS-BYTES-PAYLOAD');
+    expect(res.status).toBe(200);
+    expect(await res.text()).toBe('TS-BYTES-PAYLOAD');
     // The credentials still go upstream — they just stop at this server.
-    assert.deepStrictEqual(providerHits, [`/live/${USERNAME}/${PASSWORD}/5.ts`]);
+    expect(providerHits).toStrictEqual([`/live/${USERNAME}/${PASSWORD}/5.ts`]);
 });
 
 test('the .m3u8 proxy rewrites the playlist so no credentials reach the player', async () => {
     const res = await get('/proxy/live/5.m3u8');
-    assert.strictEqual(res.status, 200);
+    expect(res.status).toBe(200);
     const body = await res.text();
 
     // The whole point: the provider's own playlist named the credentials in
     // every segment URL, and relaying it verbatim would have leaked them.
-    assert.ok(!body.includes(PASSWORD), `password leaked in playlist body:\n${body}`);
-    assert.ok(!body.includes(USERNAME), 'username leaked in playlist body');
+    expect(body, `password leaked in playlist body:\n${body}`).not.toContain(PASSWORD);
+    expect(body, 'username leaked in playlist body').not.toContain(USERNAME);
 
     // Structure is preserved and every URI now points back at this server.
-    assert.match(body, /^#EXTM3U$/m);
-    assert.match(body, /^#EXT-X-TARGETDURATION:8$/m);
+    expect(body).toMatch(/^#EXTM3U$/m);
+    expect(body).toMatch(/^#EXT-X-TARGETDURATION:8$/m);
     const links = body.split('\n').filter(l => l.includes('/proxy/hls?'));
-    assert.strictEqual(links.length, 3, 'key + 2 segments rewritten');
+    expect(links.length, 'key + 2 segments rewritten').toBe(3);
     for (const line of links) {
-        assert.ok(line.includes(`${base}/${CFG}/proxy/hls?u=`), line);
+        expect(line, line).toContain(`${base}/${CFG}/proxy/hls?u=`);
     }
 
     // The rewritten body is longer than the one upstream declared, so
@@ -440,9 +438,9 @@ test('the .m3u8 proxy rewrites the playlist so no credentials reach the player',
     // truncated body matches a truncated header — so the check is that the
     // last line survived and the length matches the *upstream* body's, which
     // it must not.
-    assert.match(body, /seg2\.ts|\/proxy\/hls\?u=[^\n]*\n?$/, 'body reaches its final line');
-    assert.ok(body.trimEnd().split('\n').length === 8, `all 8 lines present:\n${body}`);
-    assert.strictEqual(res.headers.get('content-length'), String(Buffer.byteLength(body)));
+    expect(body, 'body reaches its final line').toMatch(/seg2\.ts|\/proxy\/hls\?u=[^\n]*\n?$/);
+    expect(body.trimEnd().split('\n').length === 8, `all 8 lines present:\n${body}`).toBeTruthy();
+    expect(res.headers.get('content-length')).toBe(String(Buffer.byteLength(body)));
 });
 
 test('a byte relay asks upstream for an unencoded body', async () => {
@@ -450,26 +448,26 @@ test('a byte relay asks upstream for an unencoded body', async () => {
     // a ranged request answers with offsets into the compressed representation,
     // which do not describe the decompressed bytes being relayed.
     const res = await get('/proxy/live/5.ts');
-    assert.strictEqual(res.status, 200);
+    expect(res.status).toBe(200);
     await res.text();
-    assert.deepStrictEqual(providerEncodings, ['identity']);
+    expect(providerEncodings).toStrictEqual(['identity']);
 });
 
 test('a playlist fetch keeps compression negotiable', async () => {
     // Playlists are text, read whole and rewritten, so gzip is a plain win there.
     await (await get('/proxy/live/5.m3u8')).text();
-    assert.strictEqual(providerEncodings.length, 1);
-    assert.notStrictEqual(providerEncodings[0], 'identity');
+    expect(providerEncodings.length).toBe(1);
+    expect(providerEncodings[0]).not.toBe('identity');
 });
 
 test('a HEAD on a playlist does not advertise the unrewritten length', async () => {
     // HEAD used to forward upstream's Content-Length, which describes the
     // provider's body; the GET that follows returns a rewritten, longer one.
     const head = await realFetch(`${base}/${CFG}/proxy/live/5.m3u8`, { method: 'HEAD' });
-    assert.strictEqual(head.status, 200);
-    assert.strictEqual(head.headers.get('content-length'), null);
-    assert.strictEqual(head.headers.get('accept-ranges'), null, 'a playlist is not seekable');
-    assert.match(head.headers.get('content-type') || '', /mpegurl/i);
+    expect(head.status).toBe(200);
+    expect(head.headers.get('content-length')).toBeNull();
+    expect(head.headers.get('accept-ranges'), 'a playlist is not seekable').toBeNull();
+    expect(head.headers.get('content-type') || '').toMatch(/mpegurl/i);
 });
 
 test('a HEAD on a byte relay still forwards its length and range support', async () => {
@@ -478,9 +476,9 @@ test('a HEAD on a byte relay still forwards its length and range support', async
     const head = await realFetch(`${base}/${CFG}/proxy/hls?${new URLSearchParams(
         encodeHlsTarget(`${providerBase}/hls/${USERNAME}/${PASSWORD}/seg1.ts`, CFG)
     )}`, { method: 'HEAD' });
-    assert.strictEqual(head.status, 200);
-    assert.strictEqual(head.headers.get('content-length'), String(Buffer.byteLength('SEGMENT-BYTES')));
-    assert.strictEqual(head.headers.get('accept-ranges'), 'bytes');
+    expect(head.status).toBe(200);
+    expect(head.headers.get('content-length')).toBe(String(Buffer.byteLength('SEGMENT-BYTES')));
+    expect(head.headers.get('accept-ranges')).toBe('bytes');
 });
 
 test('a Range header is not forwarded to a playlist request', async () => {
@@ -491,10 +489,10 @@ test('a Range header is not forwarded to a playlist request', async () => {
     const res = await realFetch(`${base}/${CFG}/proxy/live/5.m3u8`, {
         headers: { Range: 'bytes=0-11' }
     });
-    assert.strictEqual(res.status, 200, 'a full playlist, not a 206 fragment');
+    expect(res.status, 'a full playlist, not a 206 fragment').toBe(200);
     const body = await res.text();
-    assert.ok(!body.includes(PASSWORD), 'a fragment would have been relayed unrewritten');
-    assert.ok(body.includes('/proxy/hls?u='), 'still rewritten');
+    expect(body, 'a fragment would have been relayed unrewritten').not.toContain(PASSWORD);
+    expect(body, 'still rewritten').toContain('/proxy/hls?u=');
 });
 
 test('a Range on a nested playlist is withheld, not forwarded', async () => {
@@ -509,9 +507,9 @@ test('a Range on a nested playlist is withheld, not forwarded', async () => {
     });
     const body = await res.text();
 
-    assert.strictEqual(res.status, 200);
-    assert.ok(!body.includes(PASSWORD));
-    assert.ok(body.includes('/proxy/hls?u='), 'the segment inside was rewritten');
+    expect(res.status).toBe(200);
+    expect(body).not.toContain(PASSWORD);
+    expect(body, 'the segment inside was rewritten').toContain('/proxy/hls?u=');
 });
 
 test('a partial playlist is refused rather than relayed unrewritten', async () => {
@@ -520,8 +518,8 @@ test('a partial playlist is refused rather than relayed unrewritten', async () =
     const { u, s, e } = encodeHlsTarget(`${providerBase}/hls/${USERNAME}/${PASSWORD}/rogue206.m3u8`, CFG);
     const res = await realFetch(`${base}/${CFG}/proxy/hls?u=${u}&s=${s}&e=${e}`);
 
-    assert.strictEqual(res.status, 502);
-    assert.ok(!(await res.text()).includes(PASSWORD));
+    expect(res.status).toBe(502);
+    expect((await res.text())).not.toContain(PASSWORD);
 });
 
 // --- C5: a nested playlist the provider labelled as anything else -----------
@@ -535,15 +533,15 @@ test('a variant playlist with no extension and a text/plain type is rewritten', 
     // and the link minted for it says so.
     const master = await (await get('/proxy/live/11.m3u8')).text();
     const variantLink = master.split('\n').find(l => l.includes('/proxy/hls?u='));
-    assert.ok(variantLink, 'the variant was rewritten in the master');
+    expect(variantLink, 'the variant was rewritten in the master').toBeTruthy();
 
     const res = await realFetch(variantLink);
     const body = await res.text();
 
-    assert.strictEqual(res.status, 200);
-    assert.ok(!body.includes(PASSWORD), 'no credentials reach the player');
-    assert.ok(!body.includes(USERNAME));
-    assert.ok(body.includes('/proxy/hls?u='), 'its segment was rewritten in turn');
+    expect(res.status).toBe(200);
+    expect(body, 'no credentials reach the player').not.toContain(PASSWORD);
+    expect(body).not.toContain(USERNAME);
+    expect(body, 'its segment was rewritten in turn').toContain('/proxy/hls?u=');
 });
 
 test('the kind a link carries is the playlist structure, not a guess', async () => {
@@ -560,9 +558,9 @@ test('the kind a link carries is the playlist structure, not a guess', async () 
         return decodeHlsTarget(q.get('u'), q.get('s'), q.get('e'), CFG).playlist;
     };
 
-    assert.strictEqual(kindOf(variantLink), true, 'a variant stream URI');
-    assert.strictEqual(kindOf(segmentLink), false, 'a segment line keeps its Range support');
-    assert.strictEqual(kindOf(keyLink), false, 'an EXT-X-KEY URI is a key, not a playlist');
+    expect(kindOf(variantLink), 'a variant stream URI').toBe(true);
+    expect(kindOf(segmentLink), 'a segment line keeps its Range support').toBe(false);
+    expect(kindOf(keyLink), 'an EXT-X-KEY URI is a key, not a playlist').toBe(false);
 });
 
 test('a .m3u8 path is enough on its own, whatever the content type says', async () => {
@@ -573,9 +571,9 @@ test('a .m3u8 path is enough on its own, whatever the content type says', async 
     const res = await realFetch(`${base}/${CFG}/proxy/hls?u=${u}&s=${s}&e=${e}`);
     const body = await res.text();
 
-    assert.strictEqual(res.status, 200);
-    assert.ok(!body.includes(PASSWORD));
-    assert.ok(body.includes('/proxy/hls?u='));
+    expect(res.status).toBe(200);
+    expect(body).not.toContain(PASSWORD);
+    expect(body).toContain('/proxy/hls?u=');
 });
 
 test('a target that claims .m3u8 but sends a video body is refused, not mangled', async () => {
@@ -585,20 +583,20 @@ test('a target that claims .m3u8 but sends a video body is refused, not mangled'
     const { u, s, e } = encodeHlsTarget(`${providerBase}/hls/${USERNAME}/${PASSWORD}/notreally.m3u8`, CFG);
     const res = await realFetch(`${base}/${CFG}/proxy/hls?u=${u}&s=${s}&e=${e}`);
 
-    assert.strictEqual(res.status, 502);
-    assert.strictEqual(await res.text(), 'bad playlist');
+    expect(res.status).toBe(502);
+    expect(await res.text()).toBe('bad playlist');
 });
 
 test('a rewritten segment link fetches through the signed passthrough', async () => {
     const playlist = await (await get('/proxy/live/5.m3u8')).text();
     const segLine = playlist.split('\n').find(l => l.startsWith(base) && !l.startsWith('#'));
-    assert.ok(segLine, 'a segment line was rewritten');
+    expect(segLine, 'a segment line was rewritten').toBeTruthy();
 
     providerHits = [];
     const res = await realFetch(segLine);
-    assert.strictEqual(res.status, 200);
-    assert.strictEqual(await res.text(), 'SEGMENT-BYTES');
-    assert.deepStrictEqual(providerHits, [`/hls/${USERNAME}/${PASSWORD}/seg1.ts`]);
+    expect(res.status).toBe(200);
+    expect(await res.text()).toBe('SEGMENT-BYTES');
+    expect(providerHits).toStrictEqual([`/hls/${USERNAME}/${PASSWORD}/seg1.ts`]);
 });
 
 test('a relative segment resolves against the playlist, not the proxy path', async () => {
@@ -607,10 +605,10 @@ test('a relative segment resolves against the playlist, not the proxy path', asy
     const playlist = await (await get('/proxy/live/5.m3u8')).text();
     const lines = playlist.split('\n').filter(l => l.includes('/proxy/hls?u='));
     const targets = lines.map((l) => targetOf(l.replace(/^#.*URI="/, '').replace(/"$/, '')));
-    assert.ok(
+    expect(
         targets.some(t => t === `${providerBase}/live/${USERNAME}/${PASSWORD}/seg2.ts`),
         `relative segment resolved wrongly: ${JSON.stringify(targets)}`
-    );
+    ).toBeTruthy();
 });
 
 test('relative segments resolve against the post-redirect playlist URL', async () => {
@@ -619,20 +617,20 @@ test('relative segments resolve against the post-redirect playlist URL', async (
     // inside must resolve against *that*, not against the requested URL.
     const playlist = await (await get('/proxy/live/9.m3u8')).text();
     const line = playlist.split('\n').find(l => l.includes('/proxy/hls?u='));
-    assert.ok(line, 'segment rewritten');
+    expect(line, 'segment rewritten').toBeTruthy();
 
-    assert.strictEqual(targetOf(line), `${providerBase}/cdn/deep/path/relseg.ts`);
+    expect(targetOf(line)).toBe(`${providerBase}/cdn/deep/path/relseg.ts`);
 });
 
 test('a master playlist has its variant playlists rewritten in turn', async () => {
     const master = await (await get('/proxy/live/7.m3u8')).text();
     const variantLink = master.split('\n').find(l => l.includes('/proxy/hls?u='));
-    assert.ok(variantLink, 'variant playlist rewritten');
+    expect(variantLink, 'variant playlist rewritten').toBeTruthy();
 
     // Following it must yield a *rewritten* variant, not the provider's raw one.
     const variant = await (await realFetch(variantLink)).text();
-    assert.ok(!variant.includes(PASSWORD), `nested playlist leaked credentials:\n${variant}`);
-    assert.ok(variant.includes('/proxy/hls?u='), 'nested segments rewritten');
+    expect(variant, `nested playlist leaked credentials:\n${variant}`).not.toContain(PASSWORD);
+    expect(variant, 'nested segments rewritten').toContain('/proxy/hls?u=');
 });
 
 test('a playlist naming a host the proxy will not fetch is refused, not half-rewritten', async () => {
@@ -641,26 +639,26 @@ test('a playlist naming a host the proxy will not fetch is refused, not half-rew
     // means /live/<user>/<password>/ in the player's hands, the exact disclosure
     // the rewrite exists to prevent.
     const res = await get('/proxy/live/8.m3u8');
-    assert.strictEqual(res.status, 502);
+    expect(res.status).toBe(502);
 
     const body = await res.text();
-    assert.strictEqual(body, 'playlist target refused');
-    assert.ok(!body.includes(PASSWORD), 'password must not reach the player');
-    assert.ok(!body.includes(USERNAME), 'username must not reach the player');
+    expect(body).toBe('playlist target refused');
+    expect(body, 'password must not reach the player').not.toContain(PASSWORD);
+    expect(body, 'username must not reach the player').not.toContain(USERNAME);
 });
 
 test('the passthrough route refuses an unsigned target and makes no request', async () => {
     const evil = Buffer.from('http://127.0.0.1:1/private', 'utf8').toString('base64url');
     const res = await realFetch(`${base}/${CFG}/proxy/hls?u=${evil}&s=forged`);
-    assert.strictEqual(res.status, 400);
-    assert.deepStrictEqual(providerHits, [], 'rejected before any outbound call');
+    expect(res.status).toBe(400);
+    expect(providerHits, 'rejected before any outbound call').toStrictEqual([]);
 });
 
 test('the passthrough route still requires a valid config token', async () => {
     const { u, s, e } = encodeHlsTarget(`${providerBase}/hls/x/y/seg1.ts`, CFG);
     const res = await realFetch(`${base}/not-a-token/proxy/hls?u=${u}&s=${s}&e=${e}`);
-    assert.strictEqual(res.status, 401);
-    assert.deepStrictEqual(providerHits, []);
+    expect(res.status).toBe(401);
+    expect(providerHits).toStrictEqual([]);
 });
 
 // --- L8 — relayed bytes are the provider's, served from this origin ---------
@@ -676,10 +674,10 @@ test('the passthrough route still requires a valid config token', async () => {
 test('a byte relay is marked unsniffable and sandboxed', async () => {
     const res = await get('/proxy/live/5.ts');
 
-    assert.strictEqual(res.status, 200);
-    assert.strictEqual(res.headers.get('x-content-type-options'), 'nosniff');
-    assert.strictEqual(res.headers.get('content-security-policy'), 'sandbox');
-    assert.strictEqual(res.headers.get('cache-control'), 'no-store');
+    expect(res.status).toBe(200);
+    expect(res.headers.get('x-content-type-options')).toBe('nosniff');
+    expect(res.headers.get('content-security-policy')).toBe('sandbox');
+    expect(res.headers.get('cache-control')).toBe('no-store');
 });
 
 test('a rewritten playlist gets the same headers as a byte relay', async () => {
@@ -687,10 +685,10 @@ test('a rewritten playlist gets the same headers as a byte relay', async () => {
     // of them is the kind of gap that survives review.
     const res = await get('/proxy/live/5.m3u8');
 
-    assert.strictEqual(res.status, 200);
-    assert.strictEqual(res.headers.get('x-content-type-options'), 'nosniff');
-    assert.strictEqual(res.headers.get('content-security-policy'), 'sandbox');
-    assert.strictEqual(res.headers.get('cache-control'), 'no-store');
+    expect(res.status).toBe(200);
+    expect(res.headers.get('x-content-type-options')).toBe('nosniff');
+    expect(res.headers.get('content-security-policy')).toBe('sandbox');
+    expect(res.headers.get('cache-control')).toBe('no-store');
 });
 
 test('the signed passthrough carries them too', async () => {
@@ -699,12 +697,12 @@ test('the signed passthrough carries them too', async () => {
     const playlist = await (await get('/proxy/live/5.m3u8')).text();
     // A bare URI line, not the #EXT-X-KEY attribute that also carries one.
     const link = playlist.split('\n').find(l => l.startsWith(base) && !l.startsWith('#'));
-    assert.ok(link, 'a segment line was rewritten');
+    expect(link, 'a segment line was rewritten').toBeTruthy();
     const res = await realFetch(link);
 
-    assert.strictEqual(res.status, 200);
-    assert.strictEqual(res.headers.get('x-content-type-options'), 'nosniff');
-    assert.strictEqual(res.headers.get('content-security-policy'), 'sandbox');
+    expect(res.status).toBe(200);
+    expect(res.headers.get('x-content-type-options')).toBe('nosniff');
+    expect(res.headers.get('content-security-policy')).toBe('sandbox');
 });
 
 test('an html body from the panel is still relayed, just not as a document', async () => {
@@ -713,9 +711,9 @@ test('an html body from the panel is still relayed, just not as a document', asy
     // that the type survives *and* the headers came with it.
     const res = await get('/proxy/live/12.ts');
 
-    assert.match(res.headers.get('content-type') || '', /text\/html/);
-    assert.strictEqual(res.headers.get('x-content-type-options'), 'nosniff');
-    assert.strictEqual(res.headers.get('content-security-policy'), 'sandbox');
+    expect(res.headers.get('content-type') || '').toMatch(/text\/html/);
+    expect(res.headers.get('x-content-type-options')).toBe('nosniff');
+    expect(res.headers.get('content-security-policy')).toBe('sandbox');
 });
 
 // --- L10 — a playlist arriving where only bytes were expected ---------------
@@ -733,26 +731,26 @@ test('a playlist served on a .ts path is refused, not relayed', async () => {
     const res = await get('/proxy/live/13.ts');
     const body = await res.text();
 
-    assert.ok(!body.includes(PASSWORD), `password leaked in a relayed body:\n${body}`);
-    assert.ok(!body.includes(USERNAME), 'username leaked in a relayed body');
-    assert.strictEqual(res.status, 502);
+    expect(body, `password leaked in a relayed body:\n${body}`).not.toContain(PASSWORD);
+    expect(body, 'username leaked in a relayed body').not.toContain(USERNAME);
+    expect(res.status).toBe(502);
 });
 
 test('the sniff decides at the first byte that rules a playlist out', () => {
     // This is what keeps the check off the critical path of a live stream: a
     // segment is settled by its first byte, never by waiting for a window to fill.
-    assert.strictEqual(hlsPrefixVerdict('G'), 'other', 'an MPEG-TS sync byte');
-    assert.strictEqual(hlsPrefixVerdict('\u0000'), 'other', 'the start of an MP4 box');
-    assert.strictEqual(hlsPrefixVerdict('<html>'), 'other');
-    assert.strictEqual(hlsPrefixVerdict('#EXTINF'), 'other', 'a real tag, but not the first one');
+    expect(hlsPrefixVerdict('G'), 'an MPEG-TS sync byte').toBe('other');
+    expect(hlsPrefixVerdict('\u0000'), 'the start of an MP4 box').toBe('other');
+    expect(hlsPrefixVerdict('<html>')).toBe('other');
+    expect(hlsPrefixVerdict('#EXTINF'), 'a real tag, but not the first one').toBe('other');
 });
 
 test('the sniff keeps reading only while a playlist is still possible', () => {
     for (const partial of ['', '#', '#EX', '#EXTM3', '\uFEFF', '\n\n', '\uFEFF  #E']) {
-        assert.strictEqual(hlsPrefixVerdict(partial), 'more', JSON.stringify(partial));
+        expect(hlsPrefixVerdict(partial), JSON.stringify(partial)).toBe('more');
     }
     for (const yes of ['#EXTM3U', '#EXTM3U\n#EXT-X-VERSION:3', '\uFEFF#EXTM3U', '\n \n#EXTM3U']) {
-        assert.strictEqual(hlsPrefixVerdict(yes), 'playlist', JSON.stringify(yes));
+        expect(hlsPrefixVerdict(yes), JSON.stringify(yes)).toBe('playlist');
     }
 });
 
@@ -761,8 +759,8 @@ test('a body shorter than the sniff window is relayed whole', async () => {
     // inside them is already complete — piping it afterwards would never end.
     const res = await get('/proxy/live/14.ts');
 
-    assert.strictEqual(res.status, 200);
-    assert.strictEqual(await res.text(), 'TSx');
+    expect(res.status).toBe(200);
+    expect(await res.text()).toBe('TSx');
 });
 
 test('a byte relay still streams when the sniff cannot fill its window', async () => {
@@ -772,6 +770,6 @@ test('a byte relay still streams when the sniff cannot fill its window', async (
     // hang; this pins the smaller case the same rule covers.
     const res = await get('/proxy/live/5.ts');
 
-    assert.strictEqual(res.status, 200);
-    assert.strictEqual(await res.text(), 'TS-BYTES-PAYLOAD');
+    expect(res.status).toBe(200);
+    expect(await res.text()).toBe('TS-BYTES-PAYLOAD');
 });

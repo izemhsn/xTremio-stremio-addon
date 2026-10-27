@@ -1,13 +1,14 @@
 // Who a request is from, and what URL this server is reachable at.
 //
 // Both answers come from headers a client can set, so both depend on TRUST_PROXY.
-// A proxy *appends* the address it saw, which is why forwardedValue counts in from
-// the right: the leftmost X-Forwarded-For entry used to be the rate limiter's key,
-// and `X-Forwarded-For: <anything>` minted a fresh bucket per request (audit S5).
+// A proxy *appends* the address it saw, so forwardedValue counts in from the
+// right: everything to the left of the proxies' entries was written by the
+// client, and trusting it would let a client pick its own rate-limit bucket.
 // With TRUST_PROXY off every forwarded header is ignored and the socket decides.
 const net = require('node:net');
 
 const { normalizeUrl } = require('../helpers.js');
+const { IS_PRODUCTION } = require('../config-token.js');
 const { ipv6ToBytes, ipv6MatchesPrefix, IPV6_V4_MAPPED } = require('../net/private-ip.js');
 
 const PORT = process.env.PORT || 3000;
@@ -15,9 +16,26 @@ const HOST = process.env.HOST || '0.0.0.0';
 
 // Pins the origin install links are built from. Without it SAFE_HOST checks only
 // the *shape* of the Host header, so any hostname an attacker controls and points
-// at this instance mints install links carrying that hostname (audit L7) —
+// at this instance mints install links carrying that hostname —
 // warnOnUnpinnedBaseUrl says so at boot in production.
 const PUBLIC_URL = process.env.PUBLIC_URL ? normalizeUrl(process.env.PUBLIC_URL) : null;
+
+// Called once at startup. With PUBLIC_URL unset, install links are built from
+// the request's Host header. Whoever controls a hostname pointed at this
+// instance can then mint install links carrying it, and later repoint its DNS to
+// collect the config tokens users installed. Warned rather than refused: a
+// single-host deployment behind a proxy that sets Host correctly is legitimate,
+// but in production it should be a deliberate choice rather than the default.
+function warnOnUnpinnedBaseUrl({ publicUrl = PUBLIC_URL, production = IS_PRODUCTION, log = console } = {}) {
+    if (publicUrl || !production) return false;
+    log.warn(
+        '[security] PUBLIC_URL is not set, so install links are built from the request Host. ' +
+        'A hostname an attacker controls, pointed at this instance, mints install URLs carrying ' +
+        'that hostname, and repointing its DNS later collects the config tokens users installed. ' +
+        "Set PUBLIC_URL to this addon's own public address."
+    );
+    return true;
+}
 
 // Host and X-Forwarded-* are attacker-controllable unless a trusted proxy sets
 // them, and the result is embedded in the install link handed out by
@@ -38,7 +56,7 @@ const TRUST_PROXY_HOPS = (() => {
 })();
 
 // The value a trusted proxy recorded in a forwarded header, or ''. Proxies *append*,
-// so everything left of their entries was written by the client (audit S5): the
+// so everything left of their entries was written by the client: the
 // value is read from the right, TRUST_PROXY_HOPS entries in. A proxy that
 // overwrites instead leaves a single value, which is also the last.
 function forwardedValue(req, header) {
@@ -50,7 +68,7 @@ function forwardedValue(req, header) {
 
 function getBaseUrl(req) {
     if (PUBLIC_URL) return PUBLIC_URL;
-    // Only a trusted proxy's word counts (audit D4).
+    // Only a trusted proxy's word counts.
     const proto = forwardedValue(req, 'x-forwarded-proto') || req.protocol || 'http';
     const host = forwardedValue(req, 'x-forwarded-host') || req.headers.host || '';
     const safeProto = /^https?$/.test(proto) ? proto : 'http';
@@ -91,6 +109,7 @@ module.exports = {
     PORT,
     HOST,
     PUBLIC_URL,
+    warnOnUnpinnedBaseUrl,
     SAFE_HOST,
     TRUST_PROXY_HOPS,
     forwardedValue,

@@ -12,16 +12,13 @@ process.env.CONFIG_SECRET = 'test-secret-for-unit-tests';
 process.env.ALLOW_PRIVATE_NETWORKS = 'true';
 process.env.LOG_REQUESTS = 'true';
 
-const test = require('node:test');
-const assert = require('node:assert');
-
 const {
     app,
     encodeConfig,
     noteDegradedCatalog,
     degradedCatalogLogged,
     DEGRADED_CATALOG_LOG_INTERVAL_MS
-} = require('../index.js');
+} = require('./support/internals.js');
 
 const realFetch = global.fetch;
 
@@ -31,12 +28,12 @@ const CFG = encodeConfig(CFG_ARGS);
 let server;
 let base;
 
-test.before(async () => {
+beforeAll(async () => {
     await new Promise(resolve => { server = app.listen(0, '127.0.0.1', resolve); });
     base = `http://127.0.0.1:${server.address().port}`;
 });
 
-test.after(async () => {
+afterAll(async () => {
     global.fetch = realFetch;
     await new Promise(resolve => server.close(resolve));
 });
@@ -71,19 +68,19 @@ test('a newline in :type cannot write its own log line', async () => {
 
     for (const path of cases) {
         const lines = await captureConsole(() => realFetch(`${base}/${CFG}${path}`));
-        assert.ok(lines.length, `${path} logged nothing, so the test proves nothing`);
+        expect(lines.length, `${path} logged nothing, so the test proves nothing`).toBeTruthy();
         for (const line of lines) {
-            assert.ok(
-                !line.includes('\n'),
+            expect(
+                line,
                 `a raw newline reached the log for ${path}:\n${JSON.stringify(line)}`
-            );
+            ).not.toContain('\n');
         }
         // The value is still readable, just quoted — the point is escaping, not
         // dropping information the operator needs.
-        assert.ok(
+        expect(
             lines.some(l => l.includes(JSON.stringify(FORGED).slice(1, -1))),
             `the injected text should survive escaped, got:\n${JSON.stringify(lines)}`
-        );
+        ).toBeTruthy();
     }
 });
 
@@ -92,9 +89,9 @@ test('a newline in :id cannot write its own log line either', async () => {
     const lines = await captureConsole(
         () => realFetch(`${base}/${CFG}/meta/series/${encodeURIComponent(id)}.json`)
     );
-    assert.ok(lines.length);
+    expect(lines.length).toBeTruthy();
     for (const line of lines) {
-        assert.ok(!line.includes('\n'), `a raw newline reached the log:\n${JSON.stringify(line)}`);
+        expect(line, `a raw newline reached the log:\n${JSON.stringify(line)}`).not.toContain('\n');
     }
 });
 
@@ -104,20 +101,20 @@ test('the degraded-catalog warning is written once per account and kind per inte
     degradedCatalogLogged.clear();
     const t0 = 1_000_000;
 
-    assert.equal(noteDegradedCatalog(CFG_ARGS, 'movie', t0), true, 'the first one must be written');
-    assert.equal(noteDegradedCatalog(CFG_ARGS, 'movie', t0 + 1), false, 'the next request must be quiet');
-    assert.equal(
-        noteDegradedCatalog(CFG_ARGS, 'movie', t0 + DEGRADED_CATALOG_LOG_INTERVAL_MS - 1), false,
+    expect(noteDegradedCatalog(CFG_ARGS, 'movie', t0), 'the first one must be written').toBe(true);
+    expect(noteDegradedCatalog(CFG_ARGS, 'movie', t0 + 1), 'the next request must be quiet').toBe(false);
+    expect(
+        noteDegradedCatalog(CFG_ARGS, 'movie', t0 + DEGRADED_CATALOG_LOG_INTERVAL_MS - 1),
         'still inside the interval'
-    );
-    assert.equal(
-        noteDegradedCatalog(CFG_ARGS, 'movie', t0 + DEGRADED_CATALOG_LOG_INTERVAL_MS), true,
+    ).toBe(false);
+    expect(
+        noteDegradedCatalog(CFG_ARGS, 'movie', t0 + DEGRADED_CATALOG_LOG_INTERVAL_MS),
         'the operator hears about an outage that is still going'
-    );
+    ).toBe(true);
 
     // A different kind, and a different account, are separate facts.
-    assert.equal(noteDegradedCatalog(CFG_ARGS, 'series', t0 + 1), true);
-    assert.equal(noteDegradedCatalog({ ...CFG_ARGS, username: 'bob' }, 'movie', t0 + 1), true);
+    expect(noteDegradedCatalog(CFG_ARGS, 'series', t0 + 1)).toBe(true);
+    expect(noteDegradedCatalog({ ...CFG_ARGS, username: 'bob' }, 'movie', t0 + 1)).toBe(true);
 });
 
 test('the warning keys are bounded, and eviction only re-arms a warning', () => {
@@ -128,12 +125,15 @@ test('the warning keys are bounded, and eviction only re-arms a warning', () => 
     for (let i = 0; i < 1200; i++) {
         noteDegradedCatalog({ ...CFG_ARGS, username: `u${i}` }, 'movie', t0 + i);
     }
-    assert.ok(degradedCatalogLogged.size <= 1000, `unbounded: ${degradedCatalogLogged.size} keys`);
+    expect(
+        degradedCatalogLogged.size,
+        `unbounded: ${degradedCatalogLogged.size} keys`
+    ).toBeLessThanOrEqual(1000);
 
     // Evicting the oldest means the most recently warned accounts stay quiet,
     // which is the direction that matters: a dropped key warns again, it never
     // silences one.
-    assert.equal(noteDegradedCatalog({ ...CFG_ARGS, username: 'u1199' }, 'movie', t0 + 1200), false);
+    expect(noteDegradedCatalog({ ...CFG_ARGS, username: 'u1199' }, 'movie', t0 + 1200)).toBe(false);
 });
 
 test('the catalog route no longer warns once per request', async () => {
@@ -153,6 +153,9 @@ test('the catalog route no longer warns once per request', async () => {
     });
 
     const degraded = lines.filter(l => l.includes('categories for this account'));
-    assert.equal(degraded.length, 1, `expected one line across four requests, got:\n${degraded.join('\n')}`);
+    expect(
+        degraded.length,
+        `expected one line across four requests, got:\n${degraded.join('\n')}`
+    ).toBe(1);
     global.fetch = realFetch;
 });

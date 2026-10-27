@@ -146,7 +146,7 @@ function parseYear(s) {
 }
 
 // Whether a payload is worth *answering* with: a name or episodes. It must mirror
-// the meta route's `hasContent` exactly, or the disagreement gets cached. What may
+// `hasContent` in src/routes/meta.js exactly, or the disagreement gets cached. What may
 // be cached for the full TTL is the stricter hasSeriesEpisodes.
 function isUsableSeriesInfo(info) {
     if (!info || typeof info !== 'object') return false;
@@ -306,7 +306,7 @@ function getVodInfo(cfg, vodId) {
 
 // This movie's item in the warm full list, or null. Never fetches: it is the
 // fallback for when get_vod_info fails, and a cold list costs seconds. The item
-// usually names the container, which is all the stream route needs (audit M2).
+// usually names the container, which is all the stream route needs.
 function warmVodItem(cfg, vodId) {
     const list = vodStreamsCache.get(cfg);
     return Array.isArray(list) ? findStreamById(list, vodId) : null;

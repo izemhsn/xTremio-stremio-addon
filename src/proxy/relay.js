@@ -135,8 +135,8 @@ function sniffPlaylistStart(stream, maxBytes = HLS_SNIFF_BYTES) {
                 if (filled < maxBytes) {
                     filled += chunk.copy(prefix, filled, 0, Math.min(chunk.length, maxBytes - filled));
                 }
-                const so_far = verdict();
-                if (so_far !== 'more') return finish(null, false, so_far === 'playlist');
+                const soFar = verdict();
+                if (soFar !== 'more') return finish(null, false, soFar === 'playlist');
                 if (filled >= maxBytes) return finish(null, false, false);
             }
         };
@@ -154,7 +154,7 @@ function sniffPlaylistStart(stream, maxBytes = HLS_SNIFF_BYTES) {
 // panel could serve text/html from this origin: `nosniff` stops a body it
 // labelled something else being sniffed into one, and `sandbox` — with no
 // allow- tokens — puts anything that is HTML in an opaque origin with no
-// scripts, no forms and no top-level navigation (audit L8). The impact is small
+// scripts, no forms and no top-level navigation. The impact is small
 // because this site sets no cookies, but the panel is untrusted and this is two
 // headers. `no-store` rides along because it belongs to the same rule: nothing
 // relayed here is worth a cache's memory of it.
@@ -184,108 +184,36 @@ function normalizeAcceptRanges({ status, upstreamValue, sentRange, sentIfRange }
     return 'bytes';
 }
 
-// The shared body of both proxy routes: resolve the upstream, forward the headers
-// that matter for playback, and either rewrite a playlist or stream the bytes.
-// `rewriteFor(finalUrl, contentType)` returns a mapper for playlist URIs, or null
-// to stream the body untouched.
+// The shared body of both proxy routes. In four steps:
+//
+//   1. upstreamRequestHeaders  — decide which of the player's headers to send on
+//   2. fetchUpstream           — get the provider's response headers, in time
+//   3a. relayRewrittenPlaylist — a playlist: buffer it, rewrite its URLs, send it
+//   3b. streamToClient         — anything else: stream the bytes as they arrive
+//
+// `rewriteFor(finalUrl, contentType)` returns a mapper for playlist URIs, or
+// null to stream the body untouched.
 async function relayUpstream(req, res, { upstreamUrl, label, ext, rewriteFor }) {
-    const headers = { 'User-Agent': PROXY_USER_AGENT };
-    // A Range on a playlist would yield a partial body that cannot be parsed or
-    // rewritten. Players do not range-request playlists; skip it when we already
-    // know from the extension that one is coming.
-    const expectPlaylist = String(ext || '').toLowerCase() === 'm3u8';
-    if (!expectPlaylist) {
-        // Left unset, undici's fetch offers gzip/deflate. An origin that honours
-        // that on a byte relay answers a Range with a Content-Range in
-        // *compressed* offsets, which no longer describe the decompressed bytes
-        // relayed — and decompressing video spends CPU on the relaying thread.
-        // Playlists keep the default: they are text and rewritten whole.
-        headers['Accept-Encoding'] = 'identity';
-        if (req.headers.range) headers['Range'] = req.headers.range;
-        if (req.headers['if-range']) headers['If-Range'] = req.headers['if-range'];
-    }
-    // What we asked for is half the evidence normalizeAcceptRanges needs below.
-    const sentRange = Boolean(headers['Range']);
-    const sentIfRange = Boolean(headers['If-Range']);
+    const { headers, sentRange, sentIfRange } = upstreamRequestHeaders(req, ext);
 
+    // One controller per relay. Aborting it cancels the upstream request, which
+    // is what every exit below does when the player goes away or a deadline
+    // passes.
     const controller = new AbortController();
     const abort = () => {
         if (!controller.signal.aborted) {
             try { controller.abort(); } catch {}
         }
     };
-    // 'close' alone: it fires whether the client finished or vanished, and covers
-    // everything the deprecated 'aborted' event did. Listening for both was two
-    // calls to the same idempotent abort, and one of them is on its way out of
-    // Node.
+    // 'close' fires whether the client finished or vanished.
     req.on('close', abort);
-
+    // Errors caused by our own abort are expected and not worth logging.
     const isAbortErr = (e) => e && (e.name === 'AbortError' || e.code === 'ABORT_ERR' || controller.signal.aborted);
+    const ctx = { req, res, label, signal: controller.signal, abort, isAbortErr };
 
-    let upstream;
-    let finalUrl = upstreamUrl;
-    // Bound the wait for response *headers* only. An upstream that accepts the
-    // connection and then stalls would otherwise pin this request and its
-    // socket forever. The timer is cleared as soon as headers arrive so the
-    // body itself can stream for as long as playback needs.
-    let headersTimedOut = false;
-    let headerTimer = null;
-    // Re-armable, because the deadline bounds one exchange (audit L12). See the
-    // fallback below for why that matters.
-    const armHeaderTimer = () => {
-        clearTimeout(headerTimer);
-        headerTimer = setTimeout(() => { headersTimedOut = true; abort(); }, PROXY_HEADER_TIMEOUT_MS);
-    };
-    armHeaderTimer();
-    try {
-        // HEAD is passed through, and anything short of a usable response falls
-        // back to GET. Do not narrow this to 405/501: the real panel answers HEAD
-        // with a 502 and its CDN drops the connection, so fetch throws.
-        if (req.method === 'HEAD') {
-            try {
-                const head = await safeFetch(upstreamUrl, {
-                    method: 'HEAD',
-                    headers,
-                    signal: controller.signal
-                }, { onFinalUrl: (u) => { finalUrl = u; } });
-                if (head.status < 400) upstream = head;
-                else discardBody(head);
-            } catch (e) {
-                // A timeout or a client disconnect is not a statement about HEAD
-                // support, and retrying would paper over it.
-                if (headersTimedOut || isAbortErr(e)) throw e;
-            }
-        }
-
-        if (!upstream) {
-            // The fallback is a second exchange and gets its own deadline (audit
-            // L12). The real panel answers HEAD with a 502 and its CDN drops the
-            // connection, and it can take its time doing either; sharing one timer
-            // left the GET whatever remained of it, which on a slow panel is
-            // nothing at all. Two deadlines rather than one is the honest cost of
-            // trying HEAD first, and only a request that already spent the first
-            // one can pay the second.
-            if (req.method === 'HEAD') armHeaderTimer();
-            upstream = await safeFetch(upstreamUrl, {
-                method: 'GET',
-                headers,
-                signal: controller.signal
-            }, { onFinalUrl: (u) => { finalUrl = u; } });
-        }
-    } catch (e) {
-        if (headersTimedOut) {
-            console.warn(`[proxy] upstream headers timed out after ${PROXY_HEADER_TIMEOUT_MS}ms for ${label}`);
-            if (!res.headersSent) res.status(504).end('upstream timeout');
-            return;
-        }
-        if (!isAbortErr(e)) {
-            console.warn(`[proxy] upstream fetch failed for ${label}: ${e.message}`);
-        }
-        if (!res.headersSent) res.status(502).end('upstream fetch failed');
-        return;
-    } finally {
-        clearTimeout(headerTimer);
-    }
+    const fetched = await fetchUpstream(ctx, upstreamUrl, headers);
+    if (!fetched) return; // fetchUpstream already answered the client
+    const { upstream, finalUrl } = fetched;
 
     const contentType = upstream.headers.get('content-type');
     // Only a complete 200 body is rewritable; a 206 is a fragment, and an error
@@ -306,83 +234,196 @@ async function relayUpstream(req, res, { upstreamUrl, label, ext, rewriteFor }) 
     }
 
     if (mapper && req.method !== 'HEAD') {
-        let text;
-        // This branch buffers the whole body, so it gets its own deadline; the
-        // header timer is already cleared.
-        let bodyTimedOut = false;
-        const bodyTimer = setTimeout(() => { bodyTimedOut = true; abort(); }, PLAYLIST_BODY_TIMEOUT_MS);
-        try {
-            text = await readTextCapped(upstream.body, MAX_PLAYLIST_BYTES);
-        } catch (e) {
-            if (bodyTimedOut) {
-                console.warn(`[proxy] playlist body timed out after ${PLAYLIST_BODY_TIMEOUT_MS}ms for ${label}`);
-                if (!res.headersSent) res.status(504).end('upstream timeout');
-                return;
+        return relayRewrittenPlaylist(ctx, { upstream, finalUrl, contentType, mapper });
+    }
+    return streamToClient(ctx, { upstream, contentType, mapper, sentRange, sentIfRange });
+}
+
+// Step 1. The headers sent to the provider, and whether a range was asked for —
+// half of the evidence normalizeAcceptRanges needs later.
+function upstreamRequestHeaders(req, ext) {
+    const headers = { 'User-Agent': PROXY_USER_AGENT };
+    // A Range on a playlist would yield a partial body that cannot be parsed or
+    // rewritten. Players do not range-request playlists; skip it when we already
+    // know from the extension that one is coming.
+    const expectPlaylist = String(ext || '').toLowerCase() === 'm3u8';
+    if (!expectPlaylist) {
+        // Left unset, fetch offers gzip/deflate. An origin that honours that on
+        // a byte relay answers a Range with a Content-Range in *compressed*
+        // offsets, which no longer describe the decompressed bytes relayed — and
+        // decompressing video spends CPU on the relaying thread. Playlists keep
+        // the default: they are text and rewritten whole.
+        headers['Accept-Encoding'] = 'identity';
+        if (req.headers.range) headers['Range'] = req.headers.range;
+        if (req.headers['if-range']) headers['If-Range'] = req.headers['if-range'];
+    }
+    return {
+        headers,
+        sentRange: Boolean(headers['Range']),
+        sentIfRange: Boolean(headers['If-Range'])
+    };
+}
+
+// Step 2. Returns `{ upstream, finalUrl }`, or null after answering the client
+// itself with a 502 or 504.
+//
+// Only the wait for response *headers* is bounded here. An upstream that
+// accepts the connection and then stalls would otherwise hold this request open
+// forever. The timer is cleared as soon as headers arrive, so the body can
+// stream for as long as playback needs.
+async function fetchUpstream(ctx, upstreamUrl, headers) {
+    const { req, res, label, signal, abort, isAbortErr } = ctx;
+    let upstream;
+    // The URL that actually answered, after redirects. Playlists carry relative
+    // URIs, which must be resolved against this URL rather than the one asked for.
+    let finalUrl = upstreamUrl;
+    const onFinalUrl = (u) => { finalUrl = u; };
+
+    let headersTimedOut = false;
+    let headerTimer = null;
+    // Re-armable, because the deadline bounds one exchange; see the GET
+    // fallback below.
+    const armHeaderTimer = () => {
+        clearTimeout(headerTimer);
+        headerTimer = setTimeout(() => { headersTimedOut = true; abort(); }, PROXY_HEADER_TIMEOUT_MS);
+    };
+    armHeaderTimer();
+    try {
+        // HEAD is passed through, and anything short of a usable response falls
+        // back to GET. Do not narrow this to 405/501: a real panel answers HEAD
+        // with a 502 and its CDN drops the connection, so fetch throws.
+        if (req.method === 'HEAD') {
+            try {
+                const head = await safeFetch(upstreamUrl, { method: 'HEAD', headers, signal }, { onFinalUrl });
+                if (head.status < 400) upstream = head;
+                else discardBody(head);
+            } catch (e) {
+                // A timeout or a client disconnect is not a statement about HEAD
+                // support, and retrying would paper over it.
+                if (headersTimedOut || isAbortErr(e)) throw e;
             }
-            if (!isAbortErr(e)) console.warn(`[proxy] playlist read failed for ${label}: ${e.message}`);
-            // readTextCapped holds a reader, so the body is locked and cannot be
-            // cancelled — abort the request instead of leaving the socket half-read.
-            abort();
-            if (!res.headersSent) res.status(502).end('bad playlist');
-            return;
-        } finally {
-            clearTimeout(bodyTimer);
         }
 
-        // The body confirms what the headers suggested. A body without #EXTM3U
-        // is refused, not relayed: it may still carry credential-bearing URLs.
-        if (!HLS_BODY_PREFIX.test(text)) {
-            console.warn(`[proxy] expected a playlist for ${label} but the body does not start with #EXTM3U; refusing`);
-            if (!res.headersSent) res.status(502).end('bad playlist');
-            return;
+        if (!upstream) {
+            // The GET after a failed HEAD is a second exchange, so it gets a
+            // fresh deadline. Sharing one would leave it only whatever the slow
+            // HEAD left over, which can be nothing at all.
+            if (req.method === 'HEAD') armHeaderTimer();
+            upstream = await safeFetch(upstreamUrl, { method: 'GET', headers, signal }, { onFinalUrl });
         }
+    } catch (e) {
+        if (headersTimedOut) {
+            console.warn(`[proxy] upstream headers timed out after ${PROXY_HEADER_TIMEOUT_MS}ms for ${label}`);
+            if (!res.headersSent) res.status(504).end('upstream timeout');
+            return null;
+        }
+        if (!isAbortErr(e)) {
+            console.warn(`[proxy] upstream fetch failed for ${label}: ${e.message}`);
+        }
+        if (!res.headersSent) res.status(502).end('upstream fetch failed');
+        return null;
+    } finally {
+        clearTimeout(headerTimer);
+    }
+    return { upstream, finalUrl };
+}
 
-        // The two timers above are both cleared by now, so this phase carries its
-        // own deadline. See PLAYLIST_REWRITE_TIMEOUT_MS.
-        let rewritten;
-        try {
-            rewritten = await rewriteHlsPlaylist(text, finalUrl, mapper, {
-                deadline: Date.now() + PLAYLIST_REWRITE_TIMEOUT_MS
-            });
-        } catch (e) {
-            const timedOut = e.code === 'PLAYLIST_REWRITE_TIMEOUT';
-            const refused = e.code === 'PLAYLIST_TARGET_REFUSED';
-            const how = timedOut
-                ? `timed out after ${PLAYLIST_REWRITE_TIMEOUT_MS}ms`
-                : (refused ? 'refused a target' : 'failed');
-            console.warn(
-                `[proxy] playlist rewrite ${how} for ${label}${timedOut ? '' : `: ${e.message}`}`
-            );
-            if (!res.headersSent) {
-                res.status(timedOut ? 504 : 502)
-                    .end(timedOut ? 'upstream timeout' : (refused ? 'playlist target refused' : 'bad playlist'));
-            }
+// Step 3a. A playlist names its segments by URLs that contain the account's
+// credentials, so it cannot be streamed through: it is read whole, every URL in
+// it is rewritten to point back at this server, and the result is sent.
+async function relayRewrittenPlaylist(ctx, { upstream, finalUrl, contentType, mapper }) {
+    const { res, label, abort, isAbortErr } = ctx;
+
+    let text;
+    // Reading the whole body gets its own deadline; the header timer is already
+    // cleared.
+    let bodyTimedOut = false;
+    const bodyTimer = setTimeout(() => { bodyTimedOut = true; abort(); }, PLAYLIST_BODY_TIMEOUT_MS);
+    try {
+        text = await readTextCapped(upstream.body, MAX_PLAYLIST_BYTES);
+    } catch (e) {
+        if (bodyTimedOut) {
+            console.warn(`[proxy] playlist body timed out after ${PLAYLIST_BODY_TIMEOUT_MS}ms for ${label}`);
+            if (!res.headersSent) res.status(504).end('upstream timeout');
             return;
         }
-        res.status(upstream.status);
-        // Deliberately not forwarding content-length: the rewritten body is a
-        // different size. Nor accept-ranges — a playlist is not seekable.
-        if (contentType) res.setHeader('Content-Type', contentType);
-        setRelayHeaders(res);
-        return res.end(Buffer.from(rewritten, 'utf8'));
+        if (!isAbortErr(e)) console.warn(`[proxy] playlist read failed for ${label}: ${e.message}`);
+        // readTextCapped holds a reader, so the body is locked and cannot be
+        // cancelled — abort the request instead of leaving the socket half-read.
+        abort();
+        if (!res.headersSent) res.status(502).end('bad playlist');
+        return;
+    } finally {
+        clearTimeout(bodyTimer);
     }
 
-    // A playlist can also arrive where only bytes were expected: a segment path and
-    // a content type that says nothing route it straight here, and relaying it
-    // verbatim hands the player the provider's own credential-bearing URLs — the
-    // disclosure the rewrite exists to prevent, on the one path that never looked
-    // (audit L10, confirmed: /live/ID.ts answered with an m3u8 as text/plain).
+    // The body confirms what the headers suggested. A body without #EXTM3U is
+    // refused, not relayed: it may still carry credential-bearing URLs.
+    if (!HLS_BODY_PREFIX.test(text)) {
+        console.warn(`[proxy] expected a playlist for ${label} but the body does not start with #EXTM3U; refusing`);
+        if (!res.headersSent) res.status(502).end('bad playlist');
+        return;
+    }
+
+    // And the rewrite has a deadline of its own; see PLAYLIST_REWRITE_TIMEOUT_MS.
+    let rewritten;
+    try {
+        rewritten = await rewriteHlsPlaylist(text, finalUrl, mapper, {
+            deadline: Date.now() + PLAYLIST_REWRITE_TIMEOUT_MS
+        });
+    } catch (e) {
+        const timedOut = e.code === 'PLAYLIST_REWRITE_TIMEOUT';
+        const refused = e.code === 'PLAYLIST_TARGET_REFUSED';
+        const how = timedOut
+            ? `timed out after ${PLAYLIST_REWRITE_TIMEOUT_MS}ms`
+            : (refused ? 'refused a target' : 'failed');
+        console.warn(
+            `[proxy] playlist rewrite ${how} for ${label}${timedOut ? '' : `: ${e.message}`}`
+        );
+        if (!res.headersSent) {
+            res.status(timedOut ? 504 : 502)
+                .end(timedOut ? 'upstream timeout' : (refused ? 'playlist target refused' : 'bad playlist'));
+        }
+        return;
+    }
+    res.status(upstream.status);
+    // Deliberately not forwarding content-length: the rewritten body is a
+    // different size. Nor accept-ranges — a playlist is not seekable.
+    if (contentType) res.setHeader('Content-Type', contentType);
+    setRelayHeaders(res);
+    return res.end(Buffer.from(rewritten, 'utf8'));
+}
+
+// The upstream headers worth passing on for seekable playback. accept-ranges is
+// deliberately absent: it is a claim about the origin rather than a fact about
+// this body, so streamToClient works it out instead (normalizeAcceptRanges).
+const FORWARDED_HEADERS = [
+    'content-type',
+    'content-length',
+    'content-range',
+    'last-modified',
+    'etag'
+];
+
+// Step 3b. Everything that is not a rewritten playlist: video files, live
+// segments, and HEAD requests. The bytes are piped through as they arrive.
+async function streamToClient(ctx, { upstream, contentType, mapper, sentRange, sentIfRange }) {
+    const { req, res, label, abort, isAbortErr } = ctx;
+
+    // A playlist can also arrive where only bytes were expected — a segment
+    // path with a content type that says nothing. Relaying it verbatim would
+    // hand the player the provider's credential-bearing URLs, so the first few
+    // bytes are checked for #EXTM3U before anything is sent.
     //
-    // Refused, not rewritten. What a body is has to be decided before any of it is
-    // read, because the alternative here is a segment that must stream and keep its
-    // Range support; sniffing stays a confirmation of a body already in hand, never
-    // the thing that routes one. A provider naming a playlist on a segment path is
-    // misbehaving, and 502 says so without leaking anything.
-    let relay = null;
+    // Refused, not rewritten. Whether a body is a playlist has to be decided
+    // before reading it, because the alternative here is a video that must
+    // stream and keep its Range support. A provider serving a playlist on a
+    // segment path is misbehaving, and a 502 says so without leaking anything.
+    let sniffed = null;
     if (!mapper && req.method !== 'HEAD' && upstream.status === 200 && upstream.body) {
         const stream = Readable.fromWeb(upstream.body);
         try {
-            relay = { stream, ...await sniffPlaylistStart(stream) };
+            sniffed = { stream, ...await sniffPlaylistStart(stream) };
         } catch (e) {
             if (!isAbortErr(e)) console.warn(`[proxy] upstream body failed for ${label}: ${e.message}`);
             stream.destroy();
@@ -390,7 +431,7 @@ async function relayUpstream(req, res, { upstreamUrl, label, ext, rewriteFor }) 
             if (!res.headersSent) res.status(502).end('upstream stream failed');
             return;
         }
-        if (relay.playlist) {
+        if (sniffed.playlist) {
             console.warn(
                 `[proxy] refusing to relay a playlist served as ${JSON.stringify(contentType || '')} for ${label}`
             );
@@ -403,29 +444,17 @@ async function relayUpstream(req, res, { upstreamUrl, label, ext, rewriteFor }) 
 
     res.status(upstream.status);
 
-    // Forward headers relevant for seekable playback.
-    // accept-ranges is deliberately absent: it is the one header here that is a
-    // claim about the origin rather than a fact about this body, so it is
-    // derived below instead of relayed.
-    const forward = [
-        'content-type',
-        'content-length',
-        'content-range',
-        'last-modified',
-        'etag'
-    ];
-    // undici decompresses transparently, so on a content-encoded response the
+    // fetch decompresses transparently, so on a content-encoded response the
     // body handed to us is longer than the content-length that came with it.
     // Forwarding that number makes the client stop short or hang waiting for
-    // bytes that already arrived. Unlikely for media, plausible for a playlist
-    // or an error page, and the length is optional — Express falls back to
-    // chunked encoding without it.
+    // bytes that already arrived. The length is optional — Express falls back
+    // to chunked encoding without it.
     const encoded = Boolean(upstream.headers.get('content-encoding'));
-    // Only a HEAD reaches here with a mapper. The GET it previews is rewritten,
-    // so upstream's length is the wrong body's, and a playlist is not seekable —
-    // the same two headers the rewrite branch above leaves out.
+    // Only a HEAD reaches here with a mapper. The GET it previews would be
+    // rewritten, so upstream's length is the wrong body's, and a playlist is not
+    // seekable — the same two headers relayRewrittenPlaylist leaves out.
     const previewsRewrite = Boolean(mapper);
-    for (const h of forward) {
+    for (const h of FORWARDED_HEADERS) {
         if ((encoded || previewsRewrite) && h === 'content-length') continue;
         const v = upstream.headers.get(h);
         if (v) res.setHeader(h, v);
@@ -441,13 +470,13 @@ async function relayUpstream(req, res, { upstreamUrl, label, ext, rewriteFor }) 
     setRelayHeaders(res);
 
     if (req.method === 'HEAD' || !upstream.body) {
-        // A HEAD that fell back to GET above still has a body nobody will read.
+        // A HEAD that fell back to GET still has a body nobody will read.
         discardBody(upstream);
         return res.end();
     }
 
     // Already wrapped if the sniff ran; the web body can only be taken once.
-    const nodeStream = relay ? relay.stream : Readable.fromWeb(upstream.body);
+    const nodeStream = sniffed ? sniffed.stream : Readable.fromWeb(upstream.body);
     nodeStream.on('error', (e) => {
         if (!isAbortErr(e)) {
             console.warn(`[proxy] stream error for ${label}: ${e.message}`);
@@ -458,7 +487,7 @@ async function relayUpstream(req, res, { upstreamUrl, label, ext, rewriteFor }) 
         // so the player retries, rather than leaving it waiting on keep-alive.
         if (res.headersSent) return res.destroy();
         // Nothing sent yet: drop the upstream headers and answer a bare 502.
-        for (const h of [...forward, 'accept-ranges']) res.removeHeader(h);
+        for (const h of [...FORWARDED_HEADERS, 'accept-ranges']) res.removeHeader(h);
         const body = 'upstream stream failed';
         res.status(502);
         res.setHeader('Content-Type', 'text/plain; charset=utf-8');
@@ -470,14 +499,13 @@ async function relayUpstream(req, res, { upstreamUrl, label, ext, rewriteFor }) 
         abort();
         nodeStream.destroy();
     });
-    if (relay && relay.head.length) res.write(relay.head);
-    if (relay && relay.ended) return res.end();
+    // The sniff already read the first bytes; send them before piping the rest.
+    if (sniffed && sniffed.head.length) res.write(sniffed.head);
+    if (sniffed && sniffed.ended) return res.end();
     nodeStream.pipe(res);
 }
 
-// Stream proxy. Providers 302 to a CDN URL whose token expires in about a minute,
-// so every range request is re-resolved here; this also keeps the credentials in
-// the upstream path off the player.
+// --- Which hosts a playlist may send the proxy to ----------------------------
 //
 // Extra hostnames a playlist may name beyond the panel and the playlist's own
 // origin, for a provider that fans out. Every entry is a host this server will
@@ -508,7 +536,8 @@ function hlsTargetOrigins(...candidates) {
 
 // `allowedOrigins` is required, with no permissive default, so a caller that forgets
 // it signs nothing. It bounds a misbehaving playlist from an honest panel, not a
-// malicious panel, whose own origins are in the set (audit D1; see S3).
+// malicious panel, whose own origins are in the set (ALLOWED_PANEL_HOSTS is the
+// defence against those).
 function makeHlsProxyMapper(base, configToken, allowedOrigins) {
     // Vetting is per origin, shared through hlsOriginVetCache, and distinct origins
     // are capped per playlist; past the cap the playlist is refused.
@@ -574,7 +603,7 @@ function relayLimitFromEnv(name, fallback) {
 
 const PROXY_MAX_CONCURRENT_PER_TOKEN = relayLimitFromEnv('PROXY_MAX_CONCURRENT_PER_TOKEN', 16);
 
-// Accounts are free to make (audit S3), so relays are also capped per client
+// Accounts are free to make, so relays are also capped per client
 // (keyed by clientKey; generous, for carrier NAT) and in total (size it to your
 // bandwidth).
 const PROXY_MAX_CONCURRENT_PER_CLIENT = relayLimitFromEnv('PROXY_MAX_CONCURRENT_PER_CLIENT', 32);

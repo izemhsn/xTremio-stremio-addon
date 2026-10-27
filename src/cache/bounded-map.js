@@ -9,7 +9,7 @@
 // src/upstream/read-capped.js, and only the number arrives here.
 
 
-// One memory budget shared by every data cache (CACHE_MAX_MB, audit R2): the
+// One memory budget shared by every data cache (CACHE_MAX_MB): the
 // per-cache bounds do not add up to any figure of memory. LRU across all caches in
 // one order. Entries are tracked by object identity, so caches sharing a key string
 // cannot collide, and by the weight they were added with, so the total cannot drift.
@@ -166,7 +166,7 @@ class BoundedMap extends Map {
     // An entry carrying its own ttl longer than maxAgeMs is reclaimed on that
     // instead: the stale-on-failure path extends one deliberately so the list
     // keeps being served through an outage, and sweeping it on the map's age
-    // silently undid that a few minutes later (audit L3). A *shorter* per-entry
+    // silently undid that a few minutes later. A *shorter* per-entry
     // ttl never shortens the sweep — those entries stop being served on their
     // own ttl and are reclaimed here on the map's, exactly as before — so this
     // only ever keeps an entry that something deliberately asked to keep.

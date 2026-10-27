@@ -90,8 +90,8 @@ const CACHE_REFRESH_AHEAD = 0.8;
 // Keyed by the panel's origin, not the URL as typed: every upstream URL is built
 // from an absolute path, so `http://PANEL.x:80/a?b` reaches the same account as
 // `http://panel.x`, and keying on the spelling gave one account a fresh relay
-// budget and a second copy of its lists per variant (audit M1). JSON rather than
-// a separator, which a username or password could contain (audit L11).
+// budget and a second copy of its lists per variant. JSON rather than
+// a separator, which a username or password could contain.
 function accountCacheKey(cfg) {
     let server = cfg.serverUrl;
     try {
@@ -109,7 +109,7 @@ const CACHE_MAX_ACCOUNTS = Math.max(1, Number(process.env.CACHE_MAX_ACCOUNTS) ||
 
 // How many accounts' full stream lists to hold, per kind. Memory is bounded in
 // bytes, so this only stops many tiny entries accumulating; a low count was a churn
-// cliff (audit R3). A worker-thread parse was measured and is worse: structured
+// cliff. A worker-thread parse was measured and is worse: structured
 // clone deserializes on the main thread anyway.
 const CACHE_MAX_STREAM_ACCOUNTS = Math.max(1, Number(process.env.CACHE_MAX_STREAM_ACCOUNTS) || 64);
 
@@ -161,7 +161,7 @@ function createStreamListCache() {
     // these are by far the largest entries, so reclaiming an abandoned one
     // matters most. The one entry that must outlive that is the stale copy an
     // outage is being served from, and it says so itself by carrying a longer
-    // ttl, which sweep() honours (audit L3).
+    // ttl, which sweep() honours.
     const map = registerSweepable(new BoundedMap({
         maxEntries: CACHE_MAX_STREAM_ACCOUNTS,
         maxAgeMs: CACHE_TTL,
@@ -197,8 +197,8 @@ function createStreamListCache() {
 
     // Whether a warm entry is old enough to be worth refreshing behind the request
     // that found it. Only a full-strength entry qualifies: a shorter ttl marks
-    // either an empty list or the stale copy an outage is being served from (audit
-    // L3), and refreshing those would mean fetching on nearly every request rather
+    // either an empty list or the stale copy an outage is being served from,
+    // and refreshing those would mean fetching on nearly every request rather
     // than once per TTL. The cooldown bounds it the other way — one attempt per
     // CACHE_FAILURE_TTL whatever the outcome, so a panel that has started failing
     // is not asked again by every request that arrives.
@@ -230,7 +230,7 @@ function createStreamListCache() {
         // Refetches an entry that is still warm but far enough through its life that
         // the next request would have paid for it — measured at 4.8 s for a movie
         // list and 2.6 s for a series list, once per TTL per account, inside the
-        // request that happened to arrive first (audit Perf). Nothing awaits this,
+        // request that happened to arrive first. Nothing awaits this,
         // so it can only ever make a later request faster; a failure is swallowed
         // and leaves the warm entry exactly as it was, to be retried inline once it
         // really does expire. Triggered by a request and never by a timer, so a list

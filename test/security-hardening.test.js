@@ -12,8 +12,6 @@
 process.env.CONFIG_SECRET = 'test-secret-for-unit-tests';
 process.env.ALLOW_PRIVATE_NETWORKS = 'true';
 
-const test = require('node:test');
-const assert = require('node:assert');
 const crypto = require('node:crypto');
 const { execFileSync } = require('node:child_process');
 
@@ -29,15 +27,16 @@ const {
     CONFIG_TOKEN_VERSION,
     CONFIG_SECRET_MIN_BYTES,
     SCRYPT_PARAMS
-} = require('../index.js');
+} = require('./support/internals.js');
 
 const INDEX = require.resolve('../index.js');
+// For child processes that need internals without starting the server.
+const INTERNALS = require.resolve('./support/internals.js');
 // The token crypto lives in its own module now. The source-level assertion below
 // has to read the file the derivation is actually written in, not the barrel that
 // re-exports it.
 const CONFIG_TOKEN_SRC = require.resolve('../src/config-token.js');
 const realFetch = global.fetch;
-const CFG = encodeConfig({ serverUrl: 'http://provider.test:8080', username: 'alice', password: 'secret' });
 
 function collect() {
     const entries = [];
@@ -48,7 +47,7 @@ function collect() {
 
 test('keys are derived with scrypt, not a bare hash of the secret', () => {
     const key = deriveConfigKey('config-enc');
-    assert.equal(key.length, 32);
+    expect(key.length).toBe(32);
 
     // The exact thing the finding was about: the old derivation was one SHA-256
     // over a label and the secret, so a guess cost a single hash.
@@ -56,7 +55,7 @@ test('keys are derived with scrypt, not a bare hash of the secret', () => {
         .update('xtremio-config-enc')
         .update(Buffer.from(process.env.CONFIG_SECRET, 'utf8'))
         .digest();
-    assert.notDeepEqual(key, oldStyle);
+    expect(key).not.toStrictEqual(oldStyle);
 
     // And it really is scrypt with these parameters, not something cheaper.
     const expected = crypto.scryptSync(
@@ -65,23 +64,22 @@ test('keys are derived with scrypt, not a bare hash of the secret', () => {
         32,
         SCRYPT_PARAMS
     );
-    assert.deepEqual(key, expected);
+    expect(key).toStrictEqual(expected);
 });
 
 test('the scrypt cost is high enough to matter', () => {
     // N is the work factor and r sets the memory per attempt. Below this the
     // derivation stops being meaningfully more expensive than a plain hash.
-    assert.ok(SCRYPT_PARAMS.N >= 16384, `N=${SCRYPT_PARAMS.N} is too low`);
-    assert.ok(SCRYPT_PARAMS.r >= 8, `r=${SCRYPT_PARAMS.r} is too low`);
+    expect(SCRYPT_PARAMS.N, `N=${SCRYPT_PARAMS.N} is too low`).toBeGreaterThanOrEqual(16384);
+    expect(SCRYPT_PARAMS.r, `r=${SCRYPT_PARAMS.r} is too low`).toBeGreaterThanOrEqual(8);
     // 128 * N * r bytes must fit, or scryptSync throws at boot.
-    assert.ok(SCRYPT_PARAMS.maxmem >= 128 * SCRYPT_PARAMS.N * SCRYPT_PARAMS.r,
-        'maxmem cannot hold the configured N and r');
+    expect(SCRYPT_PARAMS.maxmem, 'maxmem cannot hold the configured N and r').toBeGreaterThanOrEqual(128 * SCRYPT_PARAMS.N * SCRYPT_PARAMS.r);
 });
 
 test('the two keys are independent', () => {
     // Same secret, different labels. If these ever matched, the MAC key and the
     // encryption key would be the same value.
-    assert.notDeepEqual(deriveConfigKey('config-enc'), deriveConfigKey('config-mac'));
+    expect(deriveConfigKey('config-enc')).not.toStrictEqual(deriveConfigKey('config-mac'));
 
     // The above only proves the function separates labels. Whether the module
     // actually *passes* two different ones is invisible from outside — reusing one
@@ -91,32 +89,34 @@ test('the two keys are independent', () => {
     const src = require('node:fs').readFileSync(CONFIG_TOKEN_SRC, 'utf8');
     const enc = /const CONFIG_ENC_KEY = deriveConfigKey\('([^']+)'\)/.exec(src);
     const mac = /const CONFIG_MAC_KEY = deriveConfigKey\('([^']+)'\)/.exec(src);
-    assert.ok(enc && mac, 'both keys must be derived through deriveConfigKey');
-    assert.notEqual(enc[1], mac[1], 'the encryption and MAC keys share a derivation label');
+    expect(enc && mac, 'both keys must be derived through deriveConfigKey').toBeTruthy();
+    expect(enc[1], 'the encryption and MAC keys share a derivation label').not.toBe(mac[1]);
 });
 
 test('the token version was bumped, so old install URLs are rejected', () => {
-    assert.equal(CONFIG_TOKEN_VERSION, 'v3');
-    assert.ok(encodeConfig({ serverUrl: 'http://a.b', username: 'u', password: 'p' }).startsWith('v3.'));
+    expect(CONFIG_TOKEN_VERSION).toBe('v3');
+    expect(
+        encodeConfig({ serverUrl: 'http://a.b', username: 'u', password: 'p' }).startsWith('v3.')
+    ).toBeTruthy();
 });
 
 test('a token still round-trips under the new derivation', () => {
     const cfg = { serverUrl: 'http://example.com:8080', username: 'user', password: 'pass' };
-    assert.deepEqual(decodeConfig(encodeConfig(cfg)), cfg);
+    expect(decodeConfig(encodeConfig(cfg))).toStrictEqual(cfg);
 });
 
 // --- L8: secret policy -----------------------------------------------------
 
 test('configSecretProblems flags a missing secret', () => {
     const problems = configSecretProblems(undefined);
-    assert.equal(problems.length, 1);
-    assert.match(problems[0], /not set/);
+    expect(problems.length).toBe(1);
+    expect(problems[0]).toMatch(/not set/);
 });
 
 test('configSecretProblems flags a secret below the minimum length', () => {
     const short = 'a'.repeat(CONFIG_SECRET_MIN_BYTES - 1);
-    assert.match(configSecretProblems(short)[0], /bytes/);
-    assert.deepEqual(configSecretProblems('a'.repeat(CONFIG_SECRET_MIN_BYTES)), []);
+    expect(configSecretProblems(short)[0]).toMatch(/bytes/);
+    expect(configSecretProblems('a'.repeat(CONFIG_SECRET_MIN_BYTES))).toStrictEqual([]);
 });
 
 test('length is counted in bytes, not characters', () => {
@@ -125,19 +125,19 @@ test('length is counted in bytes, not characters', () => {
     // the threshold in opposite directions for the two measures, or a revert to
     // `raw.length` passes unnoticed.
     const emoji = '🔐'.repeat(11);
-    assert.equal(Buffer.byteLength(emoji, 'utf8'), 44);
-    assert.equal(emoji.length, 22);
-    assert.deepEqual(configSecretProblems(emoji), []);
-    assert.equal(configSecretProblems('a'.repeat(16)).length, 1);
+    expect(Buffer.byteLength(emoji, 'utf8')).toBe(44);
+    expect(emoji.length).toBe(22);
+    expect(configSecretProblems(emoji)).toStrictEqual([]);
+    expect(configSecretProblems('a'.repeat(16)).length).toBe(1);
 });
 
 test('development warns and carries on', () => {
     const log = collect();
     let exited = null;
     const ok = enforceConfigSecretPolicy({ raw: undefined, production: false, log, exit: c => { exited = c; } });
-    assert.equal(ok, true);
-    assert.equal(exited, null, 'development must not exit');
-    assert.ok(log.entries.some(([level]) => level === 'warn'));
+    expect(ok).toBe(true);
+    expect(exited, 'development must not exit').toBeNull();
+    expect(log.entries.some(([level]) => level === 'warn')).toBeTruthy();
 });
 
 test('production refuses to start on a missing or weak secret', () => {
@@ -145,9 +145,9 @@ test('production refuses to start on a missing or weak secret', () => {
         const log = collect();
         let exited = null;
         const ok = enforceConfigSecretPolicy({ raw, production: true, log, exit: c => { exited = c; } });
-        assert.equal(ok, false, `raw=${JSON.stringify(raw)} should be refused`);
-        assert.equal(exited, 1);
-        assert.ok(log.entries.some(([level]) => level === 'error'));
+        expect(ok, `raw=${JSON.stringify(raw)} should be refused`).toBe(false);
+        expect(exited).toBe(1);
+        expect(log.entries.some(([level]) => level === 'error')).toBeTruthy();
     }
 });
 
@@ -155,9 +155,9 @@ test('production starts normally on a strong secret', () => {
     const log = collect();
     let exited = null;
     const ok = enforceConfigSecretPolicy({ raw: 'x'.repeat(48), production: true, log, exit: c => { exited = c; } });
-    assert.equal(ok, true);
-    assert.equal(exited, null);
-    assert.deepEqual(log.entries, []);
+    expect(ok).toBe(true);
+    expect(exited).toBeNull();
+    expect(log.entries).toStrictEqual([]);
 });
 
 test('a production boot with a weak secret exits rather than serving', () => {
@@ -174,9 +174,9 @@ test('a production boot with a weak secret exits rather than serving', () => {
         code = e.status;
         output = (e.stdout || '') + (e.stderr || '');
     }
-    assert.equal(code, 1, 'a production boot with a weak secret must exit 1');
-    assert.match(output, /Refusing to start/);
-    assert.doesNotMatch(output, /Addon running at/, 'it must not have bound a port');
+    expect(code, 'a production boot with a weak secret must exit 1').toBe(1);
+    expect(output).toMatch(/Refusing to start/);
+    expect(output, 'it must not have bound a port').not.toMatch(/Addon running at/);
 });
 
 // --- L7 (later audit): an install link built from an unpinned Host ----------
@@ -190,11 +190,11 @@ test('a production boot with a weak secret exits rather than serving', () => {
 
 test('production without PUBLIC_URL is warned about', () => {
     const log = collect();
-    assert.equal(warnOnUnpinnedBaseUrl({ publicUrl: null, production: true, log }), true);
-    assert.equal(log.entries.length, 1);
+    expect(warnOnUnpinnedBaseUrl({ publicUrl: null, production: true, log })).toBe(true);
+    expect(log.entries.length).toBe(1);
     const [level, message] = log.entries[0];
-    assert.equal(level, 'warn', 'a warning, not a refusal');
-    assert.match(message, /PUBLIC_URL/);
+    expect(level, 'a warning, not a refusal').toBe('warn');
+    expect(message).toMatch(/PUBLIC_URL/);
 });
 
 test('a pinned base URL, or development, says nothing', () => {
@@ -206,8 +206,8 @@ test('a pinned base URL, or development, says nothing', () => {
         { publicUrl: 'https://addon.example', production: false }
     ]) {
         const log = collect();
-        assert.equal(warnOnUnpinnedBaseUrl({ ...args, log }), false, JSON.stringify(args));
-        assert.deepEqual(log.entries, [], JSON.stringify(args));
+        expect(warnOnUnpinnedBaseUrl({ ...args, log }), JSON.stringify(args)).toBe(false);
+        expect(log.entries, JSON.stringify(args)).toStrictEqual([]);
     }
 });
 
@@ -223,10 +223,10 @@ test('a production boot without PUBLIC_URL warns and still serves', () => {
         output = execFileSync(process.execPath, [INDEX], { env, encoding: 'utf8', timeout: 3000 });
     } catch (e) {
         output = (e.stdout || '') + (e.stderr || '');
-        assert.notEqual(e.status, 1, 'a missing PUBLIC_URL must not stop the server starting');
+        expect(e.status, 'a missing PUBLIC_URL must not stop the server starting').not.toBe(1);
     }
-    assert.match(output, /PUBLIC_URL is not set/);
-    assert.match(output, /Addon running at/, 'it warned and carried on');
+    expect(output).toMatch(/PUBLIC_URL is not set/);
+    expect(output, 'it warned and carried on').toMatch(/Addon running at/);
 });
 
 // --- L9: CORS scope --------------------------------------------------------
@@ -234,12 +234,12 @@ test('a production boot without PUBLIC_URL warns and still serves', () => {
 test('the addon protocol keeps its wildcard, the rest does not', () => {
     // web.stremio.com calls these cross-origin, so they genuinely need it.
     for (const path of ['/manifest.json', '/tok/manifest.json', '/tok/catalog/XT-Movies/x.json', '/tok/meta/series/x.json', '/tok/stream/series/x.json']) {
-        assert.equal(corsApplies(path), true, `${path} needs CORS`);
+        expect(corsApplies(path), `${path} needs CORS`).toBe(true);
     }
     // These do not: /configure handles plaintext credentials, and the landing
     // page and health probe are read by people and orchestrators.
     for (const path of ['/configure', '/tok/configure', '/', '/health', '/tok/proxy/movie/1.mp4']) {
-        assert.equal(corsApplies(path), false, `${path} must not be wildcarded`);
+        expect(corsApplies(path), `${path} must not be wildcarded`).toBe(false);
     }
 });
 
@@ -248,11 +248,11 @@ test('CORS headers on the wire match that scope', async () => {
     const base = `http://127.0.0.1:${server.address().port}`;
     try {
         const wildcarded = await realFetch(`${base}/manifest.json`);
-        assert.equal(wildcarded.headers.get('access-control-allow-origin'), '*');
+        expect(wildcarded.headers.get('access-control-allow-origin')).toBe('*');
 
         for (const path of ['/configure', '/health', '/']) {
             const res = await realFetch(base + path);
-            assert.equal(res.headers.get('access-control-allow-origin'), null, `${path} still sends CORS`);
+            expect(res.headers.get('access-control-allow-origin'), `${path} still sends CORS`).toBeNull();
         }
     } finally {
         await new Promise(r => server.close(r));
@@ -263,30 +263,29 @@ test('PROXY_CORS=true restores the wildcard on the byte proxy only', () => {
     // The escape hatch, in case a player turns out to need it. Checked in a child
     // process because the flag is read at module load.
     const out = execFileSync(process.execPath, ['-e', `
-        const m = require(${JSON.stringify(INDEX)});
+        const m = require(${JSON.stringify(INTERNALS)});
         console.log(JSON.stringify([m.corsApplies('/tok/proxy/movie/1.mp4'), m.corsApplies('/configure')]));
     `], {
         env: { ...process.env, PROXY_CORS: 'true', CONFIG_SECRET: 'x'.repeat(32) },
         encoding: 'utf8'
     });
     const [proxy, configure] = JSON.parse(out.trim().split('\n').pop());
-    assert.equal(proxy, true, 'PROXY_CORS=true must re-enable the proxy wildcard');
-    assert.equal(configure, false, 'and must not leak onto the credential page');
+    expect(proxy, 'PROXY_CORS=true must re-enable the proxy wildcard').toBe(true);
+    expect(configure, 'and must not leak onto the credential page').toBe(false);
 });
 
 // --- H2 residual: no blanket AbortError exemption --------------------------
 
 test('the exception handlers no longer exempt AbortErrors', () => {
-    const src = require('node:fs').readFileSync(INDEX, 'utf8');
-    const bootstrap = src.slice(src.indexOf('if (require.main === module)'));
+    // index.js is nothing but the bootstrap, so the whole file is checked.
+    const bootstrap = require('node:fs').readFileSync(INDEX, 'utf8');
     // Match the guard itself, not the word: the block still *mentions* AbortError
     // in the comment explaining why the exemption is gone. The proxy route also
     // still filters aborts locally, which is the point — this asserts only that
     // the process-wide handlers stopped swallowing them.
-    assert.doesNotMatch(bootstrap, /name === 'AbortError'/,
-        'the global handlers must not special-case AbortError any more');
-    assert.doesNotMatch(bootstrap, /code === 'ABORT_ERR'/);
-    assert.match(bootstrap, /Uncaught exception, exiting/);
+    expect(bootstrap, 'the global handlers must not special-case AbortError any more').not.toMatch(/name === 'AbortError'/);
+    expect(bootstrap).not.toMatch(/code === 'ABORT_ERR'/);
+    expect(bootstrap).toMatch(/Uncaught exception, exiting/);
 });
 
 test('a client disconnecting mid-stream does not take the process down', async () => {
@@ -325,10 +324,10 @@ test('a client disconnecting mid-stream does not take the process down', async (
         for (let i = 0; i < 60 && !out.includes('Addon running'); i++) {
             await new Promise(r => setTimeout(r, 100));
         }
-        assert.ok(out.includes('Addon running'), `server did not start: ${out}`);
+        expect(out, `server did not start: ${out}`).toContain('Addon running');
 
         const token = execFileSync(process.execPath, ['-e', `
-            const m = require(${JSON.stringify(INDEX)});
+            const m = require(${JSON.stringify(INTERNALS)});
             process.stdout.write(m.encodeConfig({ serverUrl: 'http://127.0.0.1:${originPort}', username: 'u', password: 'p' }));
         `], { env: { ...process.env, CONFIG_SECRET: 'x'.repeat(32) }, encoding: 'utf8' }).trim();
 
@@ -341,10 +340,10 @@ test('a client disconnecting mid-stream does not take the process down', async (
 
         await new Promise(r => setTimeout(r, 700));
 
-        assert.equal(child.exitCode, null, `process died after a client disconnect:\n${out}`);
+        expect(child.exitCode, `process died after a client disconnect:\n${out}`).toBeNull();
         const health = await realFetch(`http://127.0.0.1:${PORT}/health`);
-        assert.equal(health.status, 200, 'still serving after the disconnect');
-        assert.doesNotMatch(out, /Uncaught exception/, `an abort escaped to the global handler:\n${out}`);
+        expect(health.status, 'still serving after the disconnect').toBe(200);
+        expect(out, `an abort escaped to the global handler:\n${out}`).not.toMatch(/Uncaught exception/);
     } finally {
         child.kill();
         await new Promise(r => origin.close(r));

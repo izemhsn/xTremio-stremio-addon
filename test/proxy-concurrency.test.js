@@ -10,8 +10,6 @@ process.env.CONFIG_SECRET = 'test-secret-for-unit-tests';
 process.env.ALLOW_PRIVATE_NETWORKS = 'true';
 process.env.PROXY_MAX_CONCURRENT_PER_TOKEN = '2';
 
-const test = require('node:test');
-const assert = require('node:assert');
 const http = require('node:http');
 
 const {
@@ -20,7 +18,7 @@ const {
     encodeHlsTarget,
     proxyInFlight,
     PROXY_MAX_CONCURRENT_PER_TOKEN
-} = require('../index.js');
+} = require('./support/internals.js');
 
 const CAP = PROXY_MAX_CONCURRENT_PER_TOKEN;
 
@@ -59,7 +57,7 @@ let base;
 let CFG;
 let OTHER;
 
-test.before(async () => {
+beforeAll(async () => {
     open = [];
     arrived = [];
     await new Promise(resolve => { provider = http.createServer(providerHandler).listen(0, '127.0.0.1', resolve); });
@@ -72,13 +70,13 @@ test.before(async () => {
     OTHER = encodeConfig({ serverUrl: providerBase, username: 'bob', password: 'other' });
 });
 
-test.after(async () => {
+afterAll(async () => {
     releaseAll();
     await new Promise(resolve => server.close(resolve));
     await new Promise(resolve => provider.close(resolve));
 });
 
-test.afterEach(async () => {
+afterEach(async () => {
     releaseAll();
     // Slots are released on the response's `close` event, which lands a tick or
     // two after the body ends.
@@ -98,13 +96,15 @@ function startRelay(token = CFG, path = 'movie/1.mp4') {
 test('a token may not exceed its concurrent relay budget', async () => {
     const relays = Array.from({ length: CAP }, () => startRelay());
     const held = await Promise.all(relays.map(r => r.done));
-    for (const res of held) assert.equal(res.status, 200);
+    for (const res of held) expect(res.status).toBe(200);
     await whenHeld(CAP);
 
     const over = await fetch(`${base}/${CFG}/proxy/movie/9.mp4`);
-    assert.equal(over.status, 429, 'the relay over the cap was allowed through');
-    assert.equal(over.headers.get('retry-after'), '1',
-        'a player needs to be told to come back for the segment, not that the stream ended');
+    expect(over.status, 'the relay over the cap was allowed through').toBe(429);
+    expect(
+        over.headers.get('retry-after'),
+        'a player needs to be told to come back for the segment, not that the stream ended'
+    ).toBe('1');
     await over.text();
 
     for (const r of relays) r.controller.abort();
@@ -115,14 +115,14 @@ test('finishing a relay returns its slot', async () => {
     await Promise.all(relays.map(r => r.done));
     await whenHeld(CAP);
 
-    assert.equal((await fetch(`${base}/${CFG}/proxy/movie/9.mp4`)).status, 429);
+    expect((await fetch(`${base}/${CFG}/proxy/movie/9.mp4`)).status).toBe(429);
 
     releaseAll();
     await Promise.all(relays.map(async r => { await (await r.done).text(); }));
     for (let i = 0; i < 200 && proxyInFlight.size; i++) await new Promise(r => setTimeout(r, 5));
 
     const after = await fetch(`${base}/${CFG}/proxy/movie/9.mp4`);
-    assert.equal(after.status, 200, 'the budget did not recover after the relays finished');
+    expect(after.status, 'the budget did not recover after the relays finished').toBe(200);
     after.body.cancel();
 });
 
@@ -138,9 +138,9 @@ test('a client that disconnects mid-stream returns its slot', async () => {
     for (const r of relays) r.controller.abort();
     for (let i = 0; i < 200 && proxyInFlight.size; i++) await new Promise(r => setTimeout(r, 5));
 
-    assert.equal(proxyInFlight.size, 0, 'an aborted relay leaked its slot');
+    expect(proxyInFlight.size, 'an aborted relay leaked its slot').toBe(0);
     const after = await fetch(`${base}/${CFG}/proxy/movie/9.mp4`);
-    assert.equal(after.status, 200);
+    expect(after.status).toBe(200);
     after.body.cancel();
 });
 
@@ -149,10 +149,10 @@ test('one account at its cap does not throttle another', async () => {
     await Promise.all(relays.map(r => r.done));
     await whenHeld(CAP);
 
-    assert.equal((await fetch(`${base}/${CFG}/proxy/movie/9.mp4`)).status, 429);
+    expect((await fetch(`${base}/${CFG}/proxy/movie/9.mp4`)).status).toBe(429);
 
     const other = await fetch(`${base}/${OTHER}/proxy/movie/9.mp4`);
-    assert.equal(other.status, 200, 'the budget is shared between accounts');
+    expect(other.status, 'the budget is shared between accounts').toBe(200);
     other.body.cancel();
 
     for (const r of relays) r.controller.abort();
@@ -164,14 +164,14 @@ test('a fresh token for the same credentials shares one budget', async () => {
     // is not a budget, which is why the counter is keyed by the account, the way the
     // rest of the file keys its caches.
     const reminted = encodeConfig({ serverUrl: providerBase, username: 'alice', password: 'secret' });
-    assert.notEqual(reminted, CFG, 'the fixture assumes tokens are not deterministic');
+    expect(reminted, 'the fixture assumes tokens are not deterministic').not.toBe(CFG);
 
     const relays = Array.from({ length: CAP }, () => startRelay());
     await Promise.all(relays.map(r => r.done));
     await whenHeld(CAP);
 
     const over = await fetch(`${base}/${reminted}/proxy/movie/9.mp4`);
-    assert.equal(over.status, 429, 're-minting the token bought a fresh allowance');
+    expect(over.status, 're-minting the token bought a fresh allowance').toBe(429);
     await over.text();
 
     for (const r of relays) r.controller.abort();
@@ -187,7 +187,7 @@ test('a different spelling of the server URL shares one budget (audit M1)', asyn
     await whenHeld(CAP);
 
     const over = await fetch(`${base}/${respelled}/proxy/movie/9.mp4`);
-    assert.equal(over.status, 429, 're-spelling the server URL bought a fresh allowance');
+    expect(over.status, 're-spelling the server URL bought a fresh allowance').toBe(429);
     await over.text();
 
     for (const r of relays) r.controller.abort();
@@ -202,11 +202,11 @@ test('the signed sub-resource route is capped too', async () => {
 
     const relays = Array.from({ length: CAP }, () => startRelay(CFG, hls));
     const held = await Promise.all(relays.map(r => r.done));
-    for (const res of held) assert.equal(res.status, 200);
+    for (const res of held) expect(res.status).toBe(200);
     await whenHeld(CAP);
 
     const over = await fetch(`${base}/${CFG}/proxy/${hls}`);
-    assert.equal(over.status, 429);
+    expect(over.status).toBe(429);
     await over.text();
 
     for (const r of relays) r.controller.abort();
@@ -218,18 +218,18 @@ test('an idle account costs no entry', async () => {
     const relay = startRelay();
     await relay.done;
     await whenHeld(1);
-    assert.equal(proxyInFlight.size, 1);
+    expect(proxyInFlight.size).toBe(1);
 
     relay.controller.abort();
     for (let i = 0; i < 200 && proxyInFlight.size; i++) await new Promise(r => setTimeout(r, 5));
-    assert.equal(proxyInFlight.size, 0, 'the counter kept a zero entry for an idle account');
+    expect(proxyInFlight.size, 'the counter kept a zero entry for an idle account').toBe(0);
 });
 
 test('an unauthorized request is refused before it can take a slot', async () => {
     const res = await fetch(`${base}/not-a-real-token/proxy/movie/1.mp4`);
-    assert.equal(res.status, 401);
+    expect(res.status).toBe(401);
     await res.text();
-    assert.equal(proxyInFlight.size, 0);
+    expect(proxyInFlight.size).toBe(0);
 });
 
 test('a malformed request is answered as one, not refused by the cap', async () => {
@@ -240,11 +240,11 @@ test('a malformed request is answered as one, not refused by the cap', async () 
     await whenHeld(CAP);
 
     const badFile = await fetch(`${base}/${CFG}/proxy/movie/not-a-number.mp4`);
-    assert.equal(badFile.status, 400);
+    expect(badFile.status).toBe(400);
     await badFile.text();
 
     const badTarget = await fetch(`${base}/${CFG}/proxy/hls?u=forged&s=forged&e=1`);
-    assert.equal(badTarget.status, 400);
+    expect(badTarget.status).toBe(400);
     await badTarget.text();
 
     for (const r of relays) r.controller.abort();
@@ -258,27 +258,27 @@ test('the limit can be turned off', async () => {
     // one of them still on, taking a slot is exactly what should happen.
     const names = ['PROXY_MAX_CONCURRENT_PER_TOKEN', 'PROXY_MAX_CONCURRENT_PER_CLIENT', 'PROXY_MAX_CONCURRENT_TOTAL'];
     // Both the barrel and the module that reads the values have to be evicted, or
-    // index.js comes back fresh still holding the cached limits.
-    const paths = [require.resolve('../index.js'), require.resolve('../src/proxy/relay.js')];
+    // the barrel comes back fresh still holding the cached limits.
+    const paths = [require.resolve('./support/internals.js'), require.resolve('../src/proxy/relay.js')];
     const saved = Object.fromEntries(names.map(name => [name, process.env[name]]));
     for (const name of names) process.env[name] = '0';
     for (const p of paths) delete require.cache[p];
     try {
-        const fresh = require('../index.js');
-        assert.equal(fresh.PROXY_MAX_CONCURRENT_PER_TOKEN, 0);
+        const fresh = require('./support/internals.js');
+        expect(fresh.PROXY_MAX_CONCURRENT_PER_TOKEN).toBe(0);
         // Nothing is counted, so nothing can be refused.
-        assert.equal(fresh.acquireProxySlot(
+        expect(fresh.acquireProxySlot(
             { serverUrl: 'x', username: 'y', password: 'z' },
             { headers: {}, socket: { remoteAddress: '203.0.113.5' } },
             { once() { throw new Error('must not register a release when disabled'); } }
-        ), null);
-        assert.equal(fresh.proxyInFlight.size, 0);
+        )).toBeNull();
+        expect(fresh.proxyInFlight.size).toBe(0);
     } finally {
         for (const name of names) {
             if (saved[name] === undefined) delete process.env[name];
             else process.env[name] = saved[name];
         }
         for (const p of paths) delete require.cache[p];
-        require('../index.js');
+        require('./support/internals.js');
     }
 });

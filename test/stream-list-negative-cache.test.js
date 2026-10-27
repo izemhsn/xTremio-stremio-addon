@@ -9,9 +9,6 @@
 process.env.CONFIG_SECRET = 'test-secret-for-unit-tests';
 process.env.ALLOW_PRIVATE_NETWORKS = 'true';
 
-const test = require('node:test');
-const assert = require('node:assert');
-
 const {
     getAllVodStreams,
     vodStreamsCache,
@@ -20,7 +17,7 @@ const {
     CACHE_FAILURE_TTL,
     CACHE_REFRESH_AHEAD,
     CACHE_STALE_MAX_AGE_MS
-} = require('../index.js');
+} = require('./support/internals.js');
 
 const realFetch = global.fetch;
 let calls = 0;
@@ -39,8 +36,8 @@ function stubFetch(payloads) {
 const cfg = { serverUrl: 'http://127.0.0.1:9', username: 'u', password: 'p' };
 const LIST = [{ stream_id: '1', name: 'Alpha' }, { stream_id: '2', name: 'Beta' }];
 
-test.beforeEach(() => { vodStreamsCache.map.clear(); });
-test.after(() => { global.fetch = realFetch; });
+beforeEach(() => { vodStreamsCache.map.clear(); });
+afterAll(() => { global.fetch = realFetch; });
 
 // The entry's own key is internal, and there is only ever one in these tests.
 function onlyEntry() {
@@ -53,20 +50,20 @@ test('a non-list payload is not cached as an empty catalog', async () => {
 
     // The blip surfaces as a rejection, which the catalog route turns into an
     // empty response for that one request.
-    await assert.rejects(() => getAllVodStreams(cfg), /not a list/);
-    assert.equal(vodStreamsCache.map.size, 0, 'nothing may be cached from a failed fetch');
+    await expect(getAllVodStreams(cfg)).rejects.toThrow(/not a list/);
+    expect(vodStreamsCache.map.size, 'nothing may be cached from a failed fetch').toBe(0);
 
     // The very next request retries rather than inheriting the emptiness.
-    assert.deepEqual(await getAllVodStreams(cfg), LIST);
-    assert.equal(calls, 2);
+    expect(await getAllVodStreams(cfg)).toStrictEqual(LIST);
+    expect(calls).toBe(2);
 });
 
 test('the shapes providers actually return on failure all count as failures', async () => {
     for (const payload of [{}, { user_info: {} }, null, 'error', 42]) {
         vodStreamsCache.map.clear();
         stubFetch([payload]);
-        await assert.rejects(() => getAllVodStreams(cfg), /not a list/);
-        assert.equal(vodStreamsCache.map.size, 0);
+        await expect(getAllVodStreams(cfg)).rejects.toThrow(/not a list/);
+        expect(vodStreamsCache.map.size).toBe(0);
     }
 });
 
@@ -75,15 +72,15 @@ test('a genuinely empty account is still cached, and not refetched', async () =>
     // it on every request would be the opposite mistake.
     stubFetch([[]]);
 
-    assert.deepEqual(await getAllVodStreams(cfg), []);
-    assert.deepEqual(await getAllVodStreams(cfg), []);
-    assert.equal(calls, 1, 'an empty list is a hit, not a miss');
+    expect(await getAllVodStreams(cfg)).toStrictEqual([]);
+    expect(await getAllVodStreams(cfg)).toStrictEqual([]);
+    expect(calls, 'an empty list is a hit, not a miss').toBe(1);
 });
 
 test('a failed refresh serves the last good list instead of an empty shelf', async () => {
     stubFetch([LIST]);
-    assert.deepEqual(await getAllVodStreams(cfg), LIST);
-    assert.equal(calls, 1);
+    expect(await getAllVodStreams(cfg)).toStrictEqual(LIST);
+    expect(calls).toBe(1);
 
     // Age the entry past its TTL so the next call refreshes.
     const entry = onlyEntry();
@@ -91,24 +88,24 @@ test('a failed refresh serves the last good list instead of an empty shelf', asy
     entry.ts = trueTs;
 
     stubFetch([new Error('upstream down')]);
-    assert.deepEqual(await getAllVodStreams(cfg), LIST, 'stale beats empty');
-    assert.equal(calls, 1, 'the refresh was attempted');
+    expect(await getAllVodStreams(cfg), 'stale beats empty').toStrictEqual(LIST);
+    expect(calls, 'the refresh was attempted').toBe(1);
 
     // `ts` keeps the data's true age — it is what CACHE_STALE_MAX_AGE_MS is
     // measured against — and only the ttl moved, far enough to schedule the retry.
     const after = onlyEntry();
-    assert.equal(after.ts, trueTs, 'ts must not be re-stamped');
+    expect(after.ts, 'ts must not be re-stamped').toBe(trueTs);
     const servableFor = after.ts + after.ttl - Date.now();
-    assert.ok(
+    expect(
         servableFor > 0 && servableFor <= CACHE_FAILURE_TTL,
         `stale window should be at most ${CACHE_FAILURE_TTL}ms, got ${servableFor}`
-    );
+    ).toBeTruthy();
 });
 
 test('a failure with nothing cached rejects rather than inventing an empty list', async () => {
     stubFetch([new Error('upstream down')]);
-    await assert.rejects(() => getAllVodStreams(cfg), /upstream down/);
-    assert.equal(vodStreamsCache.map.size, 0);
+    await expect(getAllVodStreams(cfg)).rejects.toThrow(/upstream down/);
+    expect(vodStreamsCache.map.size).toBe(0);
 });
 
 // --- L3 — the sweeper used to undo the stale fallback -----------------------
@@ -133,19 +130,19 @@ test('a sweep leaves the stale copy an outage is being served from', async () =>
     ageEntryBy(CACHE_TTL + 1);
 
     stubFetch([new Error('upstream down')]);
-    assert.deepEqual(await getAllVodStreams(cfg), LIST, 'stale beats empty');
+    expect(await getAllVodStreams(cfg), 'stale beats empty').toStrictEqual(LIST);
 
     // The sweep that used to end it. Its own return value must not count the
     // entry either, or the operator reads a reclaim that did not happen.
     const dropped = sweepCaches(Date.now());
-    assert.equal(dropped, 0, 'nothing was reclaimed');
-    assert.ok(onlyEntry(), 'the stale copy survived the sweep');
+    expect(dropped, 'nothing was reclaimed').toBe(0);
+    expect(onlyEntry(), 'the stale copy survived the sweep').toBeTruthy();
 
     // And it is still served: within the retry window this is a cache hit, so
     // the dead provider is not asked again on every request.
     stubFetch([new Error('still down')]);
-    assert.deepEqual(await getAllVodStreams(cfg), LIST);
-    assert.equal(calls, 0, 'served from the stale copy without another upstream call');
+    expect(await getAllVodStreams(cfg)).toStrictEqual(LIST);
+    expect(calls, 'served from the stale copy without another upstream call').toBe(0);
 });
 
 test('an expired list nobody is falling back on is still reclaimed on the normal TTL', async () => {
@@ -156,8 +153,8 @@ test('an expired list nobody is falling back on is still reclaimed on the normal
     await getAllVodStreams(cfg);
     ageEntryBy(CACHE_TTL + 1);
 
-    assert.equal(sweepCaches(Date.now()), 1, 'reclaimed');
-    assert.equal(vodStreamsCache.map.size, 0);
+    expect(sweepCaches(Date.now()), 'reclaimed').toBe(1);
+    expect(vodStreamsCache.map.size).toBe(0);
 });
 
 test('the stale window is bounded, so a provider that is gone stops being served', async () => {
@@ -166,15 +163,14 @@ test('the stale window is bounded, so a provider that is gone stops being served
     ageEntryBy(CACHE_STALE_MAX_AGE_MS + 1);
 
     stubFetch([new Error('upstream down')]);
-    await assert.rejects(
-        () => getAllVodStreams(cfg),
-        /upstream down/,
+    await expect(
+        getAllVodStreams(cfg),
         'a day-old lineup is not worth serving; the route degrades instead'
-    );
+    ).rejects.toThrow(/upstream down/);
 
     // Nothing extended it, so the sweeper can now take it.
-    assert.equal(sweepCaches(Date.now()), 1);
-    assert.equal(vodStreamsCache.map.size, 0);
+    expect(sweepCaches(Date.now())).toBe(1);
+    expect(vodStreamsCache.map.size).toBe(0);
 });
 
 test('repeated failures extend the stale copy only up to the cap', async () => {
@@ -184,17 +180,17 @@ test('repeated failures extend the stale copy only up to the cap', async () => {
     ageEntryBy(CACHE_STALE_MAX_AGE_MS - Math.round(CACHE_FAILURE_TTL / 2));
 
     stubFetch([new Error('upstream down')]);
-    assert.deepEqual(await getAllVodStreams(cfg), LIST);
+    expect(await getAllVodStreams(cfg)).toStrictEqual(LIST);
 
     const entry = onlyEntry();
-    assert.equal(
-        entry.ttl, CACHE_STALE_MAX_AGE_MS,
+    expect(
+        entry.ttl,
         'the extension is clamped, so the copy cannot outlive the cap by repeated retries'
-    );
-    assert.ok(
-        entry.ts + entry.ttl - Date.now() <= CACHE_FAILURE_TTL,
+    ).toBe(CACHE_STALE_MAX_AGE_MS);
+    expect(
+        entry.ts + entry.ttl - Date.now(),
         'and what is left of the window is shorter than a full retry interval'
-    );
+    ).toBeLessThanOrEqual(CACHE_FAILURE_TTL);
 });
 
 // --- refresh-ahead (audit Perf) --------------------------------------------
@@ -217,22 +213,22 @@ function agePastRefresh(ms = 1000) {
 
 test('a request past the refresh point is served warm and refetched behind it', async () => {
     stubFetch([LIST]);
-    assert.deepEqual(await getAllVodStreams(cfg), LIST);
+    expect(await getAllVodStreams(cfg)).toStrictEqual(LIST);
     const before = agePastRefresh();
 
     const NEXT = [...LIST, { stream_id: '3', name: 'Gamma' }];
     stubFetch([NEXT]);
     const served = await getAllVodStreams(cfg);
-    assert.deepEqual(served, LIST, 'the request is answered warm, not made to wait for the refetch');
+    expect(served, 'the request is answered warm, not made to wait for the refetch').toStrictEqual(LIST);
 
     const refresh = settleRefresh();
-    assert.ok(refresh, 'and a refresh was started behind it');
+    expect(refresh, 'and a refresh was started behind it').toBeTruthy();
     await refresh;
 
     const after = onlyEntry();
-    assert.deepEqual(after.data, NEXT, 'which replaced the list');
-    assert.ok(after.ts > before, 'and re-stamped its age, so the next TTL starts now');
-    assert.equal(calls, 1, 'one upstream call, none of it inside a request');
+    expect(after.data, 'which replaced the list').toStrictEqual(NEXT);
+    expect(after.ts, 'and re-stamped its age, so the next TTL starts now').toBeGreaterThan(before);
+    expect(calls, 'one upstream call, none of it inside a request').toBe(1);
 });
 
 test('an entry short of the refresh point is left alone', async () => {
@@ -244,8 +240,8 @@ test('an entry short of the refresh point is left alone', async () => {
     stubFetch([LIST]);
     await getAllVodStreams(cfg);
 
-    assert.equal(calls, 0, 'nothing was refetched');
-    assert.equal(vodStreamsCache.refreshing.size, 0);
+    expect(calls, 'nothing was refetched').toBe(0);
+    expect(vodStreamsCache.refreshing.size).toBe(0);
 });
 
 test('the stale copy an outage is being served from is never refreshed ahead', async () => {
@@ -262,8 +258,8 @@ test('the stale copy an outage is being served from is never refreshed ahead', a
     stubFetch([LIST]);
     await getAllVodStreams(cfg);
 
-    assert.equal(calls, 0, 'a failing panel is not asked again by every request');
-    assert.equal(vodStreamsCache.refreshing.size, 0);
+    expect(calls, 'a failing panel is not asked again by every request').toBe(0);
+    expect(vodStreamsCache.refreshing.size).toBe(0);
 });
 
 test('a failed refresh leaves the warm list exactly as it was, and is not retried at once', async () => {
@@ -272,19 +268,19 @@ test('a failed refresh leaves the warm list exactly as it was, and is not retrie
     const before = agePastRefresh();
 
     stubFetch([new Error('panel down')]);
-    assert.deepEqual(await getAllVodStreams(cfg), LIST, 'the request never sees the failure');
+    expect(await getAllVodStreams(cfg), 'the request never sees the failure').toStrictEqual(LIST);
     // Nothing awaits a refresh, so a rejection here would reach the process.
     await settleRefresh();
 
     const after = onlyEntry();
-    assert.deepEqual(after.data, LIST);
-    assert.equal(after.ts, before, 'a failure must not re-stamp the age of old data');
-    assert.equal(calls, 1);
+    expect(after.data).toStrictEqual(LIST);
+    expect(after.ts, 'a failure must not re-stamp the age of old data').toBe(before);
+    expect(calls).toBe(1);
 
     // The cooldown: the next request does not start another attempt.
     stubFetch([new Error('panel down')]);
-    assert.deepEqual(await getAllVodStreams(cfg), LIST);
-    assert.equal(calls, 0, 'one attempt per failure window, not one per request');
+    expect(await getAllVodStreams(cfg)).toStrictEqual(LIST);
+    expect(calls, 'one attempt per failure window, not one per request').toBe(0);
 });
 
 test('requests that arrive together share one refresh', async () => {
@@ -294,9 +290,9 @@ test('requests that arrive together share one refresh', async () => {
 
     stubFetch([LIST]);
     await Promise.all([getAllVodStreams(cfg), getAllVodStreams(cfg), getAllVodStreams(cfg)]);
-    assert.equal(vodStreamsCache.refreshing.size, 1, 'three requests, one refresh');
+    expect(vodStreamsCache.refreshing.size, 'three requests, one refresh').toBe(1);
 
     await settleRefresh();
-    assert.equal(calls, 1);
-    assert.equal(vodStreamsCache.refreshing.size, 0, 'and it clears itself when it settles');
+    expect(calls).toBe(1);
+    expect(vodStreamsCache.refreshing.size, 'and it clears itself when it settles').toBe(0);
 });

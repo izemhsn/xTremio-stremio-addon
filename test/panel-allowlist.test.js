@@ -14,9 +14,6 @@ process.env.CONFIG_SECRET = 'test-secret-for-unit-tests';
 process.env.ALLOW_PRIVATE_NETWORKS = 'true';
 process.env.ALLOWED_PANEL_HOSTS = 'panel.allowed.test, http://Second.Allowed.test:8080/player_api.php, 2001:db8::1, *.wild.test';
 
-const test = require('node:test');
-const assert = require('node:assert');
-
 const bootWarnings = [];
 const realWarn = console.warn;
 console.warn = (...args) => bootWarnings.push(args.join(' '));
@@ -29,7 +26,7 @@ const {
     panelHostAllowed,
     ALLOWED_PANEL_HOSTS,
     configureAttempts
-} = require('../index.js');
+} = require('./support/internals.js');
 console.warn = realWarn;
 
 const realFetch = global.fetch;
@@ -37,17 +34,17 @@ let upstreamCalls = 0;
 let server;
 let base;
 
-test.before(async () => {
+beforeAll(async () => {
     await new Promise(resolve => { server = app.listen(0, '127.0.0.1', resolve); });
     base = `http://127.0.0.1:${server.address().port}`;
 });
 
-test.after(async () => {
+afterAll(async () => {
     global.fetch = realFetch;
     await new Promise(resolve => server.close(resolve));
 });
 
-test.beforeEach(() => {
+beforeEach(() => {
     upstreamCalls = 0;
     configureAttempts.clear();
     // Any outbound call is a failure unless a test says otherwise.
@@ -96,21 +93,20 @@ function captureWarnings(fn) {
 // --- reading the list ----------------------------------------------------------
 
 test('entries are read the way an operator writes them', () => {
-    assert.deepEqual(
+    expect(
         [...ALLOWED_PANEL_HOSTS].sort(),
-        ['[2001:db8::1]', 'panel.allowed.test', 'second.allowed.test'],
         'a URL with a port and a path names its host; a bare IPv6 address is bracketed'
-    );
-    assert.ok(
+    ).toStrictEqual(['[2001:db8::1]', 'panel.allowed.test', 'second.allowed.test']);
+    expect(
         bootWarnings.some(w => w.includes('ALLOWED_PANEL_HOSTS: ignoring "*.wild.test"')),
         'a wildcard is refused out loud rather than silently matching nothing'
-    );
+    ).toBeTruthy();
 });
 
 test('an empty list names no hosts', () => {
     // Every other test file runs with the variable unset, which is this: any panel.
-    assert.equal(parseHostList('', 'X').size, 0);
-    assert.equal(parseHostList(' , ,', 'X').size, 0);
+    expect(parseHostList('', 'X').size).toBe(0);
+    expect(parseHostList(' , ,', 'X').size).toBe(0);
 });
 
 test('a listed host is allowed by any scheme, port or case, and nothing else is', () => {
@@ -121,7 +117,7 @@ test('a listed host is allowed by any scheme, port or case, and nothing else is'
         'http://second.allowed.test',
         'http://[2001:db8::1]:8080'
     ]) {
-        assert.ok(panelHostAllowed(url), `${url} should be allowed`);
+        expect(panelHostAllowed(url), `${url} should be allowed`).toBeTruthy();
     }
     for (const url of [
         'http://evil.test',
@@ -132,7 +128,7 @@ test('a listed host is allowed by any scheme, port or case, and nothing else is'
         'http://',
         'not a url at all'
     ]) {
-        assert.ok(!panelHostAllowed(url), `${JSON.stringify(url)} should be refused`);
+        expect(panelHostAllowed(url), `${JSON.stringify(url)} should be refused`).toBeFalsy();
     }
 });
 
@@ -142,20 +138,20 @@ test('/configure refuses an unlisted panel without making any request to it', as
     // The credential check is itself an outbound fetch to a URL the caller chose.
     const html = await postConfigure('http://evil.test:8080');
 
-    assert.equal(upstreamCalls, 0, 'the host was never contacted');
-    assert.match(html, /only accepts accounts from specific providers/);
-    assert.equal(tokenFrom(html), null, 'no install link');
-    assert.doesNotMatch(html, /panel\.allowed\.test/, 'and the reply does not list the hosts that are allowed');
+    expect(upstreamCalls, 'the host was never contacted').toBe(0);
+    expect(html).toMatch(/only accepts accounts from specific providers/);
+    expect(tokenFrom(html), 'no install link').toBeNull();
+    expect(html, 'and the reply does not list the hosts that are allowed').not.toMatch(/panel\.allowed\.test/);
 });
 
 test('/configure still mints an install URL for a listed panel', async () => {
     global.fetch = panelAnswering(ACTIVE);
     const html = await postConfigure('http://panel.allowed.test:8080');
 
-    assert.equal(upstreamCalls, 1);
+    expect(upstreamCalls).toBe(1);
     const token = tokenFrom(html);
-    assert.ok(token, 'an install link was rendered');
-    assert.equal(hostnameOf(decodeConfig(token).serverUrl), 'panel.allowed.test');
+    expect(token, 'an install link was rendered').toBeTruthy();
+    expect(hostnameOf(decodeConfig(token).serverUrl)).toBe('panel.allowed.test');
 });
 
 test("a listed panel's server_info cannot move the install URL to an unlisted host", async () => {
@@ -166,8 +162,8 @@ test("a listed panel's server_info cannot move the install URL to an unlisted ho
     const html = await postConfigure('http://panel.allowed.test:8080');
 
     const token = tokenFrom(html);
-    assert.ok(token);
-    assert.equal(hostnameOf(decodeConfig(token).serverUrl), 'panel.allowed.test', 'kept the URL that connected');
+    expect(token).toBeTruthy();
+    expect(hostnameOf(decodeConfig(token).serverUrl), 'kept the URL that connected').toBe('panel.allowed.test');
 });
 
 // --- use ------------------------------------------------------------------------
@@ -176,31 +172,31 @@ test('an install URL for an unlisted panel is refused on every route, however it
     // A token like this still decrypts: it was minted before the list was set, or
     // while it was empty — exactly when a fake panel could get one.
     const token = encodeConfig({ serverUrl: 'http://evil-old.test:8080', username: 'u', password: 'p' });
-    assert.equal(decodeConfig(token), null);
+    expect(decodeConfig(token)).toBeNull();
 
     const manifest = await (await realFetch(`${base}/${token}/manifest.json`)).json();
-    assert.deepEqual(manifest.catalogs, [], 'the unconfigured manifest');
+    expect(manifest.catalogs, 'the unconfigured manifest').toStrictEqual([]);
 
     const catalog = await (await realFetch(
         `${base}/${token}/catalog/XT-Movies/xtremio_search_movies/${encodeURIComponent('search=a')}.json`
     )).json();
-    assert.deepEqual(catalog.metas, []);
+    expect(catalog.metas).toStrictEqual([]);
 
     const streams = await (await realFetch(`${base}/${token}/stream/XT-Movies/xtremio_movie_1.json`)).json();
-    assert.deepEqual(streams.streams, []);
+    expect(streams.streams).toStrictEqual([]);
 
     const proxied = await realFetch(`${base}/${token}/proxy/movie/1.mp4`);
-    assert.equal(proxied.status, 401, 'and above all, nothing is relayed');
+    expect(proxied.status, 'and above all, nothing is relayed').toBe(401);
 
     const page = await (await realFetch(`${base}/configure?config=${token}`)).text();
-    assert.doesNotMatch(page, /evil-old\.test/, 'nor is the refused host prefilled into the form');
+    expect(page, 'nor is the refused host prefilled into the form').not.toMatch(/evil-old\.test/);
 
-    assert.equal(upstreamCalls, 0, 'not one request reached the panel');
+    expect(upstreamCalls, 'not one request reached the panel').toBe(0);
 });
 
 test('an install URL for a listed panel keeps working', () => {
     const token = encodeConfig({ serverUrl: 'https://second.allowed.test', username: 'u', password: 'p' });
-    assert.deepEqual(decodeConfig(token), { serverUrl: 'https://second.allowed.test', username: 'u', password: 'p' });
+    expect(decodeConfig(token)).toStrictEqual({ serverUrl: 'https://second.allowed.test', username: 'u', password: 'p' });
 });
 
 test('a refused install URL is logged once per host, not once per request', () => {
@@ -213,7 +209,7 @@ test('a refused install URL is logged once per host, not once per request', () =
         decodeConfig(other);
     });
 
-    assert.equal(logged.filter(l => l.includes('"noisy.test"')).length, 1);
-    assert.equal(logged.filter(l => l.includes('"other-refused.test"')).length, 1);
-    assert.match(logged.join('\n'), /not in ALLOWED_PANEL_HOSTS/, 'and it names the setting');
+    expect(logged.filter(l => l.includes('"noisy.test"')).length).toBe(1);
+    expect(logged.filter(l => l.includes('"other-refused.test"')).length).toBe(1);
+    expect(logged.join('\n'), 'and it names the setting').toMatch(/not in ALLOWED_PANEL_HOSTS/);
 });

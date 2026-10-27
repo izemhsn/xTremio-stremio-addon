@@ -9,9 +9,6 @@
 process.env.CONFIG_SECRET = 'test-secret-for-unit-tests';
 process.env.ALLOW_PRIVATE_NETWORKS = 'true';
 
-const test = require('node:test');
-const assert = require('node:assert');
-
 const {
     app,
     encodeConfig,
@@ -21,7 +18,7 @@ const {
     vodInfoCache,
     vodStreamsCache,
     seriesInfoCache
-} = require('../index.js');
+} = require('./support/internals.js');
 
 const realFetch = global.fetch;
 
@@ -52,17 +49,17 @@ const countOf = action => calls.filter(c => c === action).length;
 let server;
 let base;
 
-test.before(async () => {
+beforeAll(async () => {
     await new Promise(resolve => { server = app.listen(0, '127.0.0.1', resolve); });
     base = `http://127.0.0.1:${server.address().port}`;
 });
 
-test.after(async () => {
+afterAll(async () => {
     global.fetch = realFetch;
     await new Promise(resolve => server.close(resolve));
 });
 
-test.beforeEach(() => {
+beforeEach(() => {
     vodInfoCache.map.clear();
     vodStreamsCache.map.clear();
     seriesInfoCache.clear();
@@ -79,62 +76,62 @@ async function get(path) {
 }
 
 test('isUsableVodInfo wants a name or movie data, not an empty shell', () => {
-    assert.ok(isUsableVodInfo(HEAT));
-    assert.ok(isUsableVodInfo({ info: { o_name: 'Heat' } }));
-    assert.ok(isUsableVodInfo({ info: [], movie_data: { stream_id: 7 } }));
-    assert.ok(isUsableVodInfo({ name: 'Heat' }), 'some panels put the fields at the root');
+    expect(isUsableVodInfo(HEAT)).toBeTruthy();
+    expect(isUsableVodInfo({ info: { o_name: 'Heat' } })).toBeTruthy();
+    expect(isUsableVodInfo({ info: [], movie_data: { stream_id: 7 } })).toBeTruthy();
+    expect(isUsableVodInfo({ name: 'Heat' }), 'some panels put the fields at the root').toBeTruthy();
     for (const bad of [{ info: [], movie_data: [] }, {}, { info: {} }, { info: { cover_big: 'x.jpg' } }, null, [], 'error', 42]) {
-        assert.equal(isUsableVodInfo(bad), false, `${JSON.stringify(bad)} is not usable`);
+        expect(isUsableVodInfo(bad), `${JSON.stringify(bad)} is not usable`).toBe(false);
     }
 });
 
 test('statedContainerExt tells a named container from a guess', () => {
-    assert.equal(statedContainerExt('mkv'), 'mkv');
-    assert.equal(statedContainerExt(' mp4 '), 'mp4');
+    expect(statedContainerExt('mkv')).toBe('mkv');
+    expect(statedContainerExt(' mp4 ')).toBe('mp4');
     for (const bad of [undefined, null, '', '  ', 'a.b', '../x']) {
-        assert.equal(statedContainerExt(bad), null, `${JSON.stringify(bad)} names no container`);
+        expect(statedContainerExt(bad), `${JSON.stringify(bad)} names no container`).toBeNull();
     }
     // normalizeContainerExt keeps its contract on top of it.
-    assert.equal(normalizeContainerExt(undefined), 'mp4');
-    assert.equal(normalizeContainerExt('mkv'), 'mkv');
+    expect(normalizeContainerExt(undefined)).toBe('mp4');
+    expect(normalizeContainerExt('mkv')).toBe('mkv');
 });
 
 test('a movie the provider has no data for gets no meta and no stream, and nothing is cached', async () => {
     vodAnswers = [{ info: [], movie_data: [] }];
 
     const meta = await get('/meta/XT-Movies/xtremio_movie_999999992.json');
-    assert.deepEqual(meta.body, { meta: null });
-    assert.equal(meta.headers.get('cache-control'), 'no-store');
+    expect(meta.body).toStrictEqual({ meta: null });
+    expect(meta.headers.get('cache-control')).toBe('no-store');
 
     const stream = await get('/stream/XT-Movies/xtremio_movie_999999992.json');
-    assert.deepEqual(stream.body, { streams: [] });
-    assert.equal(stream.headers.get('cache-control'), 'no-store');
+    expect(stream.body).toStrictEqual({ streams: [] });
+    expect(stream.headers.get('cache-control')).toBe('no-store');
 
-    assert.equal(vodInfoCache.map.size, 0, 'an unusable payload must not be cached');
-    assert.equal(countOf('get_vod_info'), 2, 'each request asks the provider again');
+    expect(vodInfoCache.map.size, 'an unusable payload must not be cached').toBe(0);
+    expect(countOf('get_vod_info'), 'each request asks the provider again').toBe(2);
 });
 
 test('a movie whose data arrives later is served on the next request', async () => {
     vodAnswers = [{}, HEAT];
-    assert.deepEqual((await get('/meta/XT-Movies/xtremio_movie_7.json')).body, { meta: null });
+    expect((await get('/meta/XT-Movies/xtremio_movie_7.json')).body).toStrictEqual({ meta: null });
 
     const meta = await get('/meta/XT-Movies/xtremio_movie_7.json');
-    assert.equal(meta.body.meta.name, 'Heat');
-    assert.match(meta.headers.get('cache-control'), /max-age=86400/);
+    expect(meta.body.meta.name).toBe('Heat');
+    expect(meta.headers.get('cache-control')).toMatch(/max-age=86400/);
 });
 
 test('a movie stream with a guessed container is served but not cacheable', async () => {
     vodAnswers = [{ info: { name: 'Heat' }, movie_data: [] }];
     const guessed = await get('/stream/XT-Movies/xtremio_movie_7.json');
-    assert.match(guessed.body.streams[0].url, /\/proxy\/movie\/7\.mp4$/);
-    assert.equal(guessed.headers.get('cache-control'), 'no-store');
-    assert.equal(guessed.body.cacheMaxAge, undefined);
+    expect(guessed.body.streams[0].url).toMatch(/\/proxy\/movie\/7\.mp4$/);
+    expect(guessed.headers.get('cache-control')).toBe('no-store');
+    expect(guessed.body.cacheMaxAge).toBeUndefined();
 
     vodInfoCache.map.clear();
     vodAnswers = [HEAT];
     const stated = await get('/stream/XT-Movies/xtremio_movie_7.json');
-    assert.match(stated.body.streams[0].url, /\/proxy\/movie\/7\.mkv$/);
-    assert.equal(stated.headers.get('cache-control'), 'private, max-age=3600');
+    expect(stated.body.streams[0].url).toMatch(/\/proxy\/movie\/7\.mkv$/);
+    expect(stated.headers.get('cache-control')).toBe('private, max-age=3600');
 });
 
 // --- audit M2: the warm movie list stands in for a failed get_vod_info ---------
@@ -146,9 +143,9 @@ test('a failed get_vod_info still plays a movie the warm list names', async () =
     vodAnswers = [{}];
 
     const stream = await get('/stream/XT-Movies/xtremio_movie_7.json');
-    assert.match(stream.body.streams[0].url, /\/proxy\/movie\/7\.mkv$/, 'the list item names the container');
-    assert.equal(stream.headers.get('cache-control'), 'no-store', 'a stand-in answer is not cached');
-    assert.equal(countOf('get_vod_streams'), 0, 'the fallback must never fetch the full list');
+    expect(stream.body.streams[0].url, 'the list item names the container').toMatch(/\/proxy\/movie\/7\.mkv$/);
+    expect(stream.headers.get('cache-control'), 'a stand-in answer is not cached').toBe('no-store');
+    expect(countOf('get_vod_streams'), 'the fallback must never fetch the full list').toBe(0);
 });
 
 test('a failed get_vod_info still gives a listed movie a page', async () => {
@@ -156,7 +153,7 @@ test('a failed get_vod_info still gives a listed movie a page', async () => {
     vodAnswers = [{}];
 
     const meta = await get('/meta/XT-Movies/xtremio_movie_7.json');
-    assert.deepEqual(meta.body.meta, {
+    expect(meta.body.meta).toStrictEqual({
         id: 'xtremio_movie_7',
         type: 'XT-Movies',
         name: 'Heat',
@@ -164,8 +161,8 @@ test('a failed get_vod_info still gives a listed movie a page', async () => {
         posterShape: 'poster',
         imdbRating: '8.1'
     });
-    assert.equal(meta.headers.get('cache-control'), 'no-store');
-    assert.equal(vodInfoCache.map.size, 0);
+    expect(meta.headers.get('cache-control')).toBe('no-store');
+    expect(vodInfoCache.map.size).toBe(0);
 });
 
 test('info without a container borrows the list item\'s, uncached', async () => {
@@ -173,8 +170,8 @@ test('info without a container borrows the list item\'s, uncached', async () => 
     vodAnswers = [{ info: { name: 'Heat' }, movie_data: [] }];
 
     const stream = await get('/stream/XT-Movies/xtremio_movie_7.json');
-    assert.match(stream.body.streams[0].url, /\/proxy\/movie\/7\.mkv$/);
-    assert.equal(stream.headers.get('cache-control'), 'no-store');
+    expect(stream.body.streams[0].url).toMatch(/\/proxy\/movie\/7\.mkv$/);
+    expect(stream.headers.get('cache-control')).toBe('no-store');
 });
 
 test('a movie the warm list does not name still gets nothing', async () => {
@@ -182,8 +179,8 @@ test('a movie the warm list does not name still gets nothing', async () => {
     vodStreamsCache.set(CFG_ARGS, [{ stream_id: 3, name: 'Other', container_extension: 'mkv' }]);
     vodAnswers = [{}];
 
-    assert.deepEqual((await get('/stream/XT-Movies/xtremio_movie_7.json')).body, { streams: [] });
-    assert.deepEqual((await get('/meta/XT-Movies/xtremio_movie_7.json')).body, { meta: null });
+    expect((await get('/stream/XT-Movies/xtremio_movie_7.json')).body).toStrictEqual({ streams: [] });
+    expect((await get('/meta/XT-Movies/xtremio_movie_7.json')).body).toStrictEqual({ meta: null });
 });
 
 test('an episode stream with a guessed container is served but not cacheable', async () => {
@@ -193,13 +190,16 @@ test('an episode stream with a guessed container is served but not cacheable', a
     };
 
     const guessed = await get('/stream/series/xtremio_episode_900:1:501.json');
-    assert.match(guessed.body.streams[0].url, /\/proxy\/series\/501\.mp4$/);
-    assert.equal(guessed.headers.get('cache-control'), 'no-store');
+    expect(guessed.body.streams[0].url).toMatch(/\/proxy\/series\/501\.mp4$/);
+    expect(guessed.headers.get('cache-control')).toBe('no-store');
 
     const missing = await get('/stream/series/xtremio_episode_900:1:999.json');
-    assert.equal(missing.headers.get('cache-control'), 'no-store', 'an episode missing from the info is a guess too');
+    expect(
+        missing.headers.get('cache-control'),
+        'an episode missing from the info is a guess too'
+    ).toBe('no-store');
 
     const stated = await get('/stream/series/xtremio_episode_900:1:502.json');
-    assert.match(stated.body.streams[0].url, /\/proxy\/series\/502\.mkv$/);
-    assert.equal(stated.headers.get('cache-control'), 'private, max-age=3600');
+    expect(stated.body.streams[0].url).toMatch(/\/proxy\/series\/502\.mkv$/);
+    expect(stated.headers.get('cache-control')).toBe('private, max-age=3600');
 });

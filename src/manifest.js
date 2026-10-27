@@ -8,7 +8,7 @@
 //
 // The genre catalogs never declare `search`, degraded or not. Stremio queries
 // every catalog whose only required extra is search, so a degraded manifest that
-// kept it added seven duplicate search rows beside the two real ones (audit M3).
+// kept it added seven duplicate search rows beside the two real ones.
 const { getCategories } = require('./xtream/data.js');
 
 const ADDON_ID = 'org.xtremio.addon';
@@ -42,7 +42,7 @@ async function getManifest(cfg = null) {
         // No `search`: Stremio searches every catalog whose only required extra is
         // search, so a degraded manifest put all seven shelves into search beside
         // the two search catalogs — duplicate rows, each rescanning the lists
-        // (audit M3). With a required genre it was unreachable anyway.
+        //. With a required genre it was unreachable anyway.
         const genreExtra = (genres) => (genres.length
             ? [{ name: 'genre', options: genres, isRequired: true }, { name: 'skip' }]
             : [{ name: 'skip' }]);

@@ -13,8 +13,6 @@ process.env.PROXY_MAX_CONCURRENT_PER_TOKEN = '100';
 process.env.PROXY_MAX_CONCURRENT_PER_CLIENT = '2';
 process.env.PROXY_MAX_CONCURRENT_TOTAL = '3';
 
-const test = require('node:test');
-const assert = require('node:assert');
 const http = require('node:http');
 
 const {
@@ -25,7 +23,7 @@ const {
     proxyRelays,
     PROXY_MAX_CONCURRENT_PER_CLIENT,
     PROXY_MAX_CONCURRENT_TOTAL
-} = require('../index.js');
+} = require('./support/internals.js');
 
 // --- a provider that holds its responses open ------------------------------
 
@@ -60,20 +58,20 @@ async function idle() {
     }
 }
 
-test.before(async () => {
+beforeAll(async () => {
     await new Promise(resolve => { provider = http.createServer(providerHandler).listen(0, '127.0.0.1', resolve); });
     providerBase = `http://127.0.0.1:${provider.address().port}`;
     await new Promise(resolve => { server = app.listen(0, '127.0.0.1', resolve); });
     base = `http://127.0.0.1:${server.address().port}`;
 });
 
-test.after(async () => {
+afterAll(async () => {
     releaseAll();
     await new Promise(resolve => server.close(resolve));
     await new Promise(resolve => provider.close(resolve));
 });
 
-test.afterEach(async () => {
+afterEach(async () => {
     releaseAll();
     await idle();
 });
@@ -93,18 +91,18 @@ function startRelay(client) {
 }
 
 test('the fixture sets the limits this file relies on', () => {
-    assert.equal(PROXY_MAX_CONCURRENT_PER_CLIENT, 2);
-    assert.equal(PROXY_MAX_CONCURRENT_TOTAL, 3);
+    expect(PROXY_MAX_CONCURRENT_PER_CLIENT).toBe(2);
+    expect(PROXY_MAX_CONCURRENT_TOTAL).toBe(3);
 });
 
 test('one client cannot exceed its relay budget by using many accounts', async () => {
     const relays = [startRelay('203.0.113.5'), startRelay('203.0.113.5')];
-    for (const res of await Promise.all(relays.map(r => r.done))) assert.equal(res.status, 200);
+    for (const res of await Promise.all(relays.map(r => r.done))) expect(res.status).toBe(200);
     await whenHeld(2);
 
     const over = await relay('203.0.113.5');
-    assert.equal(over.status, 429, 'a brand-new account from the same client still counts against the client');
-    assert.equal(over.headers.get('retry-after'), '1');
+    expect(over.status, 'a brand-new account from the same client still counts against the client').toBe(429);
+    expect(over.headers.get('retry-after')).toBe('1');
     await over.text();
 
     for (const r of relays) r.controller.abort();
@@ -116,7 +114,7 @@ test('another client is not throttled by the first', async () => {
     await whenHeld(2);
 
     const other = await relay('198.51.100.9');
-    assert.equal(other.status, 200);
+    expect(other.status).toBe(200);
     other.body.cancel();
 
     for (const r of relays) r.controller.abort();
@@ -128,7 +126,7 @@ test('an IPv6 client is one client across its /64', async () => {
     await whenHeld(2);
 
     const over = await relay('2001:db8:1:2::c');
-    assert.equal(over.status, 429, 'a new address in the same /64 is the same subscriber');
+    expect(over.status, 'a new address in the same /64 is the same subscriber').toBe(429);
     await over.text();
 
     for (const r of relays) r.controller.abort();
@@ -136,12 +134,12 @@ test('an IPv6 client is one client across its /64', async () => {
 
 test('the whole server is bounded, however many clients there are', async () => {
     const relays = ['203.0.113.1', '203.0.113.2', '203.0.113.3'].map(startRelay);
-    for (const res of await Promise.all(relays.map(r => r.done))) assert.equal(res.status, 200);
+    for (const res of await Promise.all(relays.map(r => r.done))) expect(res.status).toBe(200);
     await whenHeld(3);
 
     const over = await relay('203.0.113.4');
-    assert.equal(over.status, 503, "capacity is the server's, not this caller's usage");
-    assert.equal(over.headers.get('retry-after'), '5');
+    expect(over.status, "capacity is the server's, not this caller's usage").toBe(503);
+    expect(over.headers.get('retry-after')).toBe('5');
     await over.text();
 
     for (const r of relays) r.controller.abort();
@@ -160,9 +158,9 @@ test('a refused relay holds no slot anywhere', async () => {
     const before = counts();
 
     const over = await relay('203.0.113.5');
-    assert.equal(over.status, 429);
+    expect(over.status).toBe(429);
     await over.text();
-    assert.deepEqual(counts(), before, 'the refusal took nothing it would then have to give back');
+    expect(counts(), 'the refusal took nothing it would then have to give back').toStrictEqual(before);
 
     for (const r of relays) r.controller.abort();
 });
@@ -171,13 +169,13 @@ test('every count returns to zero when the relays end', async () => {
     const relays = ['203.0.113.1', '203.0.113.2'].map(startRelay);
     await Promise.all(relays.map(r => r.done));
     await whenHeld(2);
-    assert.equal(proxyRelays.total, 2);
-    assert.equal(proxyInFlightByClient.size, 2);
+    expect(proxyRelays.total).toBe(2);
+    expect(proxyInFlightByClient.size).toBe(2);
 
     for (const r of relays) r.controller.abort();
     await idle();
 
-    assert.equal(proxyRelays.total, 0);
-    assert.equal(proxyInFlightByClient.size, 0, 'an idle client costs no entry');
-    assert.equal(proxyInFlight.size, 0);
+    expect(proxyRelays.total).toBe(0);
+    expect(proxyInFlightByClient.size, 'an idle client costs no entry').toBe(0);
+    expect(proxyInFlight.size).toBe(0);
 });
