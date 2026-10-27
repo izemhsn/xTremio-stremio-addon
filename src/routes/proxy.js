@@ -8,9 +8,9 @@
 // both routes.
 const express = require('express');
 
-const { decodeConfig } = require('../config-token.js');
+const { decodeConfig } = require('../config/token.js');
 const { isNumericId, normalizeUrl } = require('../helpers.js');
-const { decodeHlsTarget, looksLikePlaylist, hlsTargetExt } = require('../hls/playlist.js');
+const { decodeHlsTarget, looksLikePlaylist, hlsTargetExt } = require('../proxy/playlist.js');
 const {
     relayUpstream,
     panelOrigin,
@@ -19,7 +19,7 @@ const {
     acquireProxySlot,
     rejectOverCap
 } = require('../proxy/relay.js');
-const { getBaseUrl } = require('./request.js');
+const { getBaseUrl } = require('../http/request.js');
 
 const router = express.Router();
 

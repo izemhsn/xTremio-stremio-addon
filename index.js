@@ -3,12 +3,12 @@
 // It checks the configuration, starts the HTTP server, and installs the
 // process-wide handlers for signals and crashes. The app itself — every route
 // and middleware — is built in src/app.js. To find your way around the code,
-// start with docs/ARCHITECTURE.md.
+// see "Project structure" in README.md.
 const { app } = require('./src/app.js');
-const { enforceConfigSecretPolicy } = require('./src/config-token.js');
+const { enforceConfigSecretPolicy } = require('./src/config/token.js');
 const { warnOnUndiciMismatch } = require('./src/net/safe-fetch.js');
 const { startCacheSweeper } = require('./src/cache/layers.js');
-const { PORT, HOST, warnOnUnpinnedBaseUrl } = require('./src/routes/request.js');
+const { PORT, HOST, warnOnUnpinnedBaseUrl } = require('./src/http/request.js');
 const { applyServerTimeouts, createShutdownHandler } = require('./src/lifecycle.js');
 
 // Before binding a port: a production deploy with a weak or missing secret

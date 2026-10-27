@@ -17,7 +17,7 @@
 // Only for discardBody, so that "every path that abandons a response cancels its
 // body" stays one implementation rather than a rule copied here. safe-fetch
 // requires nothing from this module, so the edge adds no cycle.
-const { discardBody } = require('../net/safe-fetch.js');
+const { discardBody } = require('./safe-fetch.js');
 
 // The upstream host is supplied by the user and reachable before any
 // authentication, so an unbounded res.json() lets a hostile or broken provider

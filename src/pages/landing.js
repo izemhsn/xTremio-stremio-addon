@@ -2,7 +2,7 @@
 //
 // Static: it interpolates nothing, which is why it takes no escapeHtml and no
 // arguments. Anything added here that comes from a request, a config token or a
-// provider must go through escapeHtml in src/html.js — the rule the /configure
+// provider must go through escapeHtml in src/pages/html.js — the rule the /configure
 // page follows, and the reason both pages live under src/pages.
 function renderLandingPage() {
     return (`<!DOCTYPE html>

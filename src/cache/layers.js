@@ -12,7 +12,7 @@
 // memory. A new data cache must pass `ledger: CACHE_BUDGET` and weigh its entries,
 // or it sits outside CACHE_MAX_MB.
 const { BoundedMap, CacheBudget } = require('./bounded-map.js');
-const { estimateBytes } = require('../upstream/read-capped.js');
+const { estimateBytes } = require('../net/read-capped.js');
 const { normalizeUrl } = require('../helpers.js');
 
 // Every map the periodic sweep should visit.

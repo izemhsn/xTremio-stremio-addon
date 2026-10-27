@@ -1,9 +1,9 @@
-// Signing, encrypting and rewriting HLS playlists.
+// Signing, encrypting and rewriting HLS playlists for the proxy.
 //
 // Deliberately knows nothing about DNS, the SSRF guard or Express.
 // rewriteHlsPlaylist takes its `toProxyUrl` mapper as an argument, and the
 // production mapper — which vets a target before signing it — is built in
-// src/proxy/relay.js, with the guard. That is what keeps this module a leaf.
+// relay.js, next door, with the guard. That is what keeps this module a leaf.
 const crypto = require('node:crypto');
 
 const {
@@ -12,7 +12,7 @@ const {
     GCM_IV_BYTES,
     GCM_TAG_BYTES,
     timingSafeEqualString
-} = require('../config-token.js');
+} = require('../config/token.js');
 
 // --- HLS playlist proxying -------------------------------------------------
 //

@@ -9,7 +9,7 @@
 // cut out one page -> turn each item into a Stremio "meta preview".
 const express = require('express');
 
-const { decodeConfig } = require('../config-token.js');
+const { decodeConfig } = require('../config/token.js');
 const { CATALOG_KINDS, catalogTypesFor, selectCatalogSource } = require('../catalog/kinds.js');
 const {
     parseCatalogId,
@@ -17,8 +17,8 @@ const {
     toCatalogMetas,
     sortedCatalogItems
 } = require('../catalog/shelf.js');
-const { parseExtra, rawExtraSegment, PAGE_SIZE, withCacheHints } = require('./extras.js');
-const { logRouteError } = require('./errors.js');
+const { parseExtra, rawExtraSegment, PAGE_SIZE, withCacheHints } = require('../http/extras.js');
+const { logRouteError } = require('../http/errors.js');
 
 const router = express.Router();
 

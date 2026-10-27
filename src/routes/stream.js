@@ -10,7 +10,7 @@
 // does not say, mp4 is guessed — and a guessed answer is not cached.
 const express = require('express');
 
-const { decodeConfig } = require('../config-token.js');
+const { decodeConfig } = require('../config/token.js');
 const {
     getPrefixedNumericId,
     parseEpisodeId,
@@ -21,9 +21,9 @@ const {
 } = require('../helpers.js');
 const { LOG_REQUESTS } = require('../xtream/client.js');
 const { getSeriesInfo, getVodInfo, warmVodItem } = require('../xtream/data.js');
-const { getBaseUrl } = require('./request.js');
-const { withCacheHints } = require('./extras.js');
-const { isProgrammingError, logRouteError } = require('./errors.js');
+const { getBaseUrl } = require('../http/request.js');
+const { withCacheHints } = require('../http/extras.js');
+const { isProgrammingError, logRouteError } = require('../http/errors.js');
 
 const router = express.Router();
 

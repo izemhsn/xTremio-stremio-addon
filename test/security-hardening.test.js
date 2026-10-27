@@ -35,7 +35,7 @@ const INTERNALS = require.resolve('./support/internals.js');
 // The token crypto lives in its own module now. The source-level assertion below
 // has to read the file the derivation is actually written in, not the barrel that
 // re-exports it.
-const CONFIG_TOKEN_SRC = require.resolve('../src/config-token.js');
+const CONFIG_TOKEN_SRC = require.resolve('../src/config/token.js');
 const realFetch = global.fetch;
 
 function collect() {

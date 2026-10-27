@@ -4,11 +4,11 @@
 //
 // Every route that serves an account starts with `/:config`, an encrypted token
 // holding that account's provider URL, username and password (see
-// src/config-token.js). That token is the install URL the user pastes into
+// src/config/token.js). That token is the install URL the user pastes into
 // Stremio, so this server stores nothing about its users.
 const express = require('express');
 
-const { corsMiddleware } = require('./routes/cors.js');
+const { corsMiddleware } = require('./http/cors.js');
 const { router: manifestRoutes } = require('./routes/manifest.js');
 const { router: configureRoutes } = require('./routes/configure.js');
 const { router: catalogRoutes } = require('./routes/catalog.js');
@@ -16,7 +16,7 @@ const { router: metaRoutes } = require('./routes/meta.js');
 const { router: streamRoutes } = require('./routes/stream.js');
 const { router: proxyRoutes } = require('./routes/proxy.js');
 const { router: healthRoutes } = require('./routes/health.js');
-const { notFound, terminalErrorHandler } = require('./routes/errors.js');
+const { notFound, terminalErrorHandler } = require('./http/errors.js');
 const { renderLandingPage } = require('./pages/landing.js');
 
 const app = express();

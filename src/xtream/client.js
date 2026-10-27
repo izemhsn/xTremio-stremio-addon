@@ -10,7 +10,7 @@
 // of the two.
 const { buildXtremioApiUrl } = require('../helpers.js');
 const { safeFetch, discardBody } = require('../net/safe-fetch.js');
-const { readJsonCapped, MAX_UPSTREAM_BYTES } = require('../upstream/read-capped.js');
+const { readJsonCapped, MAX_UPSTREAM_BYTES } = require('../net/read-capped.js');
 const { CACHE_FAILURE_TTL } = require('../cache/layers.js');
 
 const LOG_REQUESTS = process.env.LOG_REQUESTS === 'true';

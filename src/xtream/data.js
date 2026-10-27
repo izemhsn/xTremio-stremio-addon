@@ -10,7 +10,7 @@
 // Xtream.
 const { causeSuffix } = require('../helpers.js');
 const { BoundedMap } = require('../cache/bounded-map.js');
-const { estimateBytes } = require('../upstream/read-capped.js');
+const { estimateBytes } = require('../net/read-capped.js');
 const { xtremioGet, getStreams, LOG_REQUESTS } = require('./client.js');
 const {
     CACHE_TTL,

@@ -5,7 +5,7 @@
 // that turns this server into a port scanner and a credential-stuffing relay
 // running on its IP. A handful of attempts per minute is far more than a human
 // configuring an addon needs.
-const { clientKey } = require('../routes/request.js');
+const { clientKey } = require('../http/request.js');
 
 const CONFIGURE_RATE_LIMIT = Math.max(1, Number(process.env.CONFIGURE_RATE_LIMIT) || 10);
 const CONFIGURE_RATE_WINDOW_MS = Math.max(1000, Number(process.env.CONFIGURE_RATE_WINDOW_MS) || 60 * 1000);

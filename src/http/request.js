@@ -8,7 +8,7 @@
 const net = require('node:net');
 
 const { normalizeUrl } = require('../helpers.js');
-const { IS_PRODUCTION } = require('../config-token.js');
+const { IS_PRODUCTION } = require('../config/token.js');
 const { ipv6ToBytes, ipv6MatchesPrefix, IPV6_V4_MAPPED } = require('../net/private-ip.js');
 
 const PORT = process.env.PORT || 3000;

@@ -19,15 +19,15 @@ const { Readable } = require('node:stream');
 const { normalizeUrl } = require('../helpers.js');
 const { BoundedMap } = require('../cache/bounded-map.js');
 const { registerSweepable, accountCacheKey } = require('../cache/layers.js');
-const { parseHostList } = require('../panel-allowlist.js');
-const { clientKey } = require('../routes/request.js');
+const { parseHostList } = require('../config/panel-allowlist.js');
+const { clientKey } = require('../http/request.js');
 const {
     safeFetch,
     discardBody,
     assertSafeOutboundUrl,
     DNS_PIN_TTL_MS
 } = require('../net/safe-fetch.js');
-const { readTextCapped } = require('../upstream/read-capped.js');
+const { readTextCapped } = require('../net/read-capped.js');
 const {
     MAX_PLAYLIST_BYTES,
     HLS_BODY_PREFIX,
@@ -35,7 +35,7 @@ const {
     encodeHlsTarget,
     looksLikePlaylist,
     rewriteHlsPlaylist
-} = require('../hls/playlist.js');
+} = require('./playlist.js');
 
 // Browser-like UA — many Xtream CDNs reject or shortchange non-browser UAs.
 const PROXY_USER_AGENT = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0 Safari/537.36';

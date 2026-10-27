@@ -12,10 +12,10 @@
 // never sent in cleartext before the panel's TLS port has been tried). The
 // autocapitalize/autocorrect/spellcheck attributes stop a phone from turning
 // `http://` into `Http://`.
-const { escapeHtml } = require('../html.js');
+const { escapeHtml } = require('./html.js');
 // The page shows the install URL, which means minting a token from the fields
 // just submitted.
-const { encodeConfig } = require('../config-token.js');
+const { encodeConfig } = require('../config/token.js');
 
 // Only for the default baseUrl, which is a development and test convenience —
 // every caller in the app passes the real one from getBaseUrl.

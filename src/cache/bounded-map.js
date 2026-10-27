@@ -6,7 +6,7 @@
 //
 // An entry's weight is its own `bytes` field, set by the caller from
 // estimateBytes — the weighing lives with the reader that counted the body, in
-// src/upstream/read-capped.js, and only the number arrives here.
+// src/net/read-capped.js, and only the number arrives here.
 
 
 // One memory budget shared by every data cache (CACHE_MAX_MB): the

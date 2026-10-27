@@ -7,14 +7,14 @@
 const crypto = require('node:crypto');
 const express = require('express');
 
-const { decodeConfig } = require('../config-token.js');
+const { decodeConfig } = require('../config/token.js');
 const { asString, normalizeUrl } = require('../helpers.js');
-const { hostnameOf, panelHostAllowed } = require('../panel-allowlist.js');
-const { validateXtremioCredentials } = require('../configure/validate.js');
-const { rateLimitConfigure } = require('../configure/rate-limit.js');
+const { hostnameOf, panelHostAllowed } = require('../config/panel-allowlist.js');
+const { validateXtremioCredentials } = require('../config/validate.js');
+const { rateLimitConfigure } = require('../config/rate-limit.js');
 const { renderConfigPage } = require('../pages/configure.js');
-const { getBaseUrl } = require('./request.js');
-const { logRouteError } = require('./errors.js');
+const { getBaseUrl } = require('../http/request.js');
+const { logRouteError } = require('../http/errors.js');
 
 const router = express.Router();
 

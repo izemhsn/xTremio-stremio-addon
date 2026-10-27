@@ -84,7 +84,7 @@ test('TRUST_PROXY can count more than one hop', () => {
     // Loaded in a second module instance, because the setting is read at import —
     // which means evicting the module that reads it as well as the barrel that
     // re-exports it, or the barrel comes back fresh holding the cached old value.
-    const paths = [require.resolve('./support/internals.js'), require.resolve('../src/routes/request.js')];
+    const paths = [require.resolve('./support/internals.js'), require.resolve('../src/http/request.js')];
     const saved = process.env.TRUST_PROXY;
     process.env.TRUST_PROXY = '2';
     for (const p of paths) delete require.cache[p];

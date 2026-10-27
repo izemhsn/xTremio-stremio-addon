@@ -15,8 +15,8 @@
 // get "Connected!" and an install link whose every catalog was empty.
 const { normalizeUrl, buildUrl } = require('../helpers.js');
 const { safeFetch } = require('../net/safe-fetch.js');
-const { readJsonCapped } = require('../upstream/read-capped.js');
-const { panelHostAllowed, hostnameOf } = require('../panel-allowlist.js');
+const { readJsonCapped } = require('../net/read-capped.js');
+const { panelHostAllowed, hostnameOf } = require('./panel-allowlist.js');
 
 function schemeOf(url) {
     return String(url || '').startsWith('https:') ? 'https' : 'http';

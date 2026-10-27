@@ -9,7 +9,7 @@
 // format. They do no I/O, so they are easy to read and to test on their own.
 const express = require('express');
 
-const { decodeConfig } = require('../config-token.js');
+const { decodeConfig } = require('../config/token.js');
 const {
     causeSuffix,
     isNumericId,
@@ -31,8 +31,8 @@ const {
     getVodInfo,
     warmVodItem
 } = require('../xtream/data.js');
-const { withCacheHints } = require('./extras.js');
-const { isProgrammingError, logRouteError } = require('./errors.js');
+const { withCacheHints } = require('../http/extras.js');
+const { isProgrammingError, logRouteError } = require('../http/errors.js');
 
 const router = express.Router();
 

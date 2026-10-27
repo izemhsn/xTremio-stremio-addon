@@ -6,7 +6,7 @@
 // sending the user to /configure.
 const express = require('express');
 
-const { decodeConfig } = require('../config-token.js');
+const { decodeConfig } = require('../config/token.js');
 const { getManifest } = require('../manifest.js');
 
 const router = express.Router();
