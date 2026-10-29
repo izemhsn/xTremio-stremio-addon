@@ -85,7 +85,6 @@ async function getStreams(cfg, action, params = {}) {
 }
 
 module.exports = {
-    UPSTREAM_HEADER_TIMEOUT_MS,
     UPSTREAM_IDLE_TIMEOUT_MS,
     UPSTREAM_BODY_TIMEOUT_MS,
     LOG_REQUESTS,

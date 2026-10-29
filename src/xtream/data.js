@@ -145,9 +145,9 @@ function parseYear(s) {
     return m ? parseInt(m[0]) : undefined;
 }
 
-// Whether a payload is worth *answering* with: a name or episodes. It must mirror
-// `hasContent` in src/routes/meta.js exactly, or the disagreement gets cached. What may
-// be cached for the full TTL is the stricter hasSeriesEpisodes.
+// Whether a payload has a name or episodes. Only used to describe a failed
+// attempt in the log; what may be cached for the full TTL is decided by the
+// stricter hasSeriesEpisodes.
 function isUsableSeriesInfo(info) {
     if (!info || typeof info !== 'object') return false;
     const hasName = info.info && typeof info.info === 'object' && info.info.name;
@@ -319,30 +319,21 @@ module.exports = {
     liveStreamsCache,
     vodStreamsCache,
     seriesStreamsCache,
-    streamIdIndexes,
     findStreamById,
     getAllVodStreams,
     getAllSeriesStreams,
     getAllLiveStreams,
     categoryStreamsCache,
-    categoryStreamsCacheKey,
     getCategoryStreams,
     parseYear,
     isUsableSeriesInfo,
-    hasSeriesEpisodes,
     SERIES_INFO_MAX_ATTEMPTS,
-    SERIES_INFO_BACKOFF_MS,
     SERIES_INFO_NEGATIVE_TTL,
     seriesInfoCache,
-    seriesInfoCacheKey,
     readSeriesInfoEntry,
     getCachedSeriesInfo,
-    setCachedSeriesInfo,
-    setNegativeSeriesInfo,
     getSeriesInfo,
-    fetchSeriesInfo,
     vodInfoCache,
-    vodInfoCacheKey,
     isUsableVodInfo,
     getVodInfo,
     warmVodItem

@@ -136,8 +136,9 @@ async function sendEpisodeStream(res, cfg, id, proxyBase) {
 
     const info = await getSeriesInfo(cfg, seriesId);
     const seasonEpisodes = (info?.episodes ?? {})[seasonNum];
+    // A provider's list can hold null entries; the meta route skips them too.
     const episode = Array.isArray(seasonEpisodes)
-        ? seasonEpisodes.find(e => String(e.id) === episodeId) || null
+        ? seasonEpisodes.find(e => String(e?.id) === episodeId) || null
         : null;
 
     const rawExt = episode?.container_extension;

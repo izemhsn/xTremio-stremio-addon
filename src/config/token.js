@@ -138,7 +138,7 @@ function enforceConfigSecretPolicy({ raw = RAW_CONFIG_SECRET, production = IS_PR
     if (!problems.length) return true;
     for (const problem of problems) log.warn(`[security] ${problem}`);
     if (production) {
-        log.error('[security] Refusing to start with NODE_ENV=production. Generate a secret with: node -e "console.log(require(\'crypto\').randomBytes(32).toString(\'hex\'))"');
+        log.error('[security] Refusing to start with NODE_ENV=production. Generate a secret with: node -e "console.log(require(\'crypto\').randomBytes(48).toString(\'base64\'))"');
         exit(1);
         return false;
     }
@@ -271,7 +271,6 @@ function decodeConfig(encoded) {
 
 module.exports = {
     CONFIG_TOKEN_VERSION,
-    RAW_CONFIG_SECRET,
     CONFIG_SECRET,
     CONFIG_SECRET_MIN_BYTES,
     IS_PRODUCTION,
@@ -280,9 +279,6 @@ module.exports = {
     deriveConfigKeys,
     CONFIG_ENC_KEY,
     CONFIG_MAC_KEY,
-    CURRENT_CONFIG_KEYS,
-    PREVIOUS_CONFIG_KEYS,
-    notePreviousSecretUse,
     UNDECODABLE_REPORT_INTERVAL_MS,
     undecodableTokens,
     noteUndecodableToken,
@@ -290,12 +286,10 @@ module.exports = {
     HLS_MAC_KEY,
     GCM_IV_BYTES,
     GCM_TAG_BYTES,
-    CONFIG_MAC_BYTES,
     configSecretProblems,
     enforceConfigSecretPolicy,
     validateConfig,
     signTokenBody,
-    decodeTokenPart,
     timingSafeEqualString,
     encodeConfig,
     sealConfig,

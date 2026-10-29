@@ -33,7 +33,9 @@ function renderConfigPage({ serverUrl = '', username = '', password = '', status
     const safeNonce = escapeHtml(nonce);
     const safeServerUrl = escapeHtml(serverUrl);
     const safeUsername = escapeHtml(username);
-    const safePassword = escapeHtml(password);
+    // Echoed back only when the form needs fixing. After a success the install
+    // link is what the user came for, and the password has no reason to be in the page.
+    const safePassword = status?.valid ? '' : escapeHtml(password);
     let statusHtml = '';
     if (status) {
         if (status.valid) {
@@ -48,13 +50,8 @@ function renderConfigPage({ serverUrl = '', username = '', password = '', status
                         <svg fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2.5" d="M12 9v4m0 4h.01M10.29 3.86L1.82 18a2 2 0 001.71 3h16.94a2 2 0 001.71-3L13.71 3.86a2 2 0 00-3.42 0z"/></svg>
                         <span class="status-text">
                             <strong>Connected over http, not https.</strong>
-                            ${status.downgrade.source === 'fallback'
-                                ? 'The https connection failed, so http was used instead.'
-                                : 'Your provider asked for http even though https worked.'}
+                            Your provider asked for http even though https worked.
                             Your username and password will be sent in cleartext on every request, and this choice is saved into the install link below.
-                            ${status.downgrade.source === 'fallback'
-                                ? 'If your provider does support https, fix the URL and configure again.'
-                                : ''}
                         </span>
                     </div>` : '';
             statusHtml = `

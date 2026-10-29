@@ -112,7 +112,6 @@ module.exports = {
     warnOnUnpinnedBaseUrl,
     SAFE_HOST,
     TRUST_PROXY_HOPS,
-    forwardedValue,
     getBaseUrl,
     clientKey,
     addressBucket

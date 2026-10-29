@@ -163,8 +163,7 @@ async function sendSeriesMeta(res, cfg, id) {
     const series = info?.info ?? info ?? {};
     const videos = buildEpisodeVideos(seriesId, info?.episodes ?? {});
 
-    // Must match isUsableSeriesInfo in src/xtream/data.js exactly, or a payload
-    // one of them accepts and the other rejects gets cached.
+    // A name or at least one playable episode is enough for a page.
     const hasContent = Boolean(series.name || videos.length);
     if (!hasContent) {
         console.warn(`[meta] no usable data for series ${seriesId}`);

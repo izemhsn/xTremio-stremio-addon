@@ -135,8 +135,5 @@ module.exports = {
     isPrivateIp,
     ipv6ToBytes,
     ipv6MatchesPrefix,
-    IPV4_PRIVATE_CIDRS,
-    IPV6_PRIVATE_PREFIXES,
-    IPV6_EMBEDDED_IPV4,
     IPV6_V4_MAPPED
 };

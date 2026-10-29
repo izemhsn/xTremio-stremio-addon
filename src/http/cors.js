@@ -22,7 +22,7 @@ function corsMiddleware(req, res, next) {
     if (!corsApplies(req.path)) return next();
     res.setHeader('Access-Control-Allow-Origin', '*');
     res.setHeader('Access-Control-Allow-Headers', 'Content-Type');
-    res.setHeader('Access-Control-Allow-Methods', 'GET, POST, OPTIONS');
+    res.setHeader('Access-Control-Allow-Methods', 'GET, OPTIONS');
     if (req.method === 'OPTIONS') return res.sendStatus(200);
     next();
 }

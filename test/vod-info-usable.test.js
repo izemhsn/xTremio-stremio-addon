@@ -203,3 +203,15 @@ test('an episode stream with a guessed container is served but not cacheable', a
     expect(stated.body.streams[0].url).toMatch(/\/proxy\/series\/502\.mkv$/);
     expect(stated.headers.get('cache-control')).toBe('private, max-age=3600');
 });
+
+test('a null entry in a season does not stop the episodes after it from playing', async () => {
+    // The meta route already skipped these, so the episode was listed and then
+    // threw on `e.id` when played, answering with no streams at all.
+    seriesAnswer = {
+        info: { name: 'Show' },
+        episodes: { 1: [null, { id: '502', episode_num: 2, container_extension: 'mkv' }] }
+    };
+
+    const stream = await get('/stream/series/xtremio_episode_900:1:502.json');
+    expect(stream.body.streams[0].url).toMatch(/\/proxy\/series\/502\.mkv$/);
+});

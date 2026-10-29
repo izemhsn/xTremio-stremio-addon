@@ -124,7 +124,7 @@ test('a panel answering a JSON null is not a valid server, not an unreachable on
     });
     const result = await validateXtremioCredentials('http://provider.test:8080', 'alice', SECRET);
     expect(result.valid).toBe(false);
-    expect(result.error).toBe('Not a valid xTremio server');
+    expect(result.error).toBe('Not a valid Xtream server');
 });
 
 test('every failed attempt is logged, including the http one that is retried', async () => {
@@ -160,7 +160,7 @@ test('a server that answers with something other than a panel is not called unre
             result = await validateXtremioCredentials('http://provider.test:8080', 'alice', SECRET);
         });
         expect(result.valid, label).toBe(false);
-        expect(result.error, label).toBe('Not a valid xTremio server');
+        expect(result.error, label).toBe('Not a valid Xtream server');
         expect(logged, label).toMatch(/answered, but not as a panel/);
     }
 });
@@ -176,7 +176,7 @@ test('an http answer still counts when the https retry cannot connect', async ()
     await captureConsole(async () => {
         result = await validateXtremioCredentials('http://provider.test:8080', 'alice', SECRET);
     });
-    expect(result.error).toBe('Not a valid xTremio server');
+    expect(result.error).toBe('Not a valid Xtream server');
 });
 
 test('a usable server_info is still honoured', async () => {

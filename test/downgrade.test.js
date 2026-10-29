@@ -50,17 +50,17 @@ test('schemeOf reads the scheme, defaulting to http', () => {
 });
 
 test('describeDowngrade only fires on a real https to http drop', () => {
-    expect(describeDowngrade('https://a.test', 'http://a.test', 'fallback')).toStrictEqual({ from: 'https', to: 'http', source: 'fallback' });
+    expect(describeDowngrade('https://a.test', 'http://a.test', 'provider')).toStrictEqual({ from: 'https', to: 'http', source: 'provider' });
     expect(
-        describeDowngrade('http://a.test', 'http://a.test', 'fallback'),
+        describeDowngrade('http://a.test', 'http://a.test', 'provider'),
         'http to http is not a downgrade'
     ).toBeNull();
     expect(
-        describeDowngrade('https://a.test', 'https://a.test', 'fallback'),
+        describeDowngrade('https://a.test', 'https://a.test', 'provider'),
         'https preserved is not a downgrade'
     ).toBeNull();
     expect(
-        describeDowngrade('http://a.test', 'https://a.test', 'fallback'),
+        describeDowngrade('http://a.test', 'https://a.test', 'provider'),
         'an upgrade is not a downgrade'
     ).toBeNull();
 });
@@ -227,7 +227,7 @@ test('a provider downgrade is still reported where the user never asked for http
 
     const result = await validateXtremioCredentials('provider.test', 'u', 'p');
 
-    expect(result.downgrade, 'attributed to the provider, not the fallback').toStrictEqual({ from: 'https', to: 'http', source: 'provider' });
+    expect(result.downgrade, 'attributed to the provider').toStrictEqual({ from: 'https', to: 'http', source: 'provider' });
     expect(result.resolvedUrl).toMatch(/^http:\/\/provider\.test:8080/);
 });
 
@@ -248,7 +248,7 @@ test('the configure page warns when the connection was downgraded', () => {
         serverUrl: 'http://provider.test',
         username: 'alice',
         password: 'secret',
-        status: { valid: true, userInfo: OK_USER, downgrade: { from: 'https', to: 'http', source: 'fallback' } }
+        status: { valid: true, userInfo: OK_USER, downgrade: { from: 'https', to: 'http', source: 'provider' } }
     });
 
     // Match the banner markup, not the class name — the stylesheet mentions
@@ -256,19 +256,7 @@ test('the configure page warns when the connection was downgraded', () => {
     expect(html, 'a warning banner is rendered').toMatch(/status-banner status-warning/);
     expect(html).toMatch(/Connected over http, not https/);
     expect(html, 'the actual consequence is spelled out').toMatch(/cleartext/);
-    expect(html, 'and the fallback cause is named').toMatch(/https connection failed/);
-});
-
-test('the page explains a provider-caused downgrade differently', () => {
-    const html = renderConfigPage({
-        serverUrl: 'http://provider.test',
-        username: 'alice',
-        password: 'secret',
-        status: { valid: true, userInfo: OK_USER, downgrade: { from: 'https', to: 'http', source: 'provider' } }
-    });
-
-    expect(html, 'the cause is attributed correctly').toMatch(/provider asked for http/);
-    expect(html, 'and not blamed on a failed connection').not.toMatch(/https connection failed/);
+    expect(html, 'and the cause is named').toMatch(/provider asked for http/);
 });
 
 test('a clean connection renders no warning at all', () => {

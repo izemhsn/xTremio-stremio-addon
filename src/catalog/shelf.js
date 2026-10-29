@@ -205,8 +205,8 @@ function catalogMemoFor(source, epoch, create) {
 // The items a genre shelf resolved to last time, or null — consulted *before* the
 // filter that would produce them, and creating nothing. Filtering is the expensive
 // half of a genre shelf and its result depends only on the source and the
-// selection, so only the sort was being saved while the filter ran on every page
-//. Keyed apart from the sorted views because it outlives all of them:
+// selection, so only the sort was being saved while the filter ran on every page.
+// Keyed apart from the sorted views because it outlives all of them:
 // three variants over one selection share one filtered array.
 function cachedCatalogSelection(source, selection, now = Date.now()) {
     const memo = catalogMemoFor(source, featuredEpoch(now), false);
@@ -243,7 +243,6 @@ function sortedCatalogItems(kind, route, { items, source, selection }, now = Dat
 module.exports = {
     sortedCatalogViews,
     VIEW_KEY_SEP,
-    CATALOG_VARIANTS,
     parseCatalogId,
     FEATURED_PERIOD_MS,
     featuredEpoch,
@@ -253,9 +252,7 @@ module.exports = {
     hasCategoryIds,
     inCategories,
     uniqueById,
-    catalogVariant,
     catalogViewKey,
-    catalogMemoFor,
     cachedCatalogSelection,
     rememberCatalogSelection,
     sortedCatalogItems

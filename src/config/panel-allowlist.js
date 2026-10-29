@@ -77,7 +77,5 @@ module.exports = {
     parseHostList,
     panelHostAllowed,
     noteRefusedPanel,
-    ALLOWED_PANEL_HOSTS,
-    refusedPanelHostsLogged,
-    REFUSED_PANEL_LOG_MAX
+    ALLOWED_PANEL_HOSTS
 };

@@ -128,7 +128,7 @@ async function validateXtremioCredentials(serverUrl, username, password) {
 
             // `?.`: a panel answering a literal `null` threw here, and the catch
             // reported it as "Cannot reach that server", which it plainly could.
-            if (!json?.user_info) return { valid: false, error: 'Not a valid xTremio server' };
+            if (!json?.user_info) return { valid: false, error: 'Not a valid Xtream server' };
             if (json.user_info.auth !== 1) return { valid: false, error: 'Invalid username or password' };
             if (json.user_info.status !== 'Active') return { valid: false, error: `Account is ${json.user_info.status || 'inactive'}` };
 
@@ -171,10 +171,10 @@ async function validateXtremioCredentials(serverUrl, username, password) {
                 named = null;
             }
             const finalUrl = named || url;
-            // Attribute the downgrade to whichever step actually caused it: the
-            // http retry, or the provider overriding a scheme that just worked.
-            const downgrade = describeDowngrade(base, url, 'fallback')
-                || describeDowngrade(url, finalUrl, 'provider');
+            // The only way onto http once https has worked: the provider's
+            // server_info overriding it. A failed https attempt is never retried
+            // over http, so there is no fallback downgrade to report.
+            const downgrade = describeDowngrade(url, finalUrl, 'provider');
             if (downgrade) {
                 console.warn(`[configure] ${new URL(finalUrl).host}: https→http downgrade (${downgrade.source}); credentials will travel in cleartext`);
             }
@@ -195,7 +195,7 @@ async function validateXtremioCredentials(serverUrl, username, password) {
                 `${reason}${next ? `; trying ${schemeOf(next.url)}` : ''}`
             );
             if (next) continue;
-            if (anyAnswered) return { valid: false, error: 'Not a valid xTremio server' };
+            if (anyAnswered) return { valid: false, error: 'Not a valid Xtream server' };
             return {
                 valid: false,
                 error: askedForHttps
@@ -214,6 +214,5 @@ module.exports = {
     schemeOf,
     describeDowngrade,
     serverInfoOrigin,
-    credentialsWorkAt,
     validateXtremioCredentials
 };

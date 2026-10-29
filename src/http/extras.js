@@ -71,8 +71,6 @@ function withCacheHints(res, cacheMaxAge, staleRevalidate) {
 }
 
 module.exports = {
-    EXTRA_KEYS,
-    decodeExtraPart,
     parseExtra,
     rawExtraSegment,
     PAGE_SIZE,

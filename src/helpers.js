@@ -193,7 +193,6 @@ module.exports = {
     isNumericId,
     getPrefixedNumericId,
     parseEpisodeId,
-    ID_PREFIX_TYPES,
     typeMatchesId,
     statedContainerExt,
     normalizeContainerExt,

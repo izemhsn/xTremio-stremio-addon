@@ -181,8 +181,6 @@ async function readTextCapped(body, maxBytes) {
 module.exports = {
     MAX_UPSTREAM_BYTES,
     MAX_PARSED_TO_BODY_RATIO,
-    PARSED_WEIGHT,
-    parsedSizeEstimates,
     readJsonCapped,
     readTextCapped,
     estimateBytes,

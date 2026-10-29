@@ -266,18 +266,10 @@ async function rewriteHlsPlaylist(text, baseUrl, toProxyUrl, { deadline = null }
 
 module.exports = {
     HLS_SIGNATURE_TTL_MS,
-    HLS_KIND_PLAYLIST,
-    HLS_KIND_SEGMENT,
     HLS_SNIFF_BYTES,
     HLS_BODY_PREFIX,
-    HLS_CONTENT_TYPES,
-    HLS_PLAYLIST_URI_TAGS,
-    HLS_STREAM_INF_TAG,
-    HLS_URI_ATTR,
-    PLAYLIST_PATH_EXT,
     MAX_PLAYLIST_BYTES,
     signHlsTarget,
-    hlsTargetAad,
     encodeHlsTarget,
     decodeHlsTarget,
     looksLikePlaylist,

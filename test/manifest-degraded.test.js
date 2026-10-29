@@ -134,7 +134,6 @@ test('the two search catalogs are unaffected either way', async () => {
             // `skip` too: Stremio sends only declared extras, so without it a
             // search could never reach its second page.
             expect(catalog.extra, `${id} working=[${working}]`).toStrictEqual([{ name: 'search', isRequired: true }, { name: 'skip' }]);
-            expect(catalog.searchProperties).toStrictEqual(['name']);
         }
     }
 });

@@ -41,17 +41,10 @@ function registerSweepable(map) {
 // Total entries reclaimed. Each map decides what "expired" means for its own
 // entries — see BoundedMap.sweep, which reclaims on the longer of the map's
 // maxAgeMs and the entry's own ttl.
-function sweepRegistered(now = Date.now()) {
+function sweepCaches(now = Date.now()) {
     let dropped = 0;
     for (const map of sweepables) dropped += map.sweep(now);
     return dropped;
-}
-
-// sweepCaches is sweepRegistered under the name the rest of the app and the tests
-// have always used. Kept as its own function because it is the app's sweep — a
-// test may call sweepRegistered on the registry directly without meaning that.
-function sweepCaches(now = Date.now()) {
-    return sweepRegistered(now);
 }
 
 // The LRU bound caps the worst case, but on its own it only reclaims memory when
@@ -354,7 +347,6 @@ module.exports = {
     CACHE_STALE_MAX_AGE_MS,
     accountCacheKey,
     registerSweepable,
-    sweepRegistered,
     sweepCaches,
     startCacheSweeper,
     CACHE_SWEEP_INTERVAL_MS,

@@ -41,8 +41,8 @@ async function getManifest(cfg = null) {
         // strictly worse than the plain catalog it was meant to degrade into.
         // No `search`: Stremio searches every catalog whose only required extra is
         // search, so a degraded manifest put all seven shelves into search beside
-        // the two search catalogs — duplicate rows, each rescanning the lists
-        //. With a required genre it was unreachable anyway.
+        // the two search catalogs — duplicate rows, each rescanning the lists.
+        // With a required genre it was unreachable anyway.
         const genreExtra = (genres) => (genres.length
             ? [{ name: 'genre', options: genres, isRequired: true }, { name: 'skip' }]
             : [{ name: 'skip' }]);
@@ -78,10 +78,7 @@ async function getManifest(cfg = null) {
                 name,
                 // Stremio sends only the extras a catalog declares, so without
                 // `skip` a search never asks for page two.
-                extra: [{ name: 'search', isRequired: true }, { name: 'skip' }],
-                // Not an SDK field, so no client reads it; kept as documentation
-                // that filterByName matches on `name` only.
-                searchProperties: ['name']
+                extra: [{ name: 'search', isRequired: true }, { name: 'skip' }]
             }))
         );
     }
@@ -108,4 +105,4 @@ async function getManifest(cfg = null) {
     };
 }
 
-module.exports = { getManifest, ADDON_ID, ADDON_VERSION };
+module.exports = { getManifest };

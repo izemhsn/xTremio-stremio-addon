@@ -118,9 +118,10 @@ class BoundedMap extends Map {
         this.totalBytes += weightOf(value);
         if (this.ledger) this.ledger.add(value, this, key);
 
-        // Never evict what was just written, even when a single entry is larger
-        // than the whole budget: refusing to cache it at all would mean
-        // refetching it on every request, which is worse than being over.
+        // Never evict what was just written, even when it alone is over this
+        // map's maxBytes: refusing it would mean refetching it on every request,
+        // which is worse than being over. Only an entry larger than the whole
+        // shared budget is refused, above.
         while (this.size > 1 && (this.size > this.maxEntries || this.overBudget())) {
             // Map keys iterate oldest-first; the first is the LRU victim.
             const oldest = this.keys().next();
@@ -190,4 +191,4 @@ function weightOf(entry) {
     return typeof entry?.bytes === 'number' ? entry.bytes : 0;
 }
 
-module.exports = { BoundedMap, CacheBudget, weightOf };
+module.exports = { BoundedMap, CacheBudget };

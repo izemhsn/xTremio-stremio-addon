@@ -135,7 +135,7 @@ const DNS_TIMEOUT_MS = Math.max(500, Number(process.env.DNS_TIMEOUT_MS) || 5000)
 // c-ares reads the nameserver list itself and can get it wrong where the OS works
 // (one Windows host gave it only 127.0.0.1). These codes mean the resolver itself is
 // unusable, so only they fall back to the OS resolver, under the same deadline. A
-// timeout never falls back: that is the stall S6 removed.
+// timeout never falls back: an uncancellable OS lookup is the stall this avoids.
 const DNS_RESOLVER_UNUSABLE = new Set(['ECONNREFUSED', 'ELOADIPHLPAPI', 'EADDRGETNETWORKPARAMS']);
 const dnsFallback = { warned: false };  // an object, so a test can reset it
 
@@ -311,7 +311,6 @@ module.exports = {
     ALLOW_PRIVATE_NETWORKS,
     DNS_TIMEOUT_MS,
     DNS_PIN_TTL_MS,
-    DNS_PIN_MAX_HOSTS,
     DNS_RESOLVER_UNUSABLE,
     DNS_SERVERS,
     parseDnsServers,
@@ -321,11 +320,8 @@ module.exports = {
     resolveHostAddresses,
     pinResolvedAddresses,
     pinnedLookup,
-    pinnedLookupError,
     PINNED_DISPATCHER,
-    UNDICI_INTEROPERABLE_MAJORS,
     warnOnUndiciMismatch,
-    blockedOutbound,
     assertSafeOutboundUrl,
     discardBody,
     safeFetch

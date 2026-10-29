@@ -184,7 +184,6 @@ module.exports = {
     CATALOG_KINDS,
     catalogTypesFor,
     DEGRADED_CATALOG_LOG_INTERVAL_MS,
-    DEGRADED_CATALOG_LOG_MAX,
     degradedCatalogLogged,
     noteDegradedCatalog,
     selectCatalogSource
