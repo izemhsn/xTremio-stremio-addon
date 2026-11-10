@@ -1,110 +1,277 @@
 # xTremio — Stremio addon for Xtream Codes
 
-Turn any [Xtream Codes](https://en.wikipedia.org/wiki/Xtream_Codes) IPTV subscription into
-**Live TV**, **Movies** and **Series** catalogs inside [Stremio](https://www.stremio.com/).
+xTremio lets you watch an [Xtream Codes](https://en.wikipedia.org/wiki/Xtream_Codes) IPTV
+subscription in [Stremio](https://www.stremio.com/). It adds three sections to Stremio:
+**Live TV**, **Movies** and **Series**.
 
-You run it yourself. There is no database — your credentials are encrypted into your own
-install link — and one running instance can serve many people, each with their own link.
+You host it yourself. It has no database: each user's login details are encrypted into their
+own install link. One running copy can serve many users, each with their own link.
+
+**Contents**
+
+- [Run it on your computer](#run-it-on-your-computer)
+- [Install it in Stremio](#install-it-in-stremio)
+- [Put it on a server](#put-it-on-a-server)
+- [Settings](#settings)
+- [What you get](#what-you-get)
+- [How it works](#how-it-works)
+- [Troubleshooting](#troubleshooting)
+- [Working on the code](#working-on-the-code)
 
 ---
 
-## Quick start
+## Run it on your computer
 
-Needs Node 20.18.1 or newer.
+There are two ways. Both give you the same addon.
+
+| Option | Choose it if |
+|---|---|
+| [Node](#option-1-node) | You want to try it quickly, or change the code |
+| [Docker](#option-2-docker) | You don't want to install Node, or you will run it on a server |
+
+First, download the code:
 
 ```bash
 git clone https://github.com/izemhsn/xTremio-stremio-addon.git
 cd xTremio-stremio-addon
-npm install
-npm start
 ```
 
-Then:
+### Option 1: Node
 
-1. Open <http://localhost:3000/configure>
-2. Enter your Xtream **server URL**, **username** and **password**
-3. Click **Save & Install** → **Install in Stremio**
+You need [Node](https://nodejs.org/) 22 or newer. Check your version with `node --version`.
 
-Live TV, XT-Movies and XT-Series now show up in Stremio.
+1. Install the dependencies:
 
-> **About the server URL:** use the bare host, with a port if you have one —
-> `http://line.example.com:8080`, or just `line.example.com:8080`.
-> A URL with a path in it (`http://host/panel`) will not work — drop the path.
+   ```bash
+   npm install
+   ```
 
----
+2. Start the addon:
 
-## Going live (read this before you deploy)
+   ```bash
+   npm start
+   ```
 
-Three things matter. Everything else has a sane default.
+3. Open <http://localhost:3000/configure>, then follow
+   [Install it in Stremio](#install-it-in-stremio).
 
-### 1. Set `CONFIG_SECRET`
+To stop it, press **Ctrl + C**.
 
-Install links are encrypted with a key made from this secret. If you don't set it, a new
-random one is made every time the server starts — so **every install link breaks on each
-restart** and everyone has to configure again.
+Other useful commands:
+
+| Command | What it does |
+|---|---|
+| `npm run dev` | Starts the addon and restarts it every time you save a file |
+| `npm test` | Runs the tests once |
+| `npm run test:watch` | Runs the tests again every time you save a file |
+
+> **Your install links stop working after a restart.** Without a
+> [secret](#what-is-config_secret), the addon makes a new random one every time it starts.
+> That is fine for a quick try. To keep your links working:
+>
+> 1. Create a `.env` file with a secret (steps 1 and 2 of [Option 2](#option-2-docker)).
+> 2. Start the addon with this command instead of `npm start`:
+>
+>    ```bash
+>    node --env-file=.env index.js
+>    ```
+
+### Option 2: Docker
+
+You need [Docker](https://docs.docker.com/get-docker/), and it must be running. On Windows and
+macOS, install Docker Desktop.
+
+1. **Create your settings file** by copying the example:
+
+   ```bash
+   cp .env.example .env
+   ```
+
+   In Windows Command Prompt, use `copy .env.example .env` instead.
+
+2. **Add a secret.** [Generate one](#generate-a-secret), open `.env`, and paste it right after
+   `CONFIG_SECRET=`. Don't add spaces or quotes:
+
+   ```
+   CONFIG_SECRET=k3J9xPq...Q==
+   ```
+
+   Generate it **only once** and keep it. A new secret breaks every install link.
+
+3. **Build the image and start the container:**
+
+   ```bash
+   docker build -t xtremio .
+   docker run -d --name xtremio -p 3000:3000 --env-file .env --restart unless-stopped xtremio
+   ```
+
+4. Open <http://localhost:3000/configure>, then follow
+   [Install it in Stremio](#install-it-in-stremio).
+
+What the `docker run` options mean:
+
+| Option | Meaning |
+|---|---|
+| `-d` | Run in the background |
+| `--name xtremio` | Give the container a name, so other commands can use it |
+| `-p 3000:3000` | Connect port 3000 on your computer to port 3000 in the container. To use another port, change only the first number: `-p 4000:3000` opens it on <http://localhost:4000> |
+| `--env-file .env` | Load the settings from `.env` |
+| `--restart unless-stopped` | Start again after a crash or a reboot, unless you stopped it yourself |
+
+Everyday commands:
+
+| To... | Run |
+|---|---|
+| See the logs | `docker logs -f xtremio` |
+| Check that it is running | `docker ps` (shows `health: starting` for about 30 seconds, then `healthy`) |
+| Stop it | `docker stop xtremio` |
+| Start it again | `docker start xtremio` |
+
+**After you change `.env` or update the code** (`git pull`), remove the container and run
+step 3 again. `docker restart` is not enough, because Docker reads `.env` only when it creates
+the container.
 
 ```bash
-CONFIG_SECRET=$(openssl rand -base64 48)   # generate once, then save it in your host's config
+docker rm -f xtremio
 ```
 
-It must be at least 32 bytes. With `NODE_ENV=production` the addon **refuses to start**
-without a valid one. Keep it backed up: losing it breaks every install, and leaking it lets
-anyone holding an install link decrypt that user's provider password.
+**If the container keeps restarting**, run `docker logs xtremio`. The usual cause is a missing
+or too short `CONFIG_SECRET`. The Docker image runs in production mode, and in production
+mode the addon refuses to start without a valid secret.
 
-Changing it later invalidates all existing links. To rotate without breaking everyone at
-once, move the old value to `CONFIG_SECRET_PREVIOUS` and set a new `CONFIG_SECRET`.
+**If the logs say `PUBLIC_URL is not set`**, you can ignore it on your own computer. On a
+server, set it (see [Put it on a server](#put-it-on-a-server)).
 
-### 2. Set `NODE_ENV=production`
+**To skip the build**, use the ready-made image. One is published for each release after
+v2.0.0, for regular PCs and servers (amd64) and for ARM boards such as the Raspberry Pi
+(arm64). You don't need the code for this, only a `.env` file:
 
-This is what turns a missing or weak `CONFIG_SECRET` from a warning into a hard stop.
+```bash
+docker run -d --name xtremio -p 3000:3000 --env-file .env --restart unless-stopped ghcr.io/izemhsn/xtremio-stremio-addon:latest
+```
 
-### 3. Behind a reverse proxy, set `PUBLIC_URL` and `TRUST_PROXY`
+### Generate a secret
 
-`PUBLIC_URL` is your public `https://` address, so install links never depend on a request
-header. `TRUST_PROXY` is how many proxies sit in front of you (`true` for one), so client
-addresses are read from what your proxy wrote rather than from what the client sent.
+Run whichever command works on your computer. It prints one long random line: that is your
+secret.
+
+| If you have | Run |
+|---|---|
+| Node (any terminal) | `node -e "console.log(require('crypto').randomBytes(48).toString('base64'))"` |
+| Windows PowerShell | `$b = New-Object byte[] 48; [Security.Cryptography.RandomNumberGenerator]::Create().GetBytes($b); [Convert]::ToBase64String($b)` |
+| Docker only | `docker run --rm node:24-alpine node -e "console.log(require('crypto').randomBytes(48).toString('base64'))"` |
+| macOS / Linux | `openssl rand -base64 48` |
 
 ---
 
-## Deployment
+## Install it in Stremio
 
-Plain Node HTTP server, no persistence. Tested on Node 20.18.1, 22 and 24.
+1. Open <http://localhost:3000/configure>.
+2. Enter your Xtream **server URL**, **username** and **password**.
+3. Click **Save & Install**, then **Install in Stremio**.
+
+Live TV, XT-Movies and XT-Series now appear in Stremio.
+
+**Tips for the server URL:**
+
+- Enter the address with its port, if it has one: `http://line.example.com:8080`, or just
+  `line.example.com:8080`.
+- Don't include a path like `/panel`. The addon ignores it and always talks to the root of the
+  server, so a provider that only works under a path won't work.
+- If you leave out `http://` or `https://`, the addon tries https first. If that fails, it
+  uses http without telling you. Type `https://` if you never want http.
+
+---
+
+## Put it on a server
+
+### Checklist
+
+Most settings have good defaults. On a server, set these three:
+
+1. **`CONFIG_SECRET`**: the key that encrypts install links. See
+   [What is `CONFIG_SECRET`?](#what-is-config_secret)
+2. **`NODE_ENV=production`**: with this, the addon refuses to start if the secret is missing
+   or too short. Without it, the addon only prints a warning. (The Docker image already sets
+   it.)
+3. **`PUBLIC_URL` and `TRUST_PROXY`**, if a reverse proxy sits in front of the addon. A
+   reverse proxy is a server such as nginx, Caddy or Traefik that receives requests first
+   (and usually handles HTTPS) and then forwards them to the addon.
+   - `PUBLIC_URL` is your public address, like `https://xtremio.example.com`. Install links
+     are built from it. Without it, they are built from the request, which a client can fake.
+   - `TRUST_PROXY` is how many proxies are in front (`true` means one). The addon then reads
+     the client's real IP address from what your proxy wrote, not from what the client sent.
+
+### What is `CONFIG_SECRET`?
+
+Every install link is encrypted with a key made from this secret.
+
+- **If you don't set it**, the addon makes a new random one each time it starts. Every install
+  link then breaks on each restart, and every user has to configure again.
+- **It must be at least 32 characters.** [Generate one](#generate-a-secret) once, then save it
+  as `CONFIG_SECRET` in your host's settings (or in `.env`).
+- **Back it up.** If you lose it, every install link breaks.
+- **Keep it private.** Anyone who has it and an install link can read that user's provider
+  password.
+
+**Changing the secret.** A new secret makes all existing links stop working. To change it
+without breaking everyone at once:
+
+1. Move the old value to `CONFIG_SECRET_PREVIOUS` and put a new value in `CONFIG_SECRET`.
+   Old links keep working, and new links use the new secret.
+2. When someone uses an old link, the log says
+   `an install URL sealed under CONFIG_SECRET_PREVIOUS was used` (once per run).
+3. When that line stops appearing after restarts, remove `CONFIG_SECRET_PREVIOUS`.
+
+### Where to host it
+
+It is a normal Node web server with no database. It is tested on Node 22 and 24.
 
 | Where | How |
 |---|---|
-| Railway / Render / Fly.io | Push the repo, start command `npm start` |
-| VPS | `npm ci --omit=dev && pm2 start index.js --name xtremio` |
-| Behind nginx / Caddy / Traefik | Same, plus `PUBLIC_URL` and `TRUST_PROXY` |
+| Railway / Render / Fly.io | Push the repo. Start command: `npm start` |
+| A VPS (your own server) | `npm ci --omit=dev && pm2 start index.js --name xtremio` |
+| A VPS with Docker | Follow [Option 2: Docker](#option-2-docker) |
+| Behind nginx / Caddy / Traefik | Same as above, plus `PUBLIC_URL` and `TRUST_PROXY` |
 
-**Bandwidth warning:** every stream is relayed through your server — roughly 5–10 Mbps in
-*and* out per 1080p viewer, and a live channel relays continuously rather than for the length
-of a file. Platforms that charge for egress or cut off long requests are a poor fit.
+Some platforms (Railway and Fly.io, for example) build the `Dockerfile` when they find one,
+instead of running `npm start`. The image already sets `NODE_ENV=production`, so set
+`CONFIG_SECRET` before the first deploy, or it won't start.
+
+> **Bandwidth warning:** every stream goes through your server. A 1080p viewer uses roughly
+> 5–10 Mbps coming in *and* 5–10 Mbps going out, and a live channel keeps going for as long as
+> someone watches. Hosts that charge for outgoing traffic, or that cut long requests, are a
+> poor fit.
 
 <details>
-<summary><b>Extra steps for a public instance anyone can use</b></summary>
+<summary><b>Extra steps if anyone on the internet can use your server</b></summary>
 
-- **Serve it over HTTPS.** The configure form posts provider passwords.
-- **Keep install links out of your proxy's access logs.** The first path segment of every
-  request is a bearer credential. The addon redacts it in its own logs; nginx does not:
+- **Use HTTPS.** The configure form sends provider passwords.
+- **Keep install links out of your proxy's logs.** The first part of every addon URL is the
+  user's encrypted login, so treat it like a password. `/configure` can also receive it as
+  `?config=`. The addon hides both in its own logs, but nginx doesn't. This nginx setting
+  logs the URL with that part replaced by `<token>`, and without the `?...` part:
 
   ```nginx
-  map $request_uri $xtremio_uri {
+  map $uri $xtremio_uri {
       ~^/[^/]+/(?<rest>.*)$  /<token>/$rest;
-      default                $request_uri;
+      default                $uri;
   }
   log_format xtremio '$remote_addr [$time_local] "$request_method $xtremio_uri" $status $body_bytes_sent';
   access_log /var/log/nginx/xtremio.log xtremio;
   ```
 
-- **Cap the relays to your bandwidth** with `PROXY_MAX_CONCURRENT_TOTAL` (whole instance) and
-  `PROXY_MAX_CONCURRENT_PER_CLIENT` (one address). These are what stop someone relaying
-  arbitrary downloads through a panel of their own. If you only mean to serve specific
-  providers, set `ALLOWED_PANEL_HOSTS` instead — that closes the relay outright.
-- **Size memory** with `CACHE_MAX_MB`, allowing for `MAX_UPSTREAM_MB` on top of it.
-- **Several instances** behind a load balancer work if they share `CONFIG_SECRET`. Caches and
-  relay caps are per instance, so divide the caps between them.
-- **Content complaints come to you.** Streams leave from your server's address — check your
-  host's acceptable-use terms for proxied IPTV traffic before you launch.
+- **Limit the number of streams** to what your bandwidth can handle:
+  `PROXY_MAX_CONCURRENT_TOTAL` for the whole server, `PROXY_MAX_CONCURRENT_PER_CLIENT` for
+  one IP address. Without limits, someone could set up their own fake provider and use your
+  server to download anything. If you only want to serve specific providers, set
+  `ALLOWED_PANEL_HOSTS` instead. That blocks every other provider.
+- **Plan memory**: `CACHE_MAX_MB`, plus up to `MAX_UPSTREAM_MB` on top of it.
+- **Running several copies** behind a load balancer works if they all use the same
+  `CONFIG_SECRET`. Each copy has its own cache and its own stream limits, so split the limits
+  between them.
+- **Complaints about content come to you**, because streams come from your server's address.
+  Check your host's rules about IPTV traffic before you launch.
 
 </details>
 
@@ -112,79 +279,89 @@ of a file. Platforms that charge for egress or cut off long requests are a poor 
 
 ## Settings
 
-All optional except `CONFIG_SECRET` in production. Example: `PORT=4000 npm start`.
+All settings are environment variables. Put them in `.env`, or in your host's settings page.
+All are optional, except `CONFIG_SECRET` in production.
+
+To set one just for a single run: `PORT=4000 npm start` (in PowerShell:
+`$env:PORT=4000; npm start`).
 
 | Variable | Default | What it does |
 |---|---|---|
-| `CONFIG_SECRET` | random each boot | Key for install links. **Required in production**, min 32 bytes. |
-| `NODE_ENV` | *(unset)* | Set to `production` to enforce the secret policy. |
-| `PUBLIC_URL` | from request headers | Your public base URL, used in install links. |
-| `TRUST_PROXY` | `false` | Number of reverse proxies in front (`true` for one). |
-| `PORT` | `3000` | Port to listen on. |
-| `HOST` | `0.0.0.0` | Interface to bind. |
-| `ALLOWED_PANEL_HOSTS` | *(any panel)* | Comma-separated Xtream panels this instance will serve. |
-| `LOG_REQUESTS` | `false` | Log every meta and stream request. Failures are logged either way. |
-| `ALLOW_PRIVATE_NETWORKS` | `false` | Allow LAN/loopback Xtream servers. **Local development only** — it disables the SSRF guard. |
+| `CONFIG_SECRET` | random at each start | The key that encrypts install links and live-stream links. **Required in production.** At least 32 characters. |
+| `NODE_ENV` | *(not set)* | Set to `production` on a server. The addon then refuses to start without a valid `CONFIG_SECRET`. |
+| `PUBLIC_URL` | taken from each request | Your public address, like `https://xtremio.example.com`. Used to build install links. |
+| `TRUST_PROXY` | `false` | How many reverse proxies are in front of the addon (`true` means one). |
+| `PORT` | `3000` | The port the addon listens on. |
+| `HOST` | `0.0.0.0` | The network address to listen on (`0.0.0.0` means all). |
+| `ALLOWED_PANEL_HOSTS` | *(any provider)* | Comma-separated list of provider hostnames this server accepts. |
+| `LOG_REQUESTS` | `false` | Set to `true` to log every meta and stream request, and every call to the provider. Errors are always logged. |
+| `ALLOW_PRIVATE_NETWORKS` | `false` | Set to `true` to allow a provider on your local network (like `192.168.x.x`). **For development only:** it turns off the check that stops people using your server to reach private addresses. |
 
 <details>
 <summary><b>Advanced settings</b></summary>
+
+Times are in milliseconds (1000 = 1 second).
 
 **Secrets**
 
 | Variable | Default | What it does |
 |---|---|---|
-| `CONFIG_SECRET_PREVIOUS` | *(unset)* | The secret you are rotating away from. Old links keep working while new ones are sealed under `CONFIG_SECRET`. Remove it once the "old secret" log line stops appearing. |
-| `HLS_SIGNATURE_TTL_MS` | `3600000` | How long a rewritten HLS link stays valid. Playlists are re-minted on every fetch. |
+| `XTREMIO_CONFIG_SECRET` | *(not set)* | Another name for `CONFIG_SECRET`. Used only when `CONFIG_SECRET` is not set. |
+| `CONFIG_SECRET_PREVIOUS` | *(not set)* | Your old secret while you change to a new one. See [Changing the secret](#what-is-config_secret). |
+| `HLS_SIGNATURE_TTL_MS` | `3600000` | How long a live-stream (HLS) link made by the addon stays valid. New links are made every time the player reloads the playlist. |
 
-**Limits and rate limiting**
-
-| Variable | Default | What it does |
-|---|---|---|
-| `CONFIGURE_RATE_LIMIT` | `10` | Max `POST /configure` attempts per client per window. |
-| `CONFIGURE_RATE_WINDOW_MS` | `60000` | Length of that window. |
-| `PROXY_MAX_CONCURRENT_PER_TOKEN` | `16` | Relays one account may have in flight. |
-| `PROXY_MAX_CONCURRENT_PER_CLIENT` | `32` | Relays one client address may have in flight. |
-| `PROXY_MAX_CONCURRENT_TOTAL` | `256` | Relays the whole instance may have in flight. |
-| `MAX_UPSTREAM_MB` | `64` | Ceiling on a single JSON response from the provider. |
-| `MAX_PLAYLIST_ORIGINS` | `32` | Distinct origins one playlist may name. |
-| `HLS_TARGET_ALLOWED_HOSTS` | *(empty)* | Extra hostnames a playlist may point at. |
-
-**Caching** (30-minute TTL, LRU-bounded)
+**Limits**
 
 | Variable | Default | What it does |
 |---|---|---|
-| `CACHE_MAX_MB` | `256` | Memory budget shared by **every** cache. |
-| `CACHE_MAX_STREAM_MB` | `64` | Budget for full stream lists, **per kind**. |
-| `CACHE_MAX_STREAM_ACCOUNTS` | `64` | Accounts' stream lists held, per kind. |
-| `CACHE_MAX_ACCOUNTS` | `100` | Accounts' category lists held. |
-| `CACHE_MAX_SERIES_INFO` | `500` | Per-series detail entries held. |
-| `CACHE_MAX_VOD_INFO` | `500` | Per-movie detail entries held. |
-| `CACHE_MAX_CATEGORY_LISTS` | `100` | Per-category stream lists held. |
-| `CACHE_SWEEP_INTERVAL_MS` | `300000` | How often expired entries are reclaimed. Minimum 30 s. |
-| `SERIES_INFO_NEGATIVE_TTL_MS` | `300000` | How long a series that failed is remembered as broken. |
+| `CONFIGURE_RATE_LIMIT` | `10` | How many times one user can submit the configure form per time window. |
+| `CONFIGURE_RATE_WINDOW_MS` | `60000` | Length of that time window. |
+| `PROXY_MAX_CONCURRENT_PER_TOKEN` | `16` | Streams one install link can play at the same time. |
+| `PROXY_MAX_CONCURRENT_PER_CLIENT` | `32` | Streams one IP address can play at the same time. |
+| `PROXY_MAX_CONCURRENT_TOTAL` | `256` | Streams the whole server can play at the same time. |
+| `MAX_UPSTREAM_MB` | `64` | Largest answer accepted from the provider (for example, a full movie list). |
+| `MAX_PLAYLIST_ORIGINS` | `32` | Maximum number of different servers one live playlist may point to. |
+| `HLS_TARGET_ALLOWED_HOSTS` | *(empty)* | Extra servers a live playlist may point to. See [Troubleshooting](#troubleshooting). |
+
+**Cache**
+
+The addon keeps the provider's answers in memory for 30 minutes, so it doesn't have to ask
+the provider every time. When a limit is reached, the oldest entries are removed first.
+
+| Variable | Default | What it does |
+|---|---|---|
+| `CACHE_MAX_MB` | `256` | Total memory that **all** caches together may use. |
+| `CACHE_MAX_STREAM_MB` | `64` | Memory for full lists, separately for live channels, movies and series. |
+| `CACHE_MAX_STREAM_ACCOUNTS` | `64` | How many accounts' full lists are kept, separately for each of the three. |
+| `CACHE_MAX_ACCOUNTS` | `100` | How many accounts' category lists are kept. |
+| `CACHE_MAX_SERIES_INFO` | `500` | How many series details are kept. |
+| `CACHE_MAX_VOD_INFO` | `500` | How many movie details are kept. |
+| `CACHE_MAX_CATEGORY_LISTS` | `100` | How many single-category lists are kept. |
+| `CACHE_SWEEP_INTERVAL_MS` | `300000` | How often expired entries are cleaned up. At least 30 seconds. |
+| `SERIES_INFO_NEGATIVE_TTL_MS` | `300000` | How long a series that keeps failing is skipped before trying again. |
 
 **Timeouts**
 
 | Variable | Default | What it does |
 |---|---|---|
-| `DNS_TIMEOUT_MS` | `5000` | Deadline for resolving an Xtream host. |
-| `DNS_SERVERS` | *(empty)* | Nameservers for the built-in resolver, e.g. `8.8.8.8,1.1.1.1`. |
-| `UPSTREAM_HEADER_TIMEOUT_MS` | `15000` | Wait for provider response headers. |
-| `UPSTREAM_IDLE_TIMEOUT_MS` | `15000` | Max gap with no data during a download. |
-| `UPSTREAM_BODY_TIMEOUT_MS` | `300000` | Overall deadline for one provider call. |
-| `PROXY_HEADER_TIMEOUT_MS` | `20000` | Wait for upstream headers when relaying. |
-| `PLAYLIST_BODY_TIMEOUT_MS` | `30000` | Deadline for reading a whole `.m3u8` body. |
-| `PLAYLIST_REWRITE_TIMEOUT_MS` | `15000` | Deadline for the rewrite that follows it. |
-| `KEEPALIVE_TIMEOUT_MS` | `65000` | How long an idle keep-alive connection is held. |
-| `HEADERS_TIMEOUT_MS` | `66000` | How long a client may take to send request headers. |
-| `REQUEST_TIMEOUT_MS` | `120000` | How long a client may take to send a whole request. |
-| `SHUTDOWN_TIMEOUT_MS` | `10000` | Grace period on `SIGTERM`/`SIGINT`. |
+| `DNS_TIMEOUT_MS` | `5000` | Maximum time to look up the provider's address. |
+| `DNS_SERVERS` | *(empty)* | DNS servers to use instead of the automatic ones, like `8.8.8.8,1.1.1.1`. Only needed if lookups fail. |
+| `UPSTREAM_HEADER_TIMEOUT_MS` | `15000` | Maximum wait for the provider to start answering. |
+| `UPSTREAM_IDLE_TIMEOUT_MS` | `15000` | Maximum pause in the middle of a provider's answer. |
+| `UPSTREAM_BODY_TIMEOUT_MS` | `300000` | Maximum total time for one provider answer. |
+| `PROXY_HEADER_TIMEOUT_MS` | `20000` | Maximum wait for a stream to start. |
+| `PLAYLIST_BODY_TIMEOUT_MS` | `30000` | Maximum time to download a live playlist (`.m3u8`). |
+| `PLAYLIST_REWRITE_TIMEOUT_MS` | `15000` | Maximum time to rewrite that playlist. |
+| `KEEPALIVE_TIMEOUT_MS` | `65000` | How long an unused connection is kept open. |
+| `HEADERS_TIMEOUT_MS` | `66000` | Maximum time for a client to send its request headers. |
+| `REQUEST_TIMEOUT_MS` | `120000` | Maximum time for a client to send its whole request. |
+| `SHUTDOWN_TIMEOUT_MS` | `10000` | When stopping, how long to wait for open requests to finish. |
 
 **Other**
 
 | Variable | Default | What it does |
 |---|---|---|
-| `PROXY_CORS` | `false` | Escape hatch — adds CORS to `/proxy` if a player turns out to need it. |
+| `PROXY_CORS` | `false` | Turns on CORS headers for stream URLs. Only needed if a player asks for them. |
 
 </details>
 
@@ -192,156 +369,196 @@ All optional except `CONFIG_SECRET` in production. Example: `PORT=4000 npm start
 
 ## What you get
 
-| Type | Catalogs | Sorting |
+| Section | Catalogs | Sorted by |
 |---|---|---|
-| **Live TV** | 1 | By category (shown as Stremio "genre") |
-| **XT-Movies** | 3 + Search | Popular (rating), New (recently added), Featured (shuffled daily) |
+| **Live TV** | 1 | Category (shown as "genre" in Stremio) |
+| **XT-Movies** | 3 + Search | Popular (rating), New (recently added), Featured (random order that changes every week) |
 | **XT-Series** | 3 + Search | Popular, New, Featured |
 
-- 100 items per page, with genre filtering.
-- The two **Search** catalogs plug into Stremio's global search and cover every category.
-- **Live TV** offers both HLS (`.m3u8`) and MPEG-TS (`.ts`).
-- **Series** gives the full episode list grouped by season.
+- Each page shows 100 items, and you can filter by genre.
+- The two **Search** catalogs work with Stremio's search bar and search every category.
+- **Live TV** channels come in two formats: HLS (`.m3u8`) and MPEG-TS (`.ts`). If one
+  doesn't play, try the other.
+- **Series** show every episode, grouped by season.
 
 ---
 
 ## How it works
 
-### Your install link
+### The install link
 
-When you configure, `{ serverUrl, username, password }` is encrypted into a token that
-becomes the first part of every URL:
+When you fill in the configure form, the addon encrypts your server URL, username and password
+into one long code, called a **token**. The token is the first part of every addon URL:
 
 ```
-stremio://your-host/<config-token>/manifest.json
+stremio://your-host/<token>/manifest.json
 ```
 
-The token is AES-256-GCM encrypted and separately HMAC-signed, with keys derived from
-`CONFIG_SECRET` using scrypt. That means:
+The token is encrypted with AES-256-GCM and signed with HMAC. Both keys are made from
+`CONFIG_SECRET` (using scrypt). This means:
 
-- **No database.** Every request carries its own config.
-- **Many users, one instance.** Nobody's link affects anyone else's.
-- **Treat the link like a password.** Anyone holding it can stream through your instance on
-  your provider account.
-- **Links only work on the instance that made them.** Moving hosts means carrying
-  `CONFIG_SECRET` across, or reissuing every link.
-- Reconfiguring from a link prefills the server URL and username but asks for the password
-  again — the token never hands it back.
+- **No database.** Every request carries its own login details.
+- **Many users, one server.** Each user has their own link, and links don't affect each other.
+- **Treat the link like a password.** Anyone who has it can watch streams through your server
+  with that provider account.
+- **A link only works on the server that made it.** To move to a new host, take
+  `CONFIG_SECRET` with you, or everyone must configure again.
+- When you click **Configure** on an installed addon, the form fills in the server URL and
+  username, but you have to type the password again. The addon never shows it back.
 
 ### Streaming
 
-Stremio is never given a provider URL. Two reasons:
+Stremio never gets a direct link to the provider, for two reasons:
 
-1. Xtream providers redirect to a CDN link that expires in about a minute.
-2. The provider's live URL carries your **username and password in the path**, which would
-   land in player logs and travel in cleartext on the http-only providers that are common.
+1. Providers send players to temporary links that expire after about a minute.
+2. Provider links contain your **username and password**. They would end up in player logs,
+   and many providers only use http, so they would travel unencrypted.
 
-So streams are served as `/:config/proxy/...` URLs on your server, and each range request
-re-resolves a fresh origin. `.ts` is relayed byte-for-byte. `.m3u8` cannot be — a playlist is
-a list of further credential-bearing URLs — so every segment, key and variant URI is rewritten
-into a signed, encrypted `/proxy/hls` link. Nested playlists are rewritten in turn, and a
-target that turns out not to be a playlist is answered `502` rather than relayed.
+Instead, every stream goes through the addon (the addon acts as a **proxy**). Stream URLs look
+like `/<token>/proxy/...` on your server:
 
----
+- **Movies, episodes, and `.ts` live channels** are passed through as they are. Every request
+  gets a fresh link from the provider.
+- **HLS (`.m3u8`) live channels** need more work. An HLS playlist is a list of more links, and
+  those links contain your password too. So the addon rewrites each link into a signed,
+  encrypted link back to itself (`/proxy/hls`). If a link that should be a playlist turns
+  out not to be one, the addon answers with error `502`.
 
-## Endpoints
+### Endpoints
 
-| Path | Purpose |
+| URL | What it is |
 |---|---|
-| `/` | Landing page |
-| `/health` | Health check — `200 {"status":"ok"}`, or `503` while shutting down |
-| `/configure` | The credentials form |
+| `/` | Home page |
+| `/health` | Health check. Answers `200` with `"status":"ok"`, or `503` with `"shutting_down"` or `"stalled"` (the server was blocked for over 1 second). Also shows uptime and delay. |
+| `/configure` | The configure form |
 | `/:config/configure` | The same form, opened by Stremio's **Configure** button |
-| `/manifest.json` | Unconfigured manifest |
-| `/:config/manifest.json` | Configured manifest with genres |
+| `/manifest.json` | Addon description before configuring |
+| `/:config/manifest.json` | Addon description for one account, with its genres |
 | `/:config/catalog/:type/:id/:extra?.json` | Catalog items |
-| `/:config/meta/:type/:id.json` | Channel, movie or series details |
-| `/:config/stream/:type/:id.json` | Playable stream URLs |
-| `/:config/proxy/:kind/:file` | Relays movie, episode and live bytes |
-| `/:config/proxy/hls` | Relays HLS segments and keys |
+| `/:config/meta/:type/:id.json` | Details of one channel, movie or series |
+| `/:config/stream/:type/:id.json` | Stream links for one item |
+| `/:config/proxy/:kind/:file` | Streams movies, episodes and live channels |
+| `/:config/proxy/hls` | Streams the parts of a live HLS stream |
+
+`:config` is the user's token.
 
 ---
 
 ## Troubleshooting
 
-**Every install link broke after a restart**
-`CONFIG_SECRET` wasn't set, so a new random one was generated at boot and old tokens can no
-longer be decrypted. [Set it](#1-set-config_secret). Everyone reconfigures once, then it won't
-happen again.
+**Every install link stopped working after a restart**
+`CONFIG_SECRET` wasn't set, so the addon made a new random one when it started, and it can't
+read the old links anymore. [Set it](#what-is-config_secret). Everyone has to configure once
+more, and then it won't happen again.
 
 **"Cannot reach that server"**
-The message is intentionally identical for a bad hostname, a closed port and a blocked private
-address, so the page can't be used to scan hosts. Check the server log for the real cause, and
-make sure your URL has no path in it.
+The addon shows the same message for a wrong address, a closed port, and a blocked private
+address. This is on purpose, so nobody can use the form to scan other servers. Check the
+server log for the real reason, and make sure your URL has no path in it.
 
 **"Connected over http, not https"**
-Your `https://` URL didn't work, or the provider's own `server_info` names http — so your
-credentials go in cleartext on every request. If the provider does support https, fix the URL
-and configure again for a new link. The old link stays on http.
+You typed the address without `https://`. The https connection worked, but the provider said
+its main address uses http, and your login worked there, so the link uses http. Your password
+is then sent unencrypted with every request. To stay on https, type the address starting with
+`https://` and configure again to get a new link. The old link stays on http.
 
 **"No streams available" on an episode**
-Usually one specific series upsetting the provider; a retry normally resolves it. A series that
-fails all 3 attempts is remembered as broken for 5 minutes, so it stops costing a retry storm
-on every request. Check the log for `[stream]` and `[getSeriesInfo] ... failed`.
+Usually the provider has a problem with that one series, and trying again fixes it. If a
+series fails 3 times in a row, the addon skips it for 5 minutes, so it doesn't keep asking
+the provider. Look for `[stream]` and `[getSeriesInfo] ... failed` in the log.
 
 **Catalogs show no genres**
-Your provider is blocking category calls. Catalogs still work, just unfiltered, and search and
-pagination are unaffected. Failed lookups are cached for only 60 seconds, so it clears itself
-within about a minute.
+Your provider is blocking the request for categories. Catalogs still work, just without genre
+filters, and search and paging are not affected. The addon tries again after 60 seconds, so
+it usually fixes itself within a minute.
 
-**Search or a shelf is briefly empty**
-The provider answered with an empty list it later filled, which real providers do transiently.
-Empty answers are cached for only 60 seconds, so it recovers within about a minute. If search
-stays empty for longer, the provider is refusing the full-catalog request outright.
+**Search or a catalog is empty for a moment**
+The provider sent an empty list and filled it later, which some providers do. The addon tries
+again after 60 seconds, so it fixes itself within about a minute. If search stays empty
+longer, the provider is refusing to send its full list.
 
 **A live channel fails with "playlist target refused"**
-The playlist named a host that is neither your panel nor its own origin, so it was refused
-rather than passing the provider's credential-bearing URLs to the player. The log names the
-host — add it to `HLS_TARGET_ALLOWED_HOSTS` if your provider legitimately uses it.
+The channel's playlist points to a server that is neither your provider nor the playlist's
+own server. The addon refuses it, so it doesn't send your provider's password-carrying links
+somewhere unknown. The log shows that server's name. If your provider really uses it, add it
+to `HLS_TARGET_ALLOWED_HOSTS`.
 
 **"Too many attempts" on the configure page**
-Rate limit, 10 per minute by default. Wait it out, or raise `CONFIGURE_RATE_LIMIT`. If it fires
-for unrelated users, you're behind a proxy and need `TRUST_PROXY`.
+You hit the limit: 10 tries per minute by default. Wait a minute, or raise
+`CONFIGURE_RATE_LIMIT`. If different users all get this message, you are behind a reverse
+proxy and need to set `TRUST_PROXY`.
 
-**Port already in use**
-`PORT=3001 npm start`.
+**"Port already in use"**
+Another program uses port 3000. Use another port: `PORT=3001 npm start` (in PowerShell:
+`$env:PORT=3001; npm start`). With Docker, change the first number in `-p`: `-p 3001:3000`.
 
-**Episodes auto-advance too early**
-A Stremio player quirk. Turn off "Play next episode automatically", or use Stremio Desktop
-(better MKV handling than web).
+**Episodes jump to the next one too early**
+This is a Stremio player issue. Turn off "Play next episode automatically", or use Stremio
+Desktop, which handles MKV files better than the web version.
 
 ---
 
-## Project structure
+## Working on the code
+
+### Project structure
 
 ```
-index.js          Express app — routes in registration order, plus bootstrap
-src/              Modules index.js re-exports, so requiring index.js gets everything
-  helpers.js          URL, id and value coercions
-  config-token.js     Install-token crypto and the CONFIG_SECRET policy
-  panel-allowlist.js  Which Xtream panels this instance will serve
-  manifest.js         The manifest, built per account from its categories
-  lifecycle.js        Socket timeouts, drain flag, graceful shutdown
-  html.js             escapeHtml, shared by both pages
-  net/                SSRF guard, private-IP ranges, DNS pinning, safeFetch
-  upstream/           Capped body reading and byte weighing
-  cache/              BoundedMap, the shared budget, cache-aside primitives
-  xtream/             One panel call, and every cache and getter over it
-  catalog/            Catalog kinds, ids, ordering, filtering, the view memo
-  hls/                Playlist signing, encryption and rewriting
-  proxy/              The shared relay, HLS target mapper, concurrency caps
-  configure/          Credential validation and scheme handling
-  routes/             Request identity, base URL, extras and cache hints
-  pages/              The /configure and landing pages
-test/             Unit tests — node:test, run with `npm test`
+index.js            Starts the server (checks settings, listens, handles shutdown)
+src/
+  app.js            The Express app: middleware and every route, in order
+  manifest.js       The addon description, built for each account from its categories
+  lifecycle.js      Server timeouts and clean shutdown
+  helpers.js        Small shared helpers: URLs, ids, value conversions
+
+  routes/           One file per endpoint. Start here to follow a request
+                    (catalog, meta, stream, proxy, configure, manifest, health)
+  http/             Shared by the routes: CORS, errors, client IP and base URL,
+                    catalog "extra" parsing, cache headers
+  pages/            The HTML of the home and /configure pages
+
+  config/           The install link: token encryption, CONFIG_SECRET rules,
+                    allowed providers, login check, /configure rate limit
+  xtream/           Talking to the Xtream provider, and caching its answers
+  catalog/          Building catalogs: kinds, sorting, filtering, pages
+  proxy/            Streaming through the addon, and rewriting HLS playlists
+  net/              Safe outgoing requests: blocks private addresses, DNS, size limits
+  cache/            Memory caches with size limits
+
+test/               Tests (Vitest). Run them with `npm test`
+  support/internals.js  Every module's exports in one place, for the tests
+
+Dockerfile          How the Docker image is built
+.github/workflows/
+  ci-cd.yml         Runs the tests on every push and pull request,
+                    and publishes the Docker image when you push a version tag
 ```
 
-One dependency note: don't move `undici` to version 8 on its own. It needs Node 22.19+, and
-its connection agent fails every request with the `fetch` bundled in Node 22 and 24.
+**How a request moves through the code:** `routes/` → `xtream/`, `catalog/` or `proxy/` →
+`net/`. The folders in the bottom group of `src/` (`config/` to `cache/`) never import from
+`routes/`.
+
+### Releasing a new version
+
+Bump the version and tag it in one step, then push both:
+
+```bash
+npm version minor        # or patch / major: updates package.json, commits, tags v2.1.0
+git push --follow-tags
+```
+
+Don't create the tag by hand. The version in `package.json` is the one Stremio shows, so CI
+refuses to publish when the tag and `package.json` disagree. When the tests pass, GitHub
+publishes the Docker image to `ghcr.io/izemhsn/xtremio-stremio-addon`, tagged `v2.1.0` and
+`latest`, for amd64 and arm64.
+
+### Dependency note
+
+Don't update `undici` to version 8 by itself. It needs Node 22.19 or newer, and it breaks every
+request when used with the `fetch` built into Node 22 and 24.
 
 ---
 
 ## License
 
-Source is publicly viewable but **not licensed for use without permission**.
-See [`LICENSE`](./LICENSE).
+[MIT](./LICENSE). You can use, copy, change and share this code, as long as you keep the
+copyright notice and license text.
