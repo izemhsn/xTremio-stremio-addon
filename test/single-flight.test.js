@@ -4,9 +4,6 @@
 process.env.CONFIG_SECRET = 'test-secret-for-unit-tests';
 process.env.ALLOW_PRIVATE_NETWORKS = 'true';
 
-const test = require('node:test');
-const assert = require('node:assert');
-
 const {
     createSingleFlight,
     getCategories,
@@ -14,7 +11,7 @@ const {
     getAllSeriesStreams,
     getAllLiveStreams,
     vodStreamsCache
-} = require('../index.js');
+} = require('./support/internals.js');
 
 const realFetch = global.fetch;
 let calls = [];
@@ -34,7 +31,7 @@ function gatedFetch({ fail = false, payload = [{ stream_id: '1', name: 'X' }] } 
     return () => release();
 }
 
-test.after(() => { global.fetch = realFetch; });
+afterAll(() => { global.fetch = realFetch; });
 
 function cfgFor(name) {
     return { serverUrl: 'http://127.0.0.1:9', username: name, password: 'p' };
@@ -53,12 +50,12 @@ test('createSingleFlight collapses concurrent calls and releases after settle', 
         singleFlight('k', fn)
     ]);
     release();
-    assert.deepStrictEqual(await all, ['value', 'value', 'value']);
-    assert.strictEqual(runs, 1, 'three concurrent callers must run the work once');
+    expect(await all).toStrictEqual(['value', 'value', 'value']);
+    expect(runs, 'three concurrent callers must run the work once').toBe(1);
 
     // Once settled the key is free again, so a later call re-runs.
-    assert.strictEqual(await singleFlight('k', async () => 'second'), 'second');
-    assert.strictEqual(runs, 1);
+    expect(await singleFlight('k', async () => 'second')).toBe('second');
+    expect(runs).toBe(1);
 });
 
 test('createSingleFlight keys are independent', async () => {
@@ -66,7 +63,7 @@ test('createSingleFlight keys are independent', async () => {
     let runs = 0;
     const fn = async () => { runs++; return runs; };
     await Promise.all([singleFlight('a', fn), singleFlight('b', fn)]);
-    assert.strictEqual(runs, 2);
+    expect(runs).toBe(2);
 });
 
 test('a rejection is shared, then the key is freed for a retry', async () => {
@@ -75,17 +72,17 @@ test('a rejection is shared, then the key is freed for a retry', async () => {
     const boom = async () => { runs++; throw new Error('nope'); };
 
     const results = await Promise.allSettled([singleFlight('k', boom), singleFlight('k', boom)]);
-    assert.ok(results.every(r => r.status === 'rejected'));
-    assert.strictEqual(runs, 1, 'both callers share the one failed attempt');
+    expect(results.every(r => r.status === 'rejected')).toBeTruthy();
+    expect(runs, 'both callers share the one failed attempt').toBe(1);
 
     // A failure must not be sticky: the next caller gets a fresh attempt.
-    assert.strictEqual(await singleFlight('k', async () => 'ok'), 'ok');
+    expect(await singleFlight('k', async () => 'ok')).toBe('ok');
 });
 
 test('a synchronous throw inside the worker still rejects and frees the key', async () => {
     const singleFlight = createSingleFlight();
-    await assert.rejects(() => singleFlight('k', () => { throw new Error('sync'); }), /sync/);
-    assert.strictEqual(await singleFlight('k', async () => 'recovered'), 'recovered');
+    await expect(singleFlight('k', () => { throw new Error('sync'); })).rejects.toThrow(/sync/);
+    expect(await singleFlight('k', async () => 'recovered')).toBe('recovered');
 });
 
 test('concurrent getAllVodStreams issues one upstream call, not N', async () => {
@@ -99,10 +96,10 @@ test('concurrent getAllVodStreams issues one upstream call, not N', async () => 
     release();
     const results = await all;
 
-    assert.strictEqual(calls.length, 1, `expected 1 upstream call, got ${calls.length}`);
-    assert.strictEqual(calls[0], 'get_vod_streams');
+    expect(calls.length, `expected 1 upstream call, got ${calls.length}`).toBe(1);
+    expect(calls[0]).toBe('get_vod_streams');
     // Every caller gets the same data.
-    results.forEach(r => assert.deepStrictEqual(r, results[0]));
+    results.forEach(r => expect(r).toStrictEqual(results[0]));
 });
 
 test('the warm cache still short-circuits after a flight completes', async () => {
@@ -111,10 +108,10 @@ test('the warm cache still short-circuits after a flight completes', async () =>
     const first = getAllVodStreams(cfg);
     release();
     await first;
-    assert.strictEqual(calls.length, 1);
+    expect(calls.length).toBe(1);
 
     await getAllVodStreams(cfg);
-    assert.strictEqual(calls.length, 1, 'a cached read must not refetch');
+    expect(calls.length, 'a cached read must not refetch').toBe(1);
 });
 
 test('each stream list has its own flight', async () => {
@@ -127,10 +124,7 @@ test('each stream list has its own flight', async () => {
     release();
     await all;
 
-    assert.deepStrictEqual(
-        [...calls].sort(),
-        ['get_live_streams', 'get_series', 'get_vod_streams']
-    );
+    expect([...calls].sort()).toStrictEqual(['get_live_streams', 'get_series', 'get_vod_streams']);
 });
 
 test('different accounts are not collapsed into one flight', async () => {
@@ -141,7 +135,7 @@ test('different accounts are not collapsed into one flight', async () => {
     ]);
     release();
     await all;
-    assert.strictEqual(calls.length, 2, 'separate accounts must each fetch');
+    expect(calls.length, 'separate accounts must each fetch').toBe(2);
 });
 
 test('concurrent getCategories issues 3 upstream calls, not 3 per caller', async () => {
@@ -154,8 +148,8 @@ test('concurrent getCategories issues 3 upstream calls, not 3 per caller', async
     release();
     const results = await all;
 
-    assert.strictEqual(calls.length, 3, `expected 3 upstream calls, got ${calls.length}`);
-    results.forEach(r => assert.strictEqual(r, results[0], 'all callers share one entry'));
+    expect(calls.length, `expected 3 upstream calls, got ${calls.length}`).toBe(3);
+    results.forEach(r => expect(r, 'all callers share one entry').toBe(results[0]));
 });
 
 // Bounded: if the re-check regresses this waits on a gate that never opens,
@@ -171,8 +165,8 @@ test('the worker re-checks the cache before fetching', { timeout: 2000 }, async 
     const inFlight = getAllVodStreams(cfg);
     vodStreamsCache.set(cfg, preset);
 
-    assert.deepStrictEqual(await inFlight, preset);
-    assert.strictEqual(calls.length, 0, 'must not fetch when the cache went warm mid-flight');
+    expect(await inFlight).toStrictEqual(preset);
+    expect(calls.length, 'must not fetch when the cache went warm mid-flight').toBe(0);
 });
 
 test('a failed flight does not poison the next attempt', async () => {
@@ -180,12 +174,12 @@ test('a failed flight does not poison the next attempt', async () => {
     let release = gatedFetch({ fail: true });
     const failed = Promise.all([getAllVodStreams(cfg), getAllVodStreams(cfg)]);
     release();
-    await assert.rejects(() => failed);
-    assert.strictEqual(calls.length, 1);
+    await expect(failed).rejects.toThrow();
+    expect(calls.length).toBe(1);
 
     release = gatedFetch();
     const retry = getAllVodStreams(cfg);
     release();
-    assert.ok(Array.isArray(await retry), 'a retry after failure must succeed');
-    assert.strictEqual(calls.length, 1);
+    expect(Array.isArray(await retry), 'a retry after failure must succeed').toBeTruthy();
+    expect(calls.length).toBe(1);
 });

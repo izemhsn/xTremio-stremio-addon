@@ -15,10 +15,7 @@
 process.env.CONFIG_SECRET = 'test-secret-for-unit-tests';
 process.env.ALLOW_PRIVATE_NETWORKS = 'true';
 
-const test = require('node:test');
-const assert = require('node:assert');
-
-const { app, renderConfigPage } = require('../index.js');
+const { app, renderConfigPage } = require('./support/internals.js');
 
 const realFetch = global.fetch;
 
@@ -61,25 +58,25 @@ function successPage(nonce) {
 test('GET /configure sends the framing, CSP and sniffing headers', async () => {
     await withServer(async (base) => {
         const res = await realFetch(`${base}/configure`);
-        assert.equal(res.status, 200);
+        expect(res.status).toBe(200);
 
-        assert.equal(res.headers.get('x-frame-options'), 'DENY');
-        assert.equal(res.headers.get('x-content-type-options'), 'nosniff');
+        expect(res.headers.get('x-frame-options')).toBe('DENY');
+        expect(res.headers.get('x-content-type-options')).toBe('nosniff');
 
         const csp = parseCsp(res.headers.get('content-security-policy'));
         // frame-ancestors is the one with a live attack behind it: this page has
         // a submit button that sends plaintext credentials.
-        assert.deepEqual(csp['frame-ancestors'], ["'none'"]);
-        assert.deepEqual(csp['default-src'], ["'none'"]);
-        assert.deepEqual(csp['base-uri'], ["'none'"]);
+        expect(csp['frame-ancestors']).toStrictEqual(["'none'"]);
+        expect(csp['default-src']).toStrictEqual(["'none'"]);
+        expect(csp['base-uri']).toStrictEqual(["'none'"]);
         // form-action does not fall back to default-src; without it the page's
         // own POST would be allowed anyway, but an injected form could post
         // the credentials anywhere.
-        assert.deepEqual(csp['form-action'], ["'self'"]);
+        expect(csp['form-action']).toStrictEqual(["'self'"]);
 
         // The existing pair must survive the addition.
-        assert.equal(res.headers.get('cache-control'), 'no-store');
-        assert.equal(res.headers.get('referrer-policy'), 'no-referrer');
+        expect(res.headers.get('cache-control')).toBe('no-store');
+        expect(res.headers.get('referrer-policy')).toBe('no-referrer');
     });
 });
 
@@ -88,7 +85,7 @@ test('no response names the framework it runs on', async () => {
     await withServer(async (base) => {
         for (const path of ['/manifest.json', '/configure', '/no-such-route']) {
             const res = await realFetch(`${base}${path}`);
-            assert.equal(res.headers.get('x-powered-by'), null, `${path} sent X-Powered-By`);
+            expect(res.headers.get('x-powered-by'), `${path} sent X-Powered-By`).toBeNull();
         }
     });
 });
@@ -102,21 +99,25 @@ test('POST /configure sends them too', async () => {
             headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
             body: 'serverUrl=&username=&password='
         });
-        assert.equal(res.headers.get('x-frame-options'), 'DENY');
-        assert.equal(res.headers.get('x-content-type-options'), 'nosniff');
-        assert.match(res.headers.get('content-security-policy') || '', /frame-ancestors 'none'/);
+        expect(res.headers.get('x-frame-options')).toBe('DENY');
+        expect(res.headers.get('x-content-type-options')).toBe('nosniff');
+        expect(res.headers.get('content-security-policy') || '').toMatch(/frame-ancestors 'none'/);
     });
 });
 
 test("the policy never allows script-src 'unsafe-inline'", async () => {
     await withServer(async (base) => {
         const csp = parseCsp((await realFetch(`${base}/configure`)).headers.get('content-security-policy'));
-        assert.ok(csp['script-src'], 'script-src must be stated, not inherited');
-        assert.ok(!csp['script-src'].includes("'unsafe-inline'"),
-            "script-src 'unsafe-inline' would defeat the whole policy");
-        assert.ok(!csp['script-src'].includes("'unsafe-eval'"));
-        assert.ok(csp['script-src'].some(v => /^'nonce-[A-Za-z0-9+/]+={0,2}'$/.test(v)),
-            'script-src must carry a nonce');
+        expect(csp['script-src'], 'script-src must be stated, not inherited').toBeTruthy();
+        expect(
+            csp['script-src'],
+            "script-src 'unsafe-inline' would defeat the whole policy"
+        ).not.toContain("'unsafe-inline'");
+        expect(csp['script-src']).not.toContain("'unsafe-eval'");
+        expect(
+            csp['script-src'].some(v => /^'nonce-[A-Za-z0-9+/]+={0,2}'$/.test(v)),
+            'script-src must carry a nonce'
+        ).toBeTruthy();
     });
 });
 
@@ -127,7 +128,7 @@ test('style-src keeps unsafe-inline, because the page needs it', async () => {
     // and the page renders unstyled.
     await withServer(async (base) => {
         const csp = parseCsp((await realFetch(`${base}/configure`)).headers.get('content-security-policy'));
-        assert.deepEqual(csp['style-src'], ["'unsafe-inline'"]);
+        expect(csp['style-src']).toStrictEqual(["'unsafe-inline'"]);
     });
 });
 
@@ -140,19 +141,19 @@ test('the nonce is fresh per response and matches the script tag', async () => {
             const res = await realFetch(`${base}/configure`);
             const csp = parseCsp(res.headers.get('content-security-policy'));
             const nonce = csp['script-src'][0].replace(/^'nonce-|'$/g, '');
-            assert.ok(nonce.length >= 16, 'a guessable nonce is not a nonce');
+            expect(nonce.length, 'a guessable nonce is not a nonce').toBeGreaterThanOrEqual(16);
             seen.add(nonce);
         }
-        assert.equal(seen.size, 3, 'a reused nonce is a static allowlist entry');
+        expect(seen.size, 'a reused nonce is a static allowlist entry').toBe(3);
     });
 });
 
 test('the script tag on the success page carries the nonce from the header', () => {
     const html = successPage('TESTNONCE123456');
-    assert.match(html, /<script nonce="TESTNONCE123456">/);
+    expect(html).toMatch(/<script nonce="TESTNONCE123456">/);
     // One script, so one nonce to match — a second, unnonced block would be
     // dead code that only fails in a browser.
-    assert.equal((html.match(/<script/g) || []).length, 1);
+    expect((html.match(/<script/g) || []).length).toBe(1);
 });
 
 // --- L-12: nothing inline is left to be blocked ------------------------------
@@ -161,38 +162,40 @@ test('the rendered page has no inline event handlers', () => {
     // The failure this prevents is silent: under the CSP an onclick simply does
     // not run, and the copy button looks fine while doing nothing.
     for (const html of [successPage('n'), renderConfigPage({ nonce: 'n' })]) {
-        assert.doesNotMatch(html, /\son[a-z]+\s*=/i, 'inline handlers are dead under this CSP');
+        expect(html, 'inline handlers are dead under this CSP').not.toMatch(/\son[a-z]+\s*=/i);
     }
 });
 
 test('copying uses navigator.clipboard, with execCommand only as a fallback', () => {
     const html = successPage('n');
-    assert.match(html, /navigator\.clipboard/);
-    assert.match(html, /addEventListener\('click'/);
+    expect(html).toMatch(/navigator\.clipboard/);
+    expect(html).toMatch(/addEventListener\('click'/);
 
     // execCommand is deliberately still present: navigator.clipboard is
     // undefined on insecure origins, which is how this addon is usually
     // reached (plain http on a LAN). It must be the fallback, not the path.
     const clipboardAt = html.indexOf('navigator.clipboard.writeText');
     const execAt = html.indexOf('execCommand');
-    assert.ok(execAt !== -1, 'the insecure-origin fallback must stay');
-    assert.ok(execAt < clipboardAt || html.includes('copyViaSelection'),
-        'execCommand must be reachable only through the fallback helper');
+    expect(execAt !== -1, 'the insecure-origin fallback must stay').toBeTruthy();
+    expect(
+        execAt < clipboardAt || html.includes('copyViaSelection'),
+        'execCommand must be reachable only through the fallback helper'
+    ).toBeTruthy();
 });
 
 test('the copy control is still there and still carries the install URL', () => {
     const html = successPage('n');
-    assert.match(html, /id="copy-input"/);
-    assert.match(html, /id="copy-label"/);
-    assert.match(html, /value="http:\/\/localhost:3000\/[^"]+\/manifest\.json"/);
+    expect(html).toMatch(/id="copy-input"/);
+    expect(html).toMatch(/id="copy-label"/);
+    expect(html).toMatch(/value="http:\/\/localhost:3000\/[^"]+\/manifest\.json"/);
 });
 
 test('a page rendered without a nonce still renders', () => {
     // renderConfigPage is exported and called from tests; a missing nonce must
     // degrade to a page whose link is still selectable, not throw.
     const html = renderConfigPage({});
-    assert.match(html, /<form method="POST" action="\/configure">/);
-    assert.doesNotMatch(html, /undefined/);
+    expect(html).toMatch(/<form method="POST" action="\/configure">/);
+    expect(html).not.toMatch(/undefined/);
 });
 
 // Audit F5. The server URL field was <input type="url">, so the browser refused
@@ -206,13 +209,13 @@ test('the server URL field accepts an address with no scheme', () => {
     const html = renderConfigPage({ nonce: 'n' });
     const field = html.match(/<input[^>]*name="serverUrl"[^>]*>/)[0];
 
-    assert.doesNotMatch(field, /type="url"/, 'type="url" blocks a scheme-less address');
-    assert.match(field, /type="text"/);
-    assert.match(field, /inputmode="url"/, 'the keyboard should still suit a URL');
-    assert.match(field, /autocapitalize="off"/);
-    assert.match(field, /autocorrect="off"/);
-    assert.match(field, /spellcheck="false"/);
-    assert.match(field, /required/);
+    expect(field, 'type="url" blocks a scheme-less address').not.toMatch(/type="url"/);
+    expect(field).toMatch(/type="text"/);
+    expect(field, 'the keyboard should still suit a URL').toMatch(/inputmode="url"/);
+    expect(field).toMatch(/autocapitalize="off"/);
+    expect(field).toMatch(/autocorrect="off"/);
+    expect(field).toMatch(/spellcheck="false"/);
+    expect(field).toMatch(/required/);
 });
 
 test('every field is labelled and carries the right autocomplete hint', () => {
@@ -222,18 +225,18 @@ test('every field is labelled and carries the right autocomplete hint', () => {
     // sighted user; the for/id pair is what makes it one to a screen reader and
     // what makes the label clickable.
     for (const name of ['serverUrl', 'username', 'password']) {
-        assert.match(html, new RegExp(`<label for="${name}">`), `${name} has no linked label`);
-        assert.match(html, new RegExp(`<input[^>]*id="${name}"`), `${name} has no id`);
+        expect(html, `${name} has no linked label`).toMatch(new RegExp(`<label for="${name}">`));
+        expect(html, `${name} has no id`).toMatch(new RegExp(`<input[^>]*id="${name}"`));
     }
 
     const username = html.match(/<input[^>]*name="username"[^>]*>/)[0];
     const password = html.match(/<input[^>]*name="password"[^>]*>/)[0];
-    assert.match(username, /autocomplete="username"/);
-    assert.match(password, /autocomplete="current-password"/);
-    assert.match(password, /type="password"/, 'the password must never be a visible field');
+    expect(username).toMatch(/autocomplete="username"/);
+    expect(password).toMatch(/autocomplete="current-password"/);
+    expect(password, 'the password must never be a visible field').toMatch(/type="password"/);
 });
 
 test('the page declares its charset', () => {
     // The page interpolates provider-supplied strings, which are not ASCII.
-    assert.match(renderConfigPage({ nonce: 'n' }), /<meta charset="utf-8">/);
+    expect(renderConfigPage({ nonce: 'n' })).toMatch(/<meta charset="utf-8">/);
 });

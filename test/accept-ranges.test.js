@@ -16,11 +16,9 @@
 process.env.CONFIG_SECRET = 'test-secret-for-unit-tests';
 process.env.ALLOW_PRIVATE_NETWORKS = 'true';
 
-const test = require('node:test');
-const assert = require('node:assert');
 const http = require('node:http');
 
-const { app, encodeConfig, normalizeAcceptRanges } = require('../index.js');
+const { app, encodeConfig, normalizeAcceptRanges } = require('./support/internals.js');
 
 const realFetch = global.fetch;
 const MALFORMED = '0-3328437858';
@@ -31,55 +29,46 @@ test('a 206 is proof, whatever upstream claims', () => {
     // The origin honoured a byte range in this very exchange; nothing it says
     // about itself outranks that.
     for (const upstreamValue of [MALFORMED, 'none', null, 'bytes', 'seconds']) {
-        assert.equal(
+        expect(
             normalizeAcceptRanges({ status: 206, upstreamValue, sentRange: true }),
-            'bytes',
             `206 with upstream ${JSON.stringify(upstreamValue)}`
-        );
+        ).toBe('bytes');
     }
 });
 
 test('a range we asked for that came back whole means the origin ignores ranges', () => {
     // L-2 exactly: upstream says bytes, upstream ignored the range. Omitting is
     // the only honest answer — asserting either unit would be a guess.
-    assert.equal(
-        normalizeAcceptRanges({ status: 200, upstreamValue: 'bytes', sentRange: true }),
-        null
-    );
-    assert.equal(
-        normalizeAcceptRanges({ status: 200, upstreamValue: null, sentRange: true }),
-        null
-    );
+    expect(normalizeAcceptRanges({ status: 200, upstreamValue: 'bytes', sentRange: true })).toBeNull();
+    expect(normalizeAcceptRanges({ status: 200, upstreamValue: null, sentRange: true })).toBeNull();
     // 416 is a refusal, not a demonstration of support.
-    assert.equal(
-        normalizeAcceptRanges({ status: 416, upstreamValue: 'bytes', sentRange: true }),
-        null
-    );
+    expect(normalizeAcceptRanges({ status: 416, upstreamValue: 'bytes', sentRange: true })).toBeNull();
 });
 
 test('a failed If-Range legitimately returns a whole body, so it proves nothing', () => {
     // The one 200-to-a-ranged-request that is not evidence of anything: the
     // validator did not match, so the origin correctly sent the whole entity.
-    assert.equal(
-        normalizeAcceptRanges({ status: 200, upstreamValue: 'bytes', sentRange: true, sentIfRange: true }),
-        'bytes'
-    );
-    assert.equal(
-        normalizeAcceptRanges({ status: 200, upstreamValue: MALFORMED, sentRange: true, sentIfRange: true }),
-        'bytes'
-    );
+    expect(
+        normalizeAcceptRanges({ status: 200, upstreamValue: 'bytes', sentRange: true, sentIfRange: true })
+    ).toBe('bytes');
+    expect(
+        normalizeAcceptRanges({ status: 200, upstreamValue: MALFORMED, sentRange: true, sentIfRange: true })
+    ).toBe('bytes');
 });
 
 test('with no range requested, a well-formed unit is trusted and a malformed one is not', () => {
-    assert.equal(normalizeAcceptRanges({ status: 200, upstreamValue: 'bytes' }), 'bytes');
-    assert.equal(normalizeAcceptRanges({ status: 200, upstreamValue: 'none' }), 'none');
-    assert.equal(normalizeAcceptRanges({ status: 200, upstreamValue: 'BYTES' }), 'bytes', 'the token is case-insensitive');
-    assert.equal(normalizeAcceptRanges({ status: 200, upstreamValue: ' bytes ' }), 'bytes');
+    expect(normalizeAcceptRanges({ status: 200, upstreamValue: 'bytes' })).toBe('bytes');
+    expect(normalizeAcceptRanges({ status: 200, upstreamValue: 'none' })).toBe('none');
+    expect(
+        normalizeAcceptRanges({ status: 200, upstreamValue: 'BYTES' }),
+        'the token is case-insensitive'
+    ).toBe('bytes');
+    expect(normalizeAcceptRanges({ status: 200, upstreamValue: ' bytes ' })).toBe('bytes');
 
     // LIVE-3: never relayed, and the optimistic default stands in instead.
-    assert.equal(normalizeAcceptRanges({ status: 200, upstreamValue: MALFORMED }), 'bytes');
-    assert.equal(normalizeAcceptRanges({ status: 200, upstreamValue: 'seconds' }), 'bytes');
-    assert.equal(normalizeAcceptRanges({ status: 200, upstreamValue: null }), 'bytes');
+    expect(normalizeAcceptRanges({ status: 200, upstreamValue: MALFORMED })).toBe('bytes');
+    expect(normalizeAcceptRanges({ status: 200, upstreamValue: 'seconds' })).toBe('bytes');
+    expect(normalizeAcceptRanges({ status: 200, upstreamValue: null })).toBe('bytes');
 });
 
 test('the result is always a valid range-unit or nothing', () => {
@@ -90,10 +79,10 @@ test('the result is always a valid range-unit or nothing', () => {
         for (const status of [200, 206, 416, 502]) {
             for (const sentRange of [true, false]) {
                 const out = normalizeAcceptRanges({ status, upstreamValue, sentRange });
-                assert.ok(
+                expect(
                     out === null || out === 'bytes' || out === 'none',
                     `status=${status} sentRange=${sentRange} upstream=${JSON.stringify(upstreamValue)} produced ${JSON.stringify(out)}`
-                );
+                ).toBeTruthy();
             }
         }
     }
@@ -131,7 +120,7 @@ function providerHandler(req, res) {
     return res.end(body);
 }
 
-test.before(async () => {
+beforeAll(async () => {
     provider = await new Promise((resolve) => {
         const s = http.createServer(providerHandler);
         s.listen(0, '127.0.0.1', () => resolve(s));
@@ -147,7 +136,7 @@ test.before(async () => {
     });
 });
 
-test.after(async () => {
+afterAll(async () => {
     global.fetch = realFetch;
     await new Promise(r => server.close(r));
     await new Promise(r => provider.close(r));
@@ -159,11 +148,11 @@ test('a malformed unit never reaches the player', async () => {
     });
     await res.arrayBuffer();
 
-    assert.equal(res.status, 206);
-    assert.equal(res.headers.get('accept-ranges'), 'bytes', 'a 206 proves ranges work');
-    assert.notEqual(res.headers.get('accept-ranges'), MALFORMED);
+    expect(res.status).toBe(206);
+    expect(res.headers.get('accept-ranges'), 'a 206 proves ranges work').toBe('bytes');
+    expect(res.headers.get('accept-ranges')).not.toBe(MALFORMED);
     // Ranges still work end to end — the point is the header, not the body.
-    assert.equal(res.headers.get('content-range'), 'bytes 0-99/4096');
+    expect(res.headers.get('content-range')).toBe('bytes 0-99/4096');
 });
 
 test('an origin that ignores the range is not advertised as supporting it', async () => {
@@ -177,13 +166,12 @@ test('an origin that ignores the range is not advertised as supporting it', asyn
     });
     const body = await res.arrayBuffer();
 
-    assert.equal(res.status, 200);
-    assert.equal(body.byteLength, 4096, 'the origin sent the whole body, as observed live');
-    assert.equal(
+    expect(res.status).toBe(200);
+    expect(body.byteLength, 'the origin sent the whole body, as observed live').toBe(4096);
+    expect(
         res.headers.get('accept-ranges'),
-        null,
         'upstream said bytes and ignored the range; relaying that is the L-2 lie'
-    );
+    ).toBeNull();
 });
 
 test('a plain request still gets the optimistic default', async () => {
@@ -192,6 +180,6 @@ test('a plain request still gets the optimistic default', async () => {
     const res = await realFetch(`${base}/${cfgToken}/proxy/movie/3.mp4`);
     await res.arrayBuffer();
 
-    assert.equal(res.status, 200);
-    assert.equal(res.headers.get('accept-ranges'), 'bytes');
+    expect(res.status).toBe(200);
+    expect(res.headers.get('accept-ranges')).toBe('bytes');
 });

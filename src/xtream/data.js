@@ -10,7 +10,7 @@
 // Xtream.
 const { causeSuffix } = require('../helpers.js');
 const { BoundedMap } = require('../cache/bounded-map.js');
-const { estimateBytes } = require('../upstream/read-capped.js');
+const { estimateBytes } = require('../net/read-capped.js');
 const { xtremioGet, getStreams, LOG_REQUESTS } = require('./client.js');
 const {
     CACHE_TTL,
@@ -145,9 +145,9 @@ function parseYear(s) {
     return m ? parseInt(m[0]) : undefined;
 }
 
-// Whether a payload is worth *answering* with: a name or episodes. It must mirror
-// the meta route's `hasContent` exactly, or the disagreement gets cached. What may
-// be cached for the full TTL is the stricter hasSeriesEpisodes.
+// Whether a payload has a name or episodes. Only used to describe a failed
+// attempt in the log; what may be cached for the full TTL is decided by the
+// stricter hasSeriesEpisodes.
 function isUsableSeriesInfo(info) {
     if (!info || typeof info !== 'object') return false;
     const hasName = info.info && typeof info.info === 'object' && info.info.name;
@@ -306,7 +306,7 @@ function getVodInfo(cfg, vodId) {
 
 // This movie's item in the warm full list, or null. Never fetches: it is the
 // fallback for when get_vod_info fails, and a cold list costs seconds. The item
-// usually names the container, which is all the stream route needs (audit M2).
+// usually names the container, which is all the stream route needs.
 function warmVodItem(cfg, vodId) {
     const list = vodStreamsCache.get(cfg);
     return Array.isArray(list) ? findStreamById(list, vodId) : null;
@@ -319,30 +319,21 @@ module.exports = {
     liveStreamsCache,
     vodStreamsCache,
     seriesStreamsCache,
-    streamIdIndexes,
     findStreamById,
     getAllVodStreams,
     getAllSeriesStreams,
     getAllLiveStreams,
     categoryStreamsCache,
-    categoryStreamsCacheKey,
     getCategoryStreams,
     parseYear,
     isUsableSeriesInfo,
-    hasSeriesEpisodes,
     SERIES_INFO_MAX_ATTEMPTS,
-    SERIES_INFO_BACKOFF_MS,
     SERIES_INFO_NEGATIVE_TTL,
     seriesInfoCache,
-    seriesInfoCacheKey,
     readSeriesInfoEntry,
     getCachedSeriesInfo,
-    setCachedSeriesInfo,
-    setNegativeSeriesInfo,
     getSeriesInfo,
-    fetchSeriesInfo,
     vodInfoCache,
-    vodInfoCacheKey,
     isUsableVodInfo,
     getVodInfo,
     warmVodItem

@@ -6,26 +6,23 @@
 // are silently refused, so a handler added that way looks fine and does nothing.
 // Behaviour belongs in the nonced <script> block, hover states in <style>.
 //
-// The server URL field is deliberately type="text" and not type="url". The
-// server has careful handling for an address typed with no scheme — https is
-// tried first, so the password is never put on the wire in cleartext before the
-// panel's TLS port has been tried (audit L9) — and type="url" made the browser
-// refuse to submit one, so only a direct POST could ever reach it. The
-// autocapitalize/autocorrect/spellcheck attributes are the other half of that:
-// a phone capitalizing the first letter of the field is where a typed `Http://`
-// comes from, which normalizeUrl now lowercases rather than mistaking for no
-// scheme at all.
-const { escapeHtml } = require('../html.js');
+// The server URL field is deliberately type="text" and not type="url":
+// type="url" makes the browser refuse an address typed without `http://`, and
+// the server handles those on purpose (it tries https first, so the password is
+// never sent in cleartext before the panel's TLS port has been tried). The
+// autocapitalize/autocorrect/spellcheck attributes stop a phone from turning
+// `http://` into `Http://`.
+const { escapeHtml } = require('./html.js');
 // The page shows the install URL, which means minting a token from the fields
 // just submitted.
-const { encodeConfig } = require('../config-token.js');
+const { encodeConfig } = require('../config/token.js');
 
 // Only for the default baseUrl, which is a development and test convenience —
 // every caller in the app passes the real one from getBaseUrl.
 const PORT = process.env.PORT || 3000;
 
 
-// `nonce` comes from setPrivateHeaders and is the only thing that lets this
+// `nonce` comes from setPrivateHeaders (src/routes/configure.js) and is the only thing that lets this
 // page's one script run under its CSP. Rendering without one (a caller that
 // forgot, or a test) still produces a working page — only the click-to-copy
 // convenience goes quiet, since the link is selectable text either way.
@@ -36,7 +33,9 @@ function renderConfigPage({ serverUrl = '', username = '', password = '', status
     const safeNonce = escapeHtml(nonce);
     const safeServerUrl = escapeHtml(serverUrl);
     const safeUsername = escapeHtml(username);
-    const safePassword = escapeHtml(password);
+    // Echoed back only when the form needs fixing. After a success the install
+    // link is what the user came for, and the password has no reason to be in the page.
+    const safePassword = status?.valid ? '' : escapeHtml(password);
     let statusHtml = '';
     if (status) {
         if (status.valid) {
@@ -51,13 +50,8 @@ function renderConfigPage({ serverUrl = '', username = '', password = '', status
                         <svg fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2.5" d="M12 9v4m0 4h.01M10.29 3.86L1.82 18a2 2 0 001.71 3h16.94a2 2 0 001.71-3L13.71 3.86a2 2 0 00-3.42 0z"/></svg>
                         <span class="status-text">
                             <strong>Connected over http, not https.</strong>
-                            ${status.downgrade.source === 'fallback'
-                                ? 'The https connection failed, so http was used instead.'
-                                : 'Your provider asked for http even though https worked.'}
+                            Your provider asked for http even though https worked.
                             Your username and password will be sent in cleartext on every request, and this choice is saved into the install link below.
-                            ${status.downgrade.source === 'fallback'
-                                ? 'If your provider does support https, fix the URL and configure again.'
-                                : ''}
                         </span>
                     </div>` : '';
             statusHtml = `

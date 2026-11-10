@@ -71,7 +71,6 @@ function createShutdownHandler(server, { timeoutMs = SHUTDOWN_TIMEOUT_MS, exit =
 }
 
 module.exports = {
-    SHUTDOWN_TIMEOUT_MS,
     KEEPALIVE_TIMEOUT_MS,
     HEADERS_TIMEOUT_MS,
     REQUEST_TIMEOUT_MS,

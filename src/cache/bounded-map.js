@@ -6,10 +6,10 @@
 //
 // An entry's weight is its own `bytes` field, set by the caller from
 // estimateBytes — the weighing lives with the reader that counted the body, in
-// src/upstream/read-capped.js, and only the number arrives here.
+// src/net/read-capped.js, and only the number arrives here.
 
 
-// One memory budget shared by every data cache (CACHE_MAX_MB, audit R2): the
+// One memory budget shared by every data cache (CACHE_MAX_MB): the
 // per-cache bounds do not add up to any figure of memory. LRU across all caches in
 // one order. Entries are tracked by object identity, so caches sharing a key string
 // cannot collide, and by the weight they were added with, so the total cannot drift.
@@ -118,9 +118,10 @@ class BoundedMap extends Map {
         this.totalBytes += weightOf(value);
         if (this.ledger) this.ledger.add(value, this, key);
 
-        // Never evict what was just written, even when a single entry is larger
-        // than the whole budget: refusing to cache it at all would mean
-        // refetching it on every request, which is worse than being over.
+        // Never evict what was just written, even when it alone is over this
+        // map's maxBytes: refusing it would mean refetching it on every request,
+        // which is worse than being over. Only an entry larger than the whole
+        // shared budget is refused, above.
         while (this.size > 1 && (this.size > this.maxEntries || this.overBudget())) {
             // Map keys iterate oldest-first; the first is the LRU victim.
             const oldest = this.keys().next();
@@ -166,7 +167,7 @@ class BoundedMap extends Map {
     // An entry carrying its own ttl longer than maxAgeMs is reclaimed on that
     // instead: the stale-on-failure path extends one deliberately so the list
     // keeps being served through an outage, and sweeping it on the map's age
-    // silently undid that a few minutes later (audit L3). A *shorter* per-entry
+    // silently undid that a few minutes later. A *shorter* per-entry
     // ttl never shortens the sweep — those entries stop being served on their
     // own ttl and are reclaimed here on the map's, exactly as before — so this
     // only ever keeps an entry that something deliberately asked to keep.
@@ -190,4 +191,4 @@ function weightOf(entry) {
     return typeof entry?.bytes === 'number' ? entry.bytes : 0;
 }
 
-module.exports = { BoundedMap, CacheBudget, weightOf };
+module.exports = { BoundedMap, CacheBudget };

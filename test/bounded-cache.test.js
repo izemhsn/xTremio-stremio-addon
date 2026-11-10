@@ -3,9 +3,6 @@
 // ever opened, and never shrank when users went away.
 process.env.CONFIG_SECRET = 'test-secret-for-unit-tests';
 
-const test = require('node:test');
-const assert = require('node:assert');
-
 const {
     BoundedMap,
     sweepCaches,
@@ -24,13 +21,13 @@ const {
     CACHE_MAX_STREAM_ACCOUNTS,
     CACHE_MAX_SERIES_INFO,
     CACHE_STALE_MAX_AGE_MS
-} = require('../index.js');
+} = require('./support/internals.js');
 
 function cfgFor(user) {
     return { serverUrl: 'http://provider.test', username: user, password: 'p' };
 }
 
-test.beforeEach(() => {
+beforeEach(() => {
     catCache.clear();
     seriesInfoCache.clear();
     vodStreamsCache.map.clear();
@@ -47,9 +44,9 @@ test('entries beyond the bound evict the least recently used', () => {
     m.set('c', { ts: Date.now() });
     m.set('d', { ts: Date.now() });
 
-    assert.strictEqual(m.size, 3, 'the bound holds');
-    assert.strictEqual(m.has('a'), false, 'the oldest was evicted');
-    assert.deepStrictEqual([...m.keys()], ['b', 'c', 'd']);
+    expect(m.size, 'the bound holds').toBe(3);
+    expect(m.has('a'), 'the oldest was evicted').toBe(false);
+    expect([...m.keys()]).toStrictEqual(['b', 'c', 'd']);
 });
 
 test('reading an entry renews it, so it is not the next victim', () => {
@@ -61,8 +58,8 @@ test('reading an entry renews it, so it is not the next victim', () => {
     m.get('a');            // 'a' is now the most recently used
     m.set('d', { ts: 4 });
 
-    assert.strictEqual(m.has('a'), true, 'the touched key survived');
-    assert.strictEqual(m.has('b'), false, 'the untouched oldest went instead');
+    expect(m.has('a'), 'the touched key survived').toBe(true);
+    expect(m.has('b'), 'the untouched oldest went instead').toBe(false);
 });
 
 test('peek reads without disturbing LRU order', () => {
@@ -70,10 +67,10 @@ test('peek reads without disturbing LRU order', () => {
     m.set('a', { ts: 1 });
     m.set('b', { ts: 2 });
 
-    assert.deepStrictEqual(m.peek('a'), { ts: 1 }, 'peek still returns the value');
+    expect(m.peek('a'), 'peek still returns the value').toStrictEqual({ ts: 1 });
     m.set('c', { ts: 3 });
 
-    assert.strictEqual(m.has('a'), false, 'peek did not rescue it');
+    expect(m.has('a'), 'peek did not rescue it').toBe(false);
 });
 
 test('overwriting an existing key updates in place without growing', () => {
@@ -82,9 +79,9 @@ test('overwriting an existing key updates in place without growing', () => {
     m.set('b', { ts: 2 });
     m.set('a', { ts: 99 });
 
-    assert.strictEqual(m.size, 2);
-    assert.deepStrictEqual(m.peek('a'), { ts: 99 });
-    assert.strictEqual(m.has('b'), true, 'an update is not an eviction');
+    expect(m.size).toBe(2);
+    expect(m.peek('a')).toStrictEqual({ ts: 99 });
+    expect(m.has('b'), 'an update is not an eviction').toBe(true);
 });
 
 test('sweep drops entries past the age and keeps fresh ones', () => {
@@ -93,17 +90,17 @@ test('sweep drops entries past the age and keeps fresh ones', () => {
     m.set('old', { ts: now - 5000 });
     m.set('fresh', { ts: now - 100 });
 
-    assert.strictEqual(m.sweep(now), 1, 'one entry reported dropped');
-    assert.strictEqual(m.has('old'), false);
-    assert.strictEqual(m.has('fresh'), true);
+    expect(m.sweep(now), 'one entry reported dropped').toBe(1);
+    expect(m.has('old')).toBe(false);
+    expect(m.has('fresh')).toBe(true);
 });
 
 test('sweep is a no-op without a configured age', () => {
     const m = new BoundedMap({ maxEntries: 10 });
     m.set('ancient', { ts: 0 });
 
-    assert.strictEqual(m.sweep(Date.now()), 0);
-    assert.strictEqual(m.has('ancient'), true, 'age-less caches are bounded by count only');
+    expect(m.sweep(Date.now())).toBe(0);
+    expect(m.has('ancient'), 'age-less caches are bounded by count only').toBe(true);
 });
 
 test('sweep tolerates entries with no usable timestamp', () => {
@@ -112,9 +109,9 @@ test('sweep tolerates entries with no usable timestamp', () => {
     m.set('odd', { noTimestamp: true });
     m.set('nullish', null);
 
-    assert.doesNotThrow(() => m.sweep(Date.now()));
-    assert.strictEqual(m.has('odd'), true, 'unrecognised entries are left alone, not dropped');
-    assert.strictEqual(m.has('shaped'), false);
+    expect(() => m.sweep(Date.now())).not.toThrow();
+    expect(m.has('odd'), 'unrecognised entries are left alone, not dropped').toBe(true);
+    expect(m.has('shaped')).toBe(false);
 });
 
 // --- the real caches are wired to it ---------------------------------------
@@ -123,31 +120,29 @@ test('the stream list caches are bounded per account', () => {
     for (let i = 0; i < CACHE_MAX_STREAM_ACCOUNTS + 2; i++) {
         vodStreamsCache.set(cfgFor(`user${i}`), [{ stream_id: i }]);
     }
-    assert.strictEqual(vodStreamsCache.map.size, CACHE_MAX_STREAM_ACCOUNTS);
-    assert.strictEqual(
+    expect(vodStreamsCache.map.size).toBe(CACHE_MAX_STREAM_ACCOUNTS);
+    expect(
         vodStreamsCache.get(cfgFor('user0')),
-        null,
         'the earliest account was evicted rather than held forever'
-    );
-    assert.deepStrictEqual(
+    ).toBeNull();
+    expect(
         vodStreamsCache.get(cfgFor(`user${CACHE_MAX_STREAM_ACCOUNTS + 1}`)),
-        [{ stream_id: CACHE_MAX_STREAM_ACCOUNTS + 1 }],
         'the newest is still served'
-    );
+    ).toStrictEqual([{ stream_id: CACHE_MAX_STREAM_ACCOUNTS + 1 }]);
 });
 
 test('seriesInfoCache is bounded, so browsing many series cannot grow forever', () => {
     for (let i = 0; i < CACHE_MAX_SERIES_INFO + 25; i++) {
         seriesInfoCache.set(`key-${i}`, { data: {}, ts: Date.now() });
     }
-    assert.strictEqual(seriesInfoCache.size, CACHE_MAX_SERIES_INFO);
+    expect(seriesInfoCache.size).toBe(CACHE_MAX_SERIES_INFO);
 });
 
 test('catCache is bounded by account count', () => {
     for (let i = 0; i < CACHE_MAX_ACCOUNTS + 5; i++) {
         catCache.set(`account-${i}`, { live: [], movies: [], series: [], ts: Date.now(), ttl: CACHE_TTL });
     }
-    assert.strictEqual(catCache.size, CACHE_MAX_ACCOUNTS);
+    expect(catCache.size).toBe(CACHE_MAX_ACCOUNTS);
 });
 
 // This is the interaction that makes catCache different from the others: M2
@@ -164,8 +159,8 @@ test('an expired catCache entry survives a sweep, preserving the stale fallback'
     sweepCaches(now);
 
     const kept = catCache.peek('acct');
-    assert.ok(kept, 'the expired entry is still there to fall back on');
-    assert.deepStrictEqual(kept.live, [{ category_id: '1' }]);
+    expect(kept, 'the expired entry is still there to fall back on').toBeTruthy();
+    expect(kept.live).toStrictEqual([{ category_id: '1' }]);
 });
 
 test('catCache entries are reclaimed once genuinely abandoned', () => {
@@ -173,7 +168,7 @@ test('catCache entries are reclaimed once genuinely abandoned', () => {
     catCache.set('abandoned', { live: [], movies: [], series: [], ts: now - CACHE_STALE_MAX_AGE_MS - 1, ttl: CACHE_TTL });
 
     sweepCaches(now);
-    assert.strictEqual(catCache.has('abandoned'), false);
+    expect(catCache.has('abandoned')).toBe(false);
 });
 
 test('sweepCaches reclaims expired entries across every cache', () => {
@@ -185,11 +180,11 @@ test('sweepCaches reclaims expired entries across every cache', () => {
     liveStreamsCache.map.set(accountCacheKey(cfgFor('b')), { data: [], ts: stale });
     seriesStreamsCache.map.set(accountCacheKey(cfgFor('c')), { data: [], ts: stale });
 
-    assert.strictEqual(sweepCaches(now), 4, 'all four reported');
-    assert.strictEqual(seriesInfoCache.size, 0);
-    assert.strictEqual(vodStreamsCache.map.size, 0);
-    assert.strictEqual(liveStreamsCache.map.size, 0);
-    assert.strictEqual(seriesStreamsCache.map.size, 0);
+    expect(sweepCaches(now), 'all four reported').toBe(4);
+    expect(seriesInfoCache.size).toBe(0);
+    expect(vodStreamsCache.map.size).toBe(0);
+    expect(liveStreamsCache.map.size).toBe(0);
+    expect(seriesStreamsCache.map.size).toBe(0);
 });
 
 // sweepCaches used to name all eight caches in a hand-written sum. A cache left
@@ -217,32 +212,34 @@ test('every live cache is swept, without sweepCaches naming any of them', () => 
     for (const [, map] of live) map.set('sweep-probe', { data: null, ts: ancient });
 
     const dropped = sweepCaches(now);
-    assert.ok(dropped >= live.length, `swept ${dropped}, expected at least ${live.length}`);
+    expect(dropped, `swept ${dropped}, expected at least ${live.length}`).toBeGreaterThanOrEqual(live.length);
     for (const [name, map] of live) {
-        assert.equal(map.has('sweep-probe'), false, `${name} was not visited by the sweep`);
+        expect(map.has('sweep-probe'), `${name} was not visited by the sweep`).toBe(false);
     }
 
     // And the sum is gone from the source: a list that names caches is exactly the
     // thing a new cache gets left out of.
-    const src = require('node:fs').readFileSync(require.resolve('../index.js'), 'utf8');
+    const src = require('node:fs').readFileSync(require.resolve('../src/cache/layers.js'), 'utf8');
     const body = src.slice(src.indexOf('function sweepCaches'), src.indexOf('function startCacheSweeper'));
-    assert.equal((body.match(/Cache\.sweep\(|Cache\.map\.sweep\(/g) || []).length, 0,
-        'sweepCaches is naming caches again');
+    expect(
+        (body.match(/Cache\.sweep\(|Cache\.map\.sweep\(/g) || []).length,
+        'sweepCaches is naming caches again'
+    ).toBe(0);
 });
 
 test('a fresh entry is left alone by the sweeper', () => {
     const now = Date.now();
     vodStreamsCache.set(cfgFor('active'), [{ stream_id: 1 }]);
 
-    assert.strictEqual(sweepCaches(now), 0);
-    assert.deepStrictEqual(vodStreamsCache.get(cfgFor('active')), [{ stream_id: 1 }]);
+    expect(sweepCaches(now)).toBe(0);
+    expect(vodStreamsCache.get(cfgFor('active'))).toStrictEqual([{ stream_id: 1 }]);
 });
 
 test('the sweep timer never holds the process open', () => {
     const timer = startCacheSweeper();
-    assert.strictEqual(typeof timer.unref, 'function');
+    expect(typeof timer.unref).toBe('function');
     // hasRef() is the observable proof; an un-unref'd interval would keep
     // `npm test` itself from exiting.
-    assert.strictEqual(timer.hasRef(), false);
+    expect(timer.hasRef()).toBe(false);
     clearInterval(timer);
 });

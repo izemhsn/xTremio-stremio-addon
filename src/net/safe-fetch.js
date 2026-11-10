@@ -95,7 +95,7 @@ const PINNED_DISPATCHER = ALLOW_PRIVATE_NETWORKS
 // The pinned dispatcher comes from the undici dependency and fetch() from Node's
 // bundled undici, and not every pairing works. Measured: 6 and 7 interoperate with
 // the fetch in Node 20.18.1, 22 and 24; an undici 8 dispatcher fails every request
-// on 22 and 24. Only pairings outside the measured set warn (audit D2). The versions
+// on 22 and 24. Only pairings outside the measured set warn. The versions
 // are parameters so each branch can be tested.
 const UNDICI_INTEROPERABLE_MAJORS = new Set(['6', '7']);
 
@@ -125,7 +125,7 @@ function blockedOutbound(message) {
     return Object.assign(new Error(message), { code: 'OUTBOUND_BLOCKED' });
 }
 
-// DNS resolution for the SSRF check, with a deadline (audit S6). dns.lookup runs on
+// DNS resolution for the SSRF check, with a deadline. dns.lookup runs on
 // libuv's four-thread pool and cannot be cancelled, so one dead nameserver stalled
 // everyone's relays. c-ares runs off the pool, one resolver per lookup, cancelled
 // at the deadline. It does not read /etc/hosts, hence the localhost check in
@@ -135,7 +135,7 @@ const DNS_TIMEOUT_MS = Math.max(500, Number(process.env.DNS_TIMEOUT_MS) || 5000)
 // c-ares reads the nameserver list itself and can get it wrong where the OS works
 // (one Windows host gave it only 127.0.0.1). These codes mean the resolver itself is
 // unusable, so only they fall back to the OS resolver, under the same deadline. A
-// timeout never falls back: that is the stall S6 removed.
+// timeout never falls back: an uncancellable OS lookup is the stall this avoids.
 const DNS_RESOLVER_UNUSABLE = new Set(['ECONNREFUSED', 'ELOADIPHLPAPI', 'EADDRGETNETWORKPARAMS']);
 const dnsFallback = { warned: false };  // an object, so a test can reset it
 
@@ -238,7 +238,7 @@ async function assertSafeOutboundUrl(inputUrl, { resolve = resolveHostAddresses 
         throw blockedOutbound(`Blocked private outbound address for ${hostname}`);
     }
     const directIp = net.isIP(hostname) ? [{ address: hostname }] : null;
-    // A host vetted within the pin window is not resolved again (audit P4), which
+    // A host vetted within the pin window is not resolved again, which
     // keeps the resolver off the relay hot path. Only vetted addresses are pinned,
     // and reuse does not extend the pin.
     const pinned = directIp ? null : dnsPins.get(hostname);
@@ -311,7 +311,6 @@ module.exports = {
     ALLOW_PRIVATE_NETWORKS,
     DNS_TIMEOUT_MS,
     DNS_PIN_TTL_MS,
-    DNS_PIN_MAX_HOSTS,
     DNS_RESOLVER_UNUSABLE,
     DNS_SERVERS,
     parseDnsServers,
@@ -321,11 +320,8 @@ module.exports = {
     resolveHostAddresses,
     pinResolvedAddresses,
     pinnedLookup,
-    pinnedLookupError,
     PINNED_DISPATCHER,
-    UNDICI_INTEROPERABLE_MAJORS,
     warnOnUndiciMismatch,
-    blockedOutbound,
     assertSafeOutboundUrl,
     discardBody,
     safeFetch

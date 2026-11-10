@@ -13,11 +13,9 @@ process.env.CONFIG_SECRET = 'test-secret-for-unit-tests';
 process.env.ALLOW_PRIVATE_NETWORKS = 'true';
 process.env.PROXY_HEADER_TIMEOUT_MS = '1000';
 
-const test = require('node:test');
-const assert = require('node:assert');
 const http = require('node:http');
 
-const { app, encodeConfig, PROXY_HEADER_TIMEOUT_MS } = require('../index.js');
+const { app, encodeConfig, PROXY_HEADER_TIMEOUT_MS } = require('./support/internals.js');
 
 const realFetch = global.fetch;
 
@@ -55,7 +53,7 @@ function providerHandler(req, res) {
     }, 600);
 }
 
-test.before(async () => {
+beforeAll(async () => {
     provider = http.createServer(providerHandler);
     await new Promise(r => provider.listen(0, '127.0.0.1', r));
     providerBase = `http://127.0.0.1:${provider.address().port}`;
@@ -64,16 +62,18 @@ test.before(async () => {
     base = `http://127.0.0.1:${server.address().port}`;
 });
 
-test.after(async () => {
+afterAll(async () => {
     await new Promise(r => server.close(r));
     await new Promise(r => provider.close(r));
 });
 
-test.beforeEach(() => { providerHits = []; });
+beforeEach(() => { providerHits = []; });
 
 test('the env override this file depends on is in effect', () => {
-    assert.equal(PROXY_HEADER_TIMEOUT_MS, 1000,
-        'the two timing tests below are written against a 1000 ms deadline');
+    expect(
+        PROXY_HEADER_TIMEOUT_MS,
+        'the two timing tests below are written against a 1000 ms deadline'
+    ).toBe(1000);
 });
 
 test('a slow 502 to HEAD does not eat the fallback GET deadline', async () => {
@@ -81,11 +81,13 @@ test('a slow 502 to HEAD does not eat the fallback GET deadline', async () => {
     const res = await realFetch(`${base}/${CFG}/proxy/movie/1.mp4`, { method: 'HEAD' });
     const elapsed = Date.now() - started;
 
-    assert.equal(res.status, 200, 'the fallback GET had time to answer');
-    assert.equal(res.headers.get('content-length'), '4');
-    assert.deepEqual(providerHits.map(h => h.method), ['HEAD', 'GET']);
-    assert.ok(elapsed > PROXY_HEADER_TIMEOUT_MS,
-        `the exchange should outlast a single deadline, took ${elapsed}ms`);
+    expect(res.status, 'the fallback GET had time to answer').toBe(200);
+    expect(res.headers.get('content-length')).toBe('4');
+    expect(providerHits.map(h => h.method)).toStrictEqual(['HEAD', 'GET']);
+    expect(
+        elapsed,
+        `the exchange should outlast a single deadline, took ${elapsed}ms`
+    ).toBeGreaterThan(PROXY_HEADER_TIMEOUT_MS);
 });
 
 test('the fallback GET is still bounded by its own deadline', async () => {
@@ -93,8 +95,7 @@ test('the fallback GET is still bounded by its own deadline', async () => {
     const res = await realFetch(`${base}/${CFG}/proxy/movie/2.mp4`, { method: 'HEAD' });
     const elapsed = Date.now() - started;
 
-    assert.equal(res.status, 504, 'a GET whose headers never arrive must still time out');
-    assert.deepEqual(providerHits.map(h => h.method), ['HEAD', 'GET']);
-    assert.ok(elapsed < PROXY_HEADER_TIMEOUT_MS * 2.5,
-        `re-arming must not compound the deadline, took ${elapsed}ms`);
+    expect(res.status, 'a GET whose headers never arrive must still time out').toBe(504);
+    expect(providerHits.map(h => h.method)).toStrictEqual(['HEAD', 'GET']);
+    expect(elapsed, `re-arming must not compound the deadline, took ${elapsed}ms`).toBeLessThan(PROXY_HEADER_TIMEOUT_MS * 2.5);
 });

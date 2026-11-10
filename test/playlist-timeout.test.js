@@ -13,11 +13,9 @@ process.env.CONFIG_SECRET = 'test-secret-for-unit-tests';
 process.env.ALLOW_PRIVATE_NETWORKS = 'true';
 process.env.PLAYLIST_BODY_TIMEOUT_MS = '1200';
 
-const test = require('node:test');
-const assert = require('node:assert');
 const http = require('node:http');
 
-const { app, encodeConfig, PLAYLIST_BODY_TIMEOUT_MS } = require('../index.js');
+const { app, encodeConfig, PLAYLIST_BODY_TIMEOUT_MS } = require('./support/internals.js');
 
 const realFetch = global.fetch;
 
@@ -49,7 +47,7 @@ function providerHandler(req, res) {
     res.end(`#EXTM3U\n#EXTINF:8,\nhttp://127.0.0.1:${provider.address().port}/seg1.ts\n`);
 }
 
-test.before(async () => {
+beforeAll(async () => {
     provider = await new Promise((resolve) => {
         const s = http.createServer(providerHandler);
         s.listen(0, '127.0.0.1', () => resolve(s));
@@ -65,14 +63,14 @@ test.before(async () => {
     });
 });
 
-test.after(async () => {
+afterAll(async () => {
     global.fetch = realFetch;
     await new Promise(r => server.close(r));
     await new Promise(r => provider.close(r));
 });
 
 test('the deadline is configurable and separate from the header timeout', () => {
-    assert.equal(PLAYLIST_BODY_TIMEOUT_MS, 1200);
+    expect(PLAYLIST_BODY_TIMEOUT_MS).toBe(1200);
 });
 
 test('a trickling playlist body is cut off instead of held forever', async () => {
@@ -81,12 +79,12 @@ test('a trickling playlist body is cut off instead of held forever', async () =>
     const res = await realFetch(`${base}/${cfg}/proxy/live/1.m3u8`);
     const elapsed = Date.now() - started;
 
-    assert.equal(res.status, 504);
-    assert.equal(await res.text(), 'upstream timeout');
-    assert.ok(
+    expect(res.status).toBe(504);
+    expect(await res.text()).toBe('upstream timeout');
+    expect(
         elapsed >= PLAYLIST_BODY_TIMEOUT_MS - 100 && elapsed < PLAYLIST_BODY_TIMEOUT_MS + 3000,
         `expected to give up near the deadline, took ${elapsed}ms`
-    );
+    ).toBeTruthy();
 });
 
 test('the upstream socket is released, not leaked', async () => {
@@ -94,12 +92,12 @@ test('the upstream socket is released, not leaked', async () => {
     // upstream connection open is the same resource leak with a nicer status.
     heldSockets = [];
     const res = await realFetch(`${base}/${cfg}/proxy/live/1.m3u8`);
-    assert.equal(res.status, 504);
+    expect(res.status).toBe(504);
     await res.text();
 
     await new Promise(r => setTimeout(r, 500));
     const stillOpen = heldSockets.filter(s => s && !s.destroyed).length;
-    assert.equal(stillOpen, 0, `${stillOpen} upstream socket(s) still open after the timeout`);
+    expect(stillOpen, `${stillOpen} upstream socket(s) still open after the timeout`).toBe(0);
 });
 
 test('a playlist that arrives in time is unaffected', async () => {
@@ -108,7 +106,7 @@ test('a playlist that arrives in time is unaffected', async () => {
     const res = await realFetch(`${base}/${cfg}/proxy/live/9.m3u8`);
     const body = await res.text();
 
-    assert.equal(res.status, 200);
-    assert.ok(body.includes('/proxy/hls?u='), 'still rewritten');
-    assert.ok(!body.includes('127.0.0.1:' + provider.address().port + '/seg1.ts'), 'and not relayed raw');
+    expect(res.status).toBe(200);
+    expect(body, 'still rewritten').toContain('/proxy/hls?u=');
+    expect(body, 'and not relayed raw').not.toContain('127.0.0.1:' + provider.address().port + '/seg1.ts');
 });

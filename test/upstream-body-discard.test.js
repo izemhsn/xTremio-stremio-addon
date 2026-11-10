@@ -18,13 +18,10 @@
 process.env.CONFIG_SECRET = 'test-secret-for-unit-tests';
 process.env.ALLOW_PRIVATE_NETWORKS = 'true';
 
-const test = require('node:test');
-const assert = require('node:assert');
-
-const { xtremioGet, readJsonCapped } = require('../index.js');
+const { xtremioGet, readJsonCapped } = require('./support/internals.js');
 
 const realFetch = global.fetch;
-test.after(() => { global.fetch = realFetch; });
+afterAll(() => { global.fetch = realFetch; });
 
 // A response whose body records whether it was cancelled, and never yields any
 // data: a test that read it would be testing something else.
@@ -52,21 +49,15 @@ test('a non-2xx panel response has its body cancelled', async () => {
     const { res, state } = unreadResponse({ status: 502 });
     global.fetch = async () => res;
 
-    await assert.rejects(
-        () => xtremioGet(cfg, 'get_vod_streams'),
-        /get_vod_streams failed: HTTP 502/
-    );
-    assert.ok(state.cancelled, 'the error body must be cancelled, not left pending');
+    await expect(xtremioGet(cfg, 'get_vod_streams')).rejects.toThrow(/get_vod_streams failed: HTTP 502/);
+    expect(state.cancelled, 'the error body must be cancelled, not left pending').toBeTruthy();
 });
 
 test('an over-cap content-length has its body cancelled', async () => {
     const { res, state } = unreadResponse({ contentLength: '999999' });
 
-    await assert.rejects(
-        () => readJsonCapped(res, 'test', 1000),
-        /too large: 999999 bytes exceeds 1000/
-    );
-    assert.ok(state.cancelled, 'refusing before the first byte still has to release the socket');
+    await expect(readJsonCapped(res, 'test', 1000)).rejects.toThrow(/too large: 999999 bytes exceeds 1000/);
+    expect(state.cancelled, 'refusing before the first byte still has to release the socket').toBeTruthy();
 });
 
 test('the same refusal through a panel call cancels the body too', async () => {
@@ -75,8 +66,8 @@ test('the same refusal through a panel call cancels the body too', async () => {
     const { res, state } = unreadResponse({ contentLength: String(1024 * 1024 * 1024) });
     global.fetch = async () => res;
 
-    await assert.rejects(() => xtremioGet(cfg, 'get_vod_streams'), /too large/);
-    assert.ok(state.cancelled);
+    await expect(xtremioGet(cfg, 'get_vod_streams')).rejects.toThrow(/too large/);
+    expect(state.cancelled).toBeTruthy();
 });
 
 test('a body already locked by a reader is left alone', async () => {
@@ -86,6 +77,6 @@ test('a body already locked by a reader is left alone', async () => {
     res.body.locked = true;
     global.fetch = async () => res;
 
-    await assert.rejects(() => xtremioGet(cfg, 'get_vod_streams'), /HTTP 502/);
-    assert.strictEqual(state.cancelled, false, 'a locked body is the reader\'s to cancel');
+    await expect(xtremioGet(cfg, 'get_vod_streams')).rejects.toThrow(/HTTP 502/);
+    expect(state.cancelled, 'a locked body is the reader\'s to cancel').toBe(false);
 });

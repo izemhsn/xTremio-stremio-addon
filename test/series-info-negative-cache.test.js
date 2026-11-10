@@ -4,9 +4,6 @@
 process.env.CONFIG_SECRET = 'test-secret-for-unit-tests';
 process.env.ALLOW_PRIVATE_NETWORKS = 'true';
 
-const test = require('node:test');
-const assert = require('node:assert');
-
 const {
     getSeriesInfo,
     getCachedSeriesInfo,
@@ -15,7 +12,7 @@ const {
     SERIES_INFO_NEGATIVE_TTL,
     SERIES_INFO_MAX_ATTEMPTS,
     CACHE_TTL
-} = require('../index.js');
+} = require('./support/internals.js');
 
 const realFetch = global.fetch;
 let calls = 0;
@@ -41,95 +38,94 @@ function ageCache(ms) {
     for (const entry of seriesInfoCache.values()) entry.ts -= ms;
 }
 
-test.beforeEach(() => seriesInfoCache.clear());
-test.after(() => { global.fetch = realFetch; });
+beforeEach(() => seriesInfoCache.clear());
+afterAll(() => { global.fetch = realFetch; });
 
 test('a totally failing series is retried once, then remembered', async () => {
     stubFetch('throw');
 
-    await assert.rejects(() => getSeriesInfo(cfg(), '1'));
-    assert.strictEqual(calls, SERIES_INFO_MAX_ATTEMPTS, 'first request pays the full retry cost');
+    await expect(getSeriesInfo(cfg(), '1')).rejects.toThrow();
+    expect(calls, 'first request pays the full retry cost').toBe(SERIES_INFO_MAX_ATTEMPTS);
 
     const before = calls;
-    await assert.rejects(() => getSeriesInfo(cfg(), '1'), /upstream down/, 'still throws the same error');
-    assert.strictEqual(calls, before, 'the second request made no upstream calls at all');
+    await expect(getSeriesInfo(cfg(), '1'), 'still throws the same error').rejects.toThrow(/upstream down/);
+    expect(calls, 'the second request made no upstream calls at all').toBe(before);
 });
 
 test('an unusable-but-present payload is replayed, not re-thrown', async () => {
     stubFetch('unusable');
 
     const first = await getSeriesInfo(cfg(), '2');
-    assert.deepStrictEqual(first, {}, 'the unusable payload is returned as before');
-    assert.strictEqual(calls, SERIES_INFO_MAX_ATTEMPTS);
+    expect(first, 'the unusable payload is returned as before').toStrictEqual({});
+    expect(calls).toBe(SERIES_INFO_MAX_ATTEMPTS);
 
     const second = await getSeriesInfo(cfg(), '2');
-    assert.deepStrictEqual(second, {}, 'the cached replay matches the uncached result');
-    assert.strictEqual(calls, SERIES_INFO_MAX_ATTEMPTS, 'no further upstream calls');
+    expect(second, 'the cached replay matches the uncached result').toStrictEqual({});
+    expect(calls, 'no further upstream calls').toBe(SERIES_INFO_MAX_ATTEMPTS);
 });
 
 test('the negative entry expires and the series is retried', async () => {
     stubFetch('throw');
-    await assert.rejects(() => getSeriesInfo(cfg(), '3'));
-    assert.strictEqual(calls, SERIES_INFO_MAX_ATTEMPTS);
+    await expect(getSeriesInfo(cfg(), '3')).rejects.toThrow();
+    expect(calls).toBe(SERIES_INFO_MAX_ATTEMPTS);
 
     ageCache(SERIES_INFO_NEGATIVE_TTL + 1);
 
-    await assert.rejects(() => getSeriesInfo(cfg(), '3'));
-    assert.strictEqual(calls, SERIES_INFO_MAX_ATTEMPTS * 2, 'it tried again after the TTL lapsed');
+    await expect(getSeriesInfo(cfg(), '3')).rejects.toThrow();
+    expect(calls, 'it tried again after the TTL lapsed').toBe(SERIES_INFO_MAX_ATTEMPTS * 2);
 });
 
 test('a provider that recovers is picked up once the negative entry expires', async () => {
     stubFetch('throw');
-    await assert.rejects(() => getSeriesInfo(cfg(), '4'));
+    await expect(getSeriesInfo(cfg(), '4')).rejects.toThrow();
 
     const good = { info: { name: 'Fixed Show' }, episodes: { 1: [{ id: '7' }] } };
     stubFetch('ok', good);
 
     // Still inside the negative window: the recovery is not yet visible.
-    await assert.rejects(() => getSeriesInfo(cfg(), '4'), 'the remembered failure still stands');
-    assert.strictEqual(calls, 0, 'and it cost nothing upstream');
+    await expect(getSeriesInfo(cfg(), '4'), 'the remembered failure still stands').rejects.toThrow();
+    expect(calls, 'and it cost nothing upstream').toBe(0);
 
     ageCache(SERIES_INFO_NEGATIVE_TTL + 1);
 
-    assert.deepStrictEqual(await getSeriesInfo(cfg(), '4'), good, 'recovery is picked up');
+    expect(await getSeriesInfo(cfg(), '4'), 'recovery is picked up').toStrictEqual(good);
 });
 
 test('a failure is remembered for far less time than a success', () => {
-    assert.ok(
-        SERIES_INFO_NEGATIVE_TTL < CACHE_TTL,
+    expect(
+        SERIES_INFO_NEGATIVE_TTL,
         'a broken series must not be pinned for the full positive TTL'
-    );
+    ).toBeLessThan(CACHE_TTL);
 });
 
 test('a negative entry is not served as a cache hit to ordinary callers', async () => {
     stubFetch('throw');
-    await assert.rejects(() => getSeriesInfo(cfg(), '5'));
+    await expect(getSeriesInfo(cfg(), '5')).rejects.toThrow();
 
-    assert.strictEqual(
+    expect(
         getCachedSeriesInfo(cfg(), '5'),
-        null,
         'getCachedSeriesInfo reports a miss rather than handing back null data as a hit'
-    );
+    ).toBeNull();
 
     const entry = readSeriesInfoEntry(cfg(), '5');
-    assert.strictEqual(entry.negative, true, 'but the entry is there');
-    assert.strictEqual(entry.data, null, 'with no payload to replay');
-    assert.match(entry.error, /upstream down/, 'and the original error preserved');
+    expect(entry.negative, 'but the entry is there').toBe(true);
+    expect(entry.data, 'with no payload to replay').toBeNull();
+    expect(entry.error, 'and the original error preserved').toMatch(/upstream down/);
 });
 
 test('a successful fetch is cached positively, on the long TTL', async () => {
     const good = { info: { name: 'Good Show' }, episodes: { 1: [{ id: '9' }] } };
     stubFetch('ok', good);
 
-    assert.deepStrictEqual(await getSeriesInfo(cfg(), '6'), good);
-    assert.strictEqual(calls, 1, 'a usable answer needs no retries');
+    expect(await getSeriesInfo(cfg(), '6')).toStrictEqual(good);
+    expect(calls, 'a usable answer needs no retries').toBe(1);
 
     const entry = readSeriesInfoEntry(cfg(), '6');
-    assert.strictEqual(entry.negative, undefined, 'not marked negative');
-    assert.strictEqual(entry.ttl, CACHE_TTL, 'and held for the full positive TTL');
+    expect(entry.negative, 'not marked negative').toBeUndefined();
+    expect(entry.ttl, 'and held for the full positive TTL').toBe(CACHE_TTL);
 
     await getSeriesInfo(cfg(), '6');
-    assert.strictEqual(calls, 1, 'served from cache');
+    expect(calls, 'served from cache').toBe(1);
 });
 
 // --- C8: a series with a name and nothing to play ---------------------------
@@ -141,15 +137,14 @@ test('a series with a name but no episodes is not pinned for the positive TTL', 
     const nameOnly = { info: { name: 'Nothing To Play' } };
     stubFetch('ok', nameOnly);
 
-    assert.deepStrictEqual(
+    expect(
         await getSeriesInfo(cfg(), '10'),
-        nameOnly,
         'still answered with, so the meta route can render the name'
-    );
+    ).toStrictEqual(nameOnly);
 
     const entry = readSeriesInfoEntry(cfg(), '10');
-    assert.strictEqual(entry.negative, true);
-    assert.strictEqual(entry.ttl, SERIES_INFO_NEGATIVE_TTL, 'remembered for minutes, not half an hour');
+    expect(entry.negative).toBe(true);
+    expect(entry.ttl, 'remembered for minutes, not half an hour').toBe(SERIES_INFO_NEGATIVE_TTL);
 });
 
 test('a season holding no episodes is not content either', async () => {
@@ -160,29 +155,29 @@ test('a season holding no episodes is not content either', async () => {
 
     await getSeriesInfo(cfg(), '11');
 
-    assert.strictEqual(readSeriesInfoEntry(cfg(), '11').ttl, SERIES_INFO_NEGATIVE_TTL);
+    expect(readSeriesInfoEntry(cfg(), '11').ttl).toBe(SERIES_INFO_NEGATIVE_TTL);
 });
 
 test('an episodes-less series is asked again once the short entry lapses', async () => {
     stubFetch('ok', { info: { name: 'Nothing To Play' } });
     await getSeriesInfo(cfg(), '12');
     const spent = calls;
-    assert.strictEqual(spent, SERIES_INFO_MAX_ATTEMPTS, 'the retries ran, as for any unusable answer');
+    expect(spent, 'the retries ran, as for any unusable answer').toBe(SERIES_INFO_MAX_ATTEMPTS);
 
     await getSeriesInfo(cfg(), '12');
-    assert.strictEqual(calls, spent, 'inside the window the replay costs nothing upstream');
+    expect(calls, 'inside the window the replay costs nothing upstream').toBe(spent);
 
     ageCache(SERIES_INFO_NEGATIVE_TTL + 1);
     const withEpisodes = { info: { name: 'Nothing To Play' }, episodes: { 1: [{ id: '3' }] } };
     stubFetch('ok', withEpisodes);
 
-    assert.deepStrictEqual(await getSeriesInfo(cfg(), '12'), withEpisodes, 'the episodes are picked up');
-    assert.strictEqual(readSeriesInfoEntry(cfg(), '12').ttl, CACHE_TTL, 'and now held for the long TTL');
+    expect(await getSeriesInfo(cfg(), '12'), 'the episodes are picked up').toStrictEqual(withEpisodes);
+    expect(readSeriesInfoEntry(cfg(), '12').ttl, 'and now held for the long TTL').toBe(CACHE_TTL);
 });
 
 test('negative entries live in the same bounded cache, so they cannot pile up', async () => {
     stubFetch('throw');
-    await assert.rejects(() => getSeriesInfo(cfg(), '7'));
+    await expect(getSeriesInfo(cfg(), '7')).rejects.toThrow();
 
-    assert.strictEqual(seriesInfoCache.size, 1, 'stored in seriesInfoCache, under the same LRU bound');
+    expect(seriesInfoCache.size, 'stored in seriesInfoCache, under the same LRU bound').toBe(1);
 });

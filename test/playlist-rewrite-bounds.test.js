@@ -16,13 +16,9 @@ process.env.PLAYLIST_REWRITE_TIMEOUT_MS = '1000';
 // early when private networks are allowed, and the DNS work this test measures
 // would never happen.
 
-const test = require('node:test');
-const assert = require('node:assert');
-
-// index.js resolves through `new (require('dns').promises.Resolver)()`, one resolver
-// per lookup, so patching the prototype here is seen by every one of them. It used to
-// call dns.lookup, which is what this stub replaced, until audit S6 moved resolution
-// off the thread pool.
+// The SSRF guard (src/net/safe-fetch.js) resolves through
+// `new (require('dns').promises.Resolver)()`, one resolver per lookup, so
+// patching the prototype here is seen by every one of them.
 const net = require('node:net');
 const { Resolver } = require('dns').promises;
 const realResolve4 = Resolver.prototype.resolve4;
@@ -62,7 +58,7 @@ const {
     dnsPins,
     MAX_PLAYLIST_ORIGINS,
     PLAYLIST_REWRITE_TIMEOUT_MS
-} = require('../index.js');
+} = require('./support/internals.js');
 
 const realFetch = global.fetch;
 const CFG = encodeConfig({ serverUrl: 'http://provider.test', username: 'u', password: 'p' });
@@ -91,16 +87,16 @@ function reset() {
     dnsPins.clear();
 }
 
-test.beforeEach(reset);
-test.after(() => {
+beforeEach(reset);
+afterAll(() => {
     Resolver.prototype.resolve4 = realResolve4;
     Resolver.prototype.resolve6 = realResolve6;
     global.fetch = realFetch;
 });
 
 test('the bounds are configurable', () => {
-    assert.equal(MAX_PLAYLIST_ORIGINS, 4);
-    assert.equal(PLAYLIST_REWRITE_TIMEOUT_MS, 1000);
+    expect(MAX_PLAYLIST_ORIGINS).toBe(4);
+    expect(PLAYLIST_REWRITE_TIMEOUT_MS).toBe(1000);
 });
 
 test('a playlist naming many origins resolves only up to the cap', async () => {
@@ -110,19 +106,20 @@ test('a playlist naming many origins resolves only up to the cap', async () => {
     // half-rewritten hands them to the player. Past the cap the playlist is
     // refused instead, the same answer the deadline gives.
     const hosts = Array.from({ length: 40 }, (_, i) => `h${i}.example.com`);
-    await assert.rejects(
-        () => rewriteHlsPlaylist(
-            playlistOver(hosts),
-            'http://h0.example.com/live.m3u8',
-            makeHlsProxyMapper('http://addon.test', CFG, ALLOWED)
-        ),
-        (e) => e.code === 'PLAYLIST_TARGET_REFUSED'
-    );
+    await expect(rewriteHlsPlaylist(
+        playlistOver(hosts),
+        'http://h0.example.com/live.m3u8',
+        makeHlsProxyMapper('http://addon.test', CFG, ALLOWED)
+    )).rejects.toMatchObject({
+        code: 'PLAYLIST_TARGET_REFUSED'
+    });
 
     // The cap has to stop the *work*, not just the signing — that is the whole
     // point. 40 origins must not cost 40 resolutions.
-    assert.equal(new Set(lookups).size, MAX_PLAYLIST_ORIGINS,
-        `resolved ${new Set(lookups).size} hosts, expected ${MAX_PLAYLIST_ORIGINS}`);
+    expect(
+        new Set(lookups).size,
+        `resolved ${new Set(lookups).size} hosts, expected ${MAX_PLAYLIST_ORIGINS}`
+    ).toBe(MAX_PLAYLIST_ORIGINS);
 });
 
 test('a real playlist, all on one host, is unaffected by the cap', async () => {
@@ -140,10 +137,10 @@ test('a real playlist, all on one host, is unaffected by the cap', async () => {
 
     // Two segments plus the EXT-X-KEY URI: key and map URIs are sub-resources
     // exactly like segment lines, and leak the same credentials if left alone.
-    assert.equal(out.split('\n').filter(l => l.includes('/proxy/hls?u=')).length, 3);
-    assert.ok(out.includes('URI="http://addon.test/'), 'the key URI is rewritten too');
-    assert.ok(!out.includes('http://cdn.example.com/'), 'nothing may be relayed raw');
-    assert.equal(lookups.length, 1, 'one host is one lookup');
+    expect(out.split('\n').filter(l => l.includes('/proxy/hls?u=')).length).toBe(3);
+    expect(out, 'the key URI is rewritten too').toContain('URI="http://addon.test/');
+    expect(out, 'nothing may be relayed raw').not.toContain('http://cdn.example.com/');
+    expect(lookups.length, 'one host is one lookup').toBe(1);
 });
 
 test('origin vetting is shared across rewrites, not repeated per playlist', async () => {
@@ -154,13 +151,13 @@ test('origin vetting is shared across rewrites, not repeated per playlist', asyn
 
     await rewriteHlsPlaylist(body, 'http://cdn.example.com/live.m3u8',
         makeHlsProxyMapper('http://addon.test', CFG, ALLOWED));
-    assert.equal(lookups.length, 1);
+    expect(lookups.length).toBe(1);
 
     for (let i = 0; i < 5; i++) {
         await rewriteHlsPlaylist(body, 'http://cdn.example.com/live.m3u8',
             makeHlsProxyMapper('http://addon.test', CFG, ALLOWED));
     }
-    assert.equal(lookups.length, 1, 'later passes re-resolved a host already vetted');
+    expect(lookups.length, 'later passes re-resolved a host already vetted').toBe(1);
 });
 
 test('concurrent rewrites of the same origin share one resolution', async () => {
@@ -172,7 +169,7 @@ test('concurrent rewrites of the same origin share one resolution', async () => 
         rewriteHlsPlaylist(body, 'http://cdn.example.com/live.m3u8',
             makeHlsProxyMapper('http://addon.test', CFG, ALLOWED))
     ));
-    assert.equal(lookups.length, 1);
+    expect(lookups.length).toBe(1);
 });
 
 test('a lookup that merely failed is not remembered as a refusal', async () => {
@@ -184,15 +181,14 @@ test('a lookup that merely failed is not remembered as a refusal', async () => {
     const map = () => makeHlsProxyMapper('http://addon.test', CFG, ALLOWED);
 
     lookupError = new Error('queryA EAI_AGAIN cdn.example.com');
-    await assert.rejects(
-        () => rewriteHlsPlaylist(body, 'http://cdn.example.com/live.m3u8', map()),
-        (e) => e.code === 'PLAYLIST_TARGET_REFUSED'
-    );
+    await expect(rewriteHlsPlaylist(body, 'http://cdn.example.com/live.m3u8', map())).rejects.toMatchObject({
+        code: 'PLAYLIST_TARGET_REFUSED'
+    });
 
     // The resolver recovers, and the very next rewrite succeeds.
     lookupError = null;
     const out = await rewriteHlsPlaylist(body, 'http://cdn.example.com/live.m3u8', map());
-    assert.ok(out.includes('/proxy/hls?u='), 'a transient failure was cached as a verdict');
+    expect(out, 'a transient failure was cached as a verdict').toContain('/proxy/hls?u=');
 });
 
 test('a private address is remembered, so it costs one lookup', async () => {
@@ -204,12 +200,11 @@ test('a private address is remembered, so it costs one lookup', async () => {
 
     lookupAddresses = [{ address: '10.0.0.5', family: 4 }];
     for (let i = 0; i < 3; i++) {
-        await assert.rejects(
-            () => rewriteHlsPlaylist(body, 'http://internal.example.com/live.m3u8', map()),
-            (e) => e.code === 'PLAYLIST_TARGET_REFUSED'
-        );
+        await expect(rewriteHlsPlaylist(body, 'http://internal.example.com/live.m3u8', map())).rejects.toMatchObject({
+            code: 'PLAYLIST_TARGET_REFUSED'
+        });
     }
-    assert.equal(lookups.length, 1, 'a settled refusal was re-resolved');
+    expect(lookups.length, 'a settled refusal was re-resolved').toBe(1);
 });
 
 test('the rewrite phase gives up on its own deadline', async () => {
@@ -223,13 +218,14 @@ test('the rewrite phase gives up on its own deadline', async () => {
     const hosts = Array.from({ length: 500 }, (_, i) => `h${i}.example.com`);
 
     const started = Date.now();
-    await assert.rejects(
-        () => rewriteHlsPlaylist(playlistOver(hosts), 'http://h0.example.com/live.m3u8', slow,
-            { deadline: Date.now() + 300 }),
-        (e) => e.code === 'PLAYLIST_REWRITE_TIMEOUT'
-    );
+    await expect(
+        rewriteHlsPlaylist(playlistOver(hosts), 'http://h0.example.com/live.m3u8', slow,
+            { deadline: Date.now() + 300 })
+    ).rejects.toMatchObject({
+        code: 'PLAYLIST_REWRITE_TIMEOUT'
+    });
     const elapsed = Date.now() - started;
-    assert.ok(elapsed < 3000, `expected to give up near the deadline, took ${elapsed}ms`);
+    expect(elapsed, `expected to give up near the deadline, took ${elapsed}ms`).toBeLessThan(3000);
 });
 
 test('without a deadline the rewrite behaves exactly as before', async () => {
@@ -239,7 +235,7 @@ test('without a deadline the rewrite behaves exactly as before', async () => {
         'http://cdn.example.com/live.m3u8',
         makeHlsProxyMapper('http://addon.test', CFG, ALLOWED)
     );
-    assert.ok(out.includes('/proxy/hls?u='));
+    expect(out).toContain('/proxy/hls?u=');
 });
 
 // The 504 wiring in relayUpstream is deliberately not covered end to end. Driving

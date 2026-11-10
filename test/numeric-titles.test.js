@@ -8,9 +8,6 @@
 process.env.CONFIG_SECRET = 'test-secret-for-unit-tests';
 process.env.ALLOW_PRIVATE_NETWORKS = 'true';
 
-const test = require('node:test');
-const assert = require('node:assert');
-
 const {
     app,
     encodeConfig,
@@ -23,7 +20,7 @@ const {
     seriesStreamsCache,
     liveStreamsCache,
     vodInfoCache
-} = require('../index.js');
+} = require('./support/internals.js');
 
 const realFetch = global.fetch;
 
@@ -66,17 +63,17 @@ function clearCaches() {
 let server;
 let base;
 
-test.before(async () => {
+beforeAll(async () => {
     await new Promise(resolve => { server = app.listen(0, '127.0.0.1', resolve); });
     base = `http://127.0.0.1:${server.address().port}`;
 });
 
-test.after(async () => {
+afterAll(async () => {
     global.fetch = realFetch;
     await new Promise(resolve => server.close(resolve));
 });
 
-test.beforeEach(() => {
+beforeEach(() => {
     clearCaches();
     stubProvider();
 });
@@ -85,22 +82,22 @@ test.beforeEach(() => {
 
 test('a numeric title does not throw out of filterByName', () => {
     const found = filterByName(MOVIES, 'ali');
-    assert.deepEqual(found.map(s => s.stream_id), [104]);
+    expect(found.map(s => s.stream_id)).toStrictEqual([104]);
 });
 
 test('a numeric title is searchable by its digits', () => {
-    assert.deepEqual(filterByName(MOVIES, '19').map(s => s.stream_id), [102]);
-    assert.deepEqual(filterByName(MOVIES, '300').map(s => s.stream_id), [103]);
+    expect(filterByName(MOVIES, '19').map(s => s.stream_id)).toStrictEqual([102]);
+    expect(filterByName(MOVIES, '300').map(s => s.stream_id)).toStrictEqual([103]);
 });
 
 test('titleOf takes strings and numbers, and nothing else', () => {
-    assert.equal(titleOf('Alien'), 'Alien');
-    assert.equal(titleOf(1917), '1917');
-    assert.equal(titleOf(0), '0');
+    expect(titleOf('Alien')).toBe('Alien');
+    expect(titleOf(1917)).toBe('1917');
+    expect(titleOf(0)).toBe('0');
     // Not titles: the callers all have a fallback, and "[object Object]" on a
     // shelf is worse than using it.
     for (const value of [undefined, null, {}, [], NaN, Infinity, true]) {
-        assert.equal(titleOf(value), '', `titleOf(${JSON.stringify(value) ?? String(value)})`);
+        expect(titleOf(value), `titleOf(${JSON.stringify(value) ?? String(value)})`).toBe('');
     }
 });
 
@@ -114,8 +111,8 @@ test('a catalog meta carries its title as a string', () => {
     });
     const numeric = metas.find(m => m.id === 'xtremio_movie_102');
 
-    assert.strictEqual(numeric.name, '1917', 'a number would be a type violation in the SDK');
-    assert.strictEqual(typeof numeric.name, 'string');
+    expect(numeric.name, 'a number would be a type violation in the SDK').toBe('1917');
+    expect(typeof numeric.name).toBe('string');
 });
 
 // --- what the account actually saw -----------------------------------------
@@ -127,27 +124,27 @@ test('one numeric title does not empty every search on the account', async () =>
     // while filtering, so the route answered with an empty shelf instead.
     const body = await getJson(`/catalog/XT-Movies/xtremio_search_movies/${encodeURIComponent('search=ali')}.json`);
 
-    assert.deepEqual(body.metas.map(m => m.id), ['xtremio_movie_104']);
+    expect(body.metas.map(m => m.id)).toStrictEqual(['xtremio_movie_104']);
 });
 
 test('searching for the numeric title finds it', async () => {
     const body = await getJson(`/catalog/XT-Movies/xtremio_search_movies/${encodeURIComponent('search=1917')}.json`);
 
-    assert.deepEqual(body.metas.map(m => m.id), ['xtremio_movie_102']);
-    assert.strictEqual(body.metas[0].name, '1917');
+    expect(body.metas.map(m => m.id)).toStrictEqual(['xtremio_movie_102']);
+    expect(body.metas[0].name).toBe('1917');
 });
 
 test('a browse shelf renders a numeric title as a string', async () => {
     const body = await getJson(`/catalog/XT-Movies/xtremio_movies_new/${encodeURIComponent('genre=Action')}.json`);
 
     const names = body.metas.map(m => m.name);
-    assert.deepEqual(names, ['Alien', '300', '1917', 'The Thing'], 'newest first');
-    for (const name of names) assert.strictEqual(typeof name, 'string');
+    expect(names, 'newest first').toStrictEqual(['Alien', '300', '1917', 'The Thing']);
+    for (const name of names) expect(typeof name).toBe('string');
 });
 
 test('a meta response names a numeric-titled movie as a string', async () => {
     const body = await getJson('/meta/XT-Movies/xtremio_movie_102.json');
 
-    assert.strictEqual(body.meta.name, '1917');
-    assert.strictEqual(typeof body.meta.name, 'string');
+    expect(body.meta.name).toBe('1917');
+    expect(typeof body.meta.name).toBe('string');
 });

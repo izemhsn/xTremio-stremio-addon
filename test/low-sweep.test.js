@@ -18,8 +18,6 @@
 process.env.CONFIG_SECRET = 'test-secret-for-unit-tests';
 process.env.ALLOW_PRIVATE_NETWORKS = 'true';
 
-const test = require('node:test');
-const assert = require('node:assert');
 const http = require('node:http');
 const zlib = require('node:zlib');
 
@@ -30,7 +28,7 @@ const {
     parseCatalogId,
     isUsableSeriesInfo,
     discardBody
-} = require('../index.js');
+} = require('./support/internals.js');
 
 const realFetch = global.fetch;
 
@@ -110,7 +108,7 @@ function providerHandler(req, res) {
     res.end(req.method === 'HEAD' ? undefined : 'abcd');
 }
 
-test.before(async () => {
+beforeAll(async () => {
     provider = http.createServer(providerHandler);
     await new Promise(r => provider.listen(0, '127.0.0.1', r));
     providerBase = `http://127.0.0.1:${provider.address().port}`;
@@ -119,41 +117,43 @@ test.before(async () => {
     base = `http://127.0.0.1:${server.address().port}`;
 });
 
-test.after(async () => {
+afterAll(async () => {
     await new Promise(r => server.close(r));
     await new Promise(r => provider.close(r));
 });
 
-test.beforeEach(() => { providerHits = []; redirectClosed = false; });
+beforeEach(() => { providerHits = []; redirectClosed = false; });
 
 // --- M-1: the method reaches upstream ---------------------------------------
 
 test('a HEAD from the player is a HEAD upstream, not a GET', async () => {
     const res = await realFetch(`${base}/${CFG}/proxy/movie/1.mp4`, { method: 'HEAD' });
-    assert.equal(res.status, 200);
-    assert.equal(res.headers.get('content-length'), '4');
-    assert.equal(await res.text(), '', 'a HEAD response carries no body');
+    expect(res.status).toBe(200);
+    expect(res.headers.get('content-length')).toBe('4');
+    expect(await res.text(), 'a HEAD response carries no body').toBe('');
 
-    assert.ok(providerHits.length >= 1);
-    assert.ok(providerHits.every(h => h.method === 'HEAD'),
-        `upstream should only have seen HEAD, saw ${JSON.stringify(providerHits)}`);
+    expect(providerHits.length).toBeGreaterThanOrEqual(1);
+    expect(
+        providerHits.every(h => h.method === 'HEAD'),
+        `upstream should only have seen HEAD, saw ${JSON.stringify(providerHits)}`
+    ).toBeTruthy();
 });
 
 test('a GET still goes upstream as a GET and still delivers the body', async () => {
     const res = await realFetch(`${base}/${CFG}/proxy/movie/1.mp4`);
-    assert.equal(await res.text(), 'abcd');
-    assert.ok(providerHits.every(h => h.method === 'GET'));
+    expect(await res.text()).toBe('abcd');
+    expect(providerHits.every(h => h.method === 'GET')).toBeTruthy();
 });
 
 test('a provider that refuses HEAD falls back to GET rather than failing', async () => {
     // The regression this guards: trading wasted bytes for a broken probe would
     // be a worse bug than the one M-1 describes.
     const res = await realFetch(`${base}/${CFG}/proxy/movie/2.mp4`, { method: 'HEAD' });
-    assert.equal(res.status, 200, 'the 405 must not reach the player');
-    assert.equal(res.headers.get('content-length'), '9');
+    expect(res.status, 'the 405 must not reach the player').toBe(200);
+    expect(res.headers.get('content-length')).toBe('9');
 
     const methods = providerHits.map(h => h.method);
-    assert.deepEqual(methods, ['HEAD', 'GET'], 'HEAD first, then the fallback');
+    expect(methods, 'HEAD first, then the fallback').toStrictEqual(['HEAD', 'GET']);
 });
 
 test('a 502 to a HEAD falls back too — the shape the real provider sends', async () => {
@@ -161,9 +161,9 @@ test('a 502 to a HEAD falls back too — the shape the real provider sends', asy
     // redirect. A fallback scoped to 405/501 let that reach the player, which is
     // exactly what happened on the first attempt at this fix.
     const res = await realFetch(`${base}/${CFG}/proxy/movie/6.mp4`, { method: 'HEAD' });
-    assert.equal(res.status, 200, 'a 502 from a HEAD must not reach the player');
-    assert.equal(res.headers.get('content-length'), '4');
-    assert.deepEqual(providerHits.map(h => h.method), ['HEAD', 'GET']);
+    expect(res.status, 'a 502 from a HEAD must not reach the player').toBe(200);
+    expect(res.headers.get('content-length')).toBe('4');
+    expect(providerHits.map(h => h.method)).toStrictEqual(['HEAD', 'GET']);
 });
 
 test('a HEAD that kills the connection falls back too', async () => {
@@ -171,9 +171,9 @@ test('a HEAD that kills the connection falls back too', async () => {
     // 302 drops the socket on a HEAD, so fetch throws instead of returning a
     // status. A status-only check never sees this one.
     const res = await realFetch(`${base}/${CFG}/proxy/movie/7.mp4`, { method: 'HEAD' });
-    assert.equal(res.status, 200, 'a thrown HEAD must not reach the player');
-    assert.equal(res.headers.get('content-length'), '4');
-    assert.deepEqual(providerHits.map(h => h.method), ['HEAD', 'GET']);
+    expect(res.status, 'a thrown HEAD must not reach the player').toBe(200);
+    expect(res.headers.get('content-length')).toBe('4');
+    expect(providerHits.map(h => h.method)).toStrictEqual(['HEAD', 'GET']);
 });
 
 // --- L-3: content-length vs a decompressed body ------------------------------
@@ -182,17 +182,19 @@ test('content-length is dropped when upstream sent content-encoding', async () =
     const res = await realFetch(`${base}/${CFG}/proxy/movie/3.mp4`);
     const body = await res.text();
 
-    assert.equal(body.length, 5000, 'the client gets the decompressed body');
+    expect(body.length, 'the client gets the decompressed body').toBe(5000);
     // The compressed length would be a few dozen bytes; forwarding it would make
     // a client stop after those and treat the rest as a broken stream.
-    assert.equal(res.headers.get('content-length'), null,
-        'a length describing the compressed body must not be forwarded');
+    expect(
+        res.headers.get('content-length'),
+        'a length describing the compressed body must not be forwarded'
+    ).toBeNull();
 });
 
 test('content-length is still forwarded when nothing was encoded', async () => {
     const res = await realFetch(`${base}/${CFG}/proxy/movie/1.mp4`);
-    assert.equal(res.headers.get('content-length'), '4');
-    assert.equal(await res.text(), 'abcd');
+    expect(res.headers.get('content-length')).toBe('4');
+    expect(await res.text()).toBe('abcd');
 });
 
 // --- L-1: abandoned bodies are cancelled -------------------------------------
@@ -205,18 +207,18 @@ test('discardBody cancels an unread body and never throws', async () => {
     });
     discardBody({ body: stream });
     await new Promise(r => setImmediate(r));
-    assert.equal(cancelled, true);
+    expect(cancelled).toBe(true);
 
     // The shapes it must tolerate: no response, no body, and a body someone is
     // already reading (locked), which is the case that would throw.
     const locked = new ReadableStream({ start(c) { c.close(); } });
     locked.getReader();
-    assert.doesNotThrow(() => {
+    expect(() => {
         discardBody(undefined);
         discardBody({});
         discardBody({ body: null });
         discardBody({ body: locked });
-    });
+    }).not.toThrow();
 });
 
 test('a redirect body is released, and the redirect is still followed', async () => {
@@ -228,15 +230,15 @@ test('a redirect body is released, and the redirect is still followed', async ()
     // that matters and is stable (the redirect is followed, its socket does not
     // linger); the cancel itself is unit-tested above as the hygiene it is.
     const res = await realFetch(`${base}/${CFG}/proxy/movie/4.mp4`);
-    assert.equal(res.status, 200);
-    assert.equal(await res.text(), 'abcd', 'the redirect is still followed');
-    assert.deepEqual(providerHits.map(h => h.url.slice(-6)), ['/4.mp4', '/5.mp4']);
+    expect(res.status).toBe(200);
+    expect(await res.text(), 'the redirect is still followed').toBe('abcd');
+    expect(providerHits.map(h => h.url.slice(-6))).toStrictEqual(['/4.mp4', '/5.mp4']);
 
     const deadline = Date.now() + 3000;
     while (!redirectClosed && Date.now() < deadline) {
         await new Promise(r => setTimeout(r, 5));
     }
-    assert.equal(redirectClosed, true, 'the abandoned redirect body still holds its socket');
+    expect(redirectClosed, 'the abandoned redirect body still holds its socket').toBe(true);
 });
 
 // --- L-4: "usable" must mean what the caller needs ---------------------------
@@ -244,15 +246,15 @@ test('a redirect body is released, and the redirect is still followed', async ()
 test('a series payload carrying only a cover is not usable', () => {
     // The exact shape that used to be cached positively for 30 minutes and then
     // rendered as meta: null by the route that requires a name or episodes.
-    assert.equal(isUsableSeriesInfo({ info: { cover: 'http://x/c.jpg' } }), false);
-    assert.equal(isUsableSeriesInfo({ info: { plot: 'a plot' } }), false);
-    assert.equal(isUsableSeriesInfo({ info: { genre: 'Drama' } }), false);
-    assert.equal(isUsableSeriesInfo({ info: {}, episodes: {} }), false);
+    expect(isUsableSeriesInfo({ info: { cover: 'http://x/c.jpg' } })).toBe(false);
+    expect(isUsableSeriesInfo({ info: { plot: 'a plot' } })).toBe(false);
+    expect(isUsableSeriesInfo({ info: { genre: 'Drama' } })).toBe(false);
+    expect(isUsableSeriesInfo({ info: {}, episodes: {} })).toBe(false);
 });
 
 test('a name or any episode is still usable', () => {
-    assert.equal(isUsableSeriesInfo({ info: { name: 'Show' } }), true);
-    assert.equal(isUsableSeriesInfo({ episodes: { 1: [{ id: '5' }] } }), true);
+    expect(isUsableSeriesInfo({ info: { name: 'Show' } })).toBe(true);
+    expect(isUsableSeriesInfo({ episodes: { 1: [{ id: '5' }] } })).toBe(true);
     // This used to assert `true`, on a key count: `{ 1: [] }` is one season, so
     // the payload "had episodes". It has none — the meta route iterates the
     // arrays and builds no videos at all, so `hasContent` said false and the
@@ -260,12 +262,12 @@ test('a name or any episode is still usable', () => {
     // usable. That disagreement is the one this predicate exists to avoid, so an
     // empty season now counts for nothing. A payload with episodes and no info
     // block still works, which is what the line above holds.
-    assert.equal(isUsableSeriesInfo({ episodes: { 1: [] } }), false);
+    expect(isUsableSeriesInfo({ episodes: { 1: [] } })).toBe(false);
 });
 
 test('the rejects stay rejected', () => {
     for (const bad of [null, undefined, 'string', 42, {}, { info: null }]) {
-        assert.equal(isUsableSeriesInfo(bad), false, `${JSON.stringify(bad)} is not usable`);
+        expect(isUsableSeriesInfo(bad), `${JSON.stringify(bad)} is not usable`).toBe(false);
     }
 });
 
@@ -274,39 +276,38 @@ test('the rejects stay rejected', () => {
 test('only the three declared variants parse', () => {
     for (const kind of ['movies', 'series']) {
         for (const variant of ['new', 'popular', 'featured']) {
-            assert.deepEqual(parseCatalogId(`xtremio_${kind}_${variant}`), { kind, variant, search: false });
+            expect(parseCatalogId(`xtremio_${kind}_${variant}`)).toStrictEqual({ kind, variant, search: false });
         }
-        assert.equal(parseCatalogId(`xtremio_${kind}_bogus`), null);
-        assert.equal(parseCatalogId(`xtremio_${kind}_`), null);
-        assert.equal(parseCatalogId(`xtremio_${kind}_NEW`), null, 'variants are case-sensitive');
+        expect(parseCatalogId(`xtremio_${kind}_bogus`)).toBeNull();
+        expect(parseCatalogId(`xtremio_${kind}_`)).toBeNull();
+        expect(parseCatalogId(`xtremio_${kind}_NEW`), 'variants are case-sensitive').toBeNull();
     }
     // The ids that are not variant-suffixed at all must be untouched by this.
-    assert.deepEqual(parseCatalogId('xtremio_live'), { kind: 'live', variant: null, search: false });
-    assert.deepEqual(parseCatalogId('xtremio_search_movies'), { kind: 'movies', variant: null, search: true });
-    assert.deepEqual(parseCatalogId('xtremio_search_series'), { kind: 'series', variant: null, search: true });
-    assert.equal(parseCatalogId(''), null);
-    assert.equal(parseCatalogId(undefined), null);
+    expect(parseCatalogId('xtremio_live')).toStrictEqual({ kind: 'live', variant: null, search: false });
+    expect(parseCatalogId('xtremio_search_movies')).toStrictEqual({ kind: 'movies', variant: null, search: true });
+    expect(parseCatalogId('xtremio_search_series')).toStrictEqual({ kind: 'series', variant: null, search: true });
+    expect(parseCatalogId('')).toBeNull();
+    expect(parseCatalogId(undefined)).toBeNull();
 });
 
 test('an unknown catalog id is an empty shelf, not an unsorted one', async () => {
     const res = await realFetch(`${base}/${CFG}/catalog/XT-Movies/xtremio_movies_bogus.json`);
-    assert.equal(res.status, 200);
-    assert.deepEqual(await res.json(), { metas: [] });
+    expect(res.status).toBe(200);
+    expect(await res.json()).toStrictEqual({ metas: [] });
     // And it costs nothing upstream, which is the other half of rejecting early.
-    assert.deepEqual(providerHits, []);
+    expect(providerHits).toStrictEqual([]);
 });
 
 // --- L-9 / L-10: small correctness ------------------------------------------
 
 test('escapeHtml stringifies falsy values instead of erasing them', () => {
-    assert.equal(escapeHtml(0), '0');
-    assert.equal(escapeHtml(false), 'false');
-    assert.equal(escapeHtml(''), '');
-    assert.equal(escapeHtml(null), '');
-    assert.equal(escapeHtml(undefined), '');
+    expect(escapeHtml(0)).toBe('0');
+    expect(escapeHtml(false)).toBe('false');
+    expect(escapeHtml('')).toBe('');
+    expect(escapeHtml(null)).toBe('');
+    expect(escapeHtml(undefined)).toBe('');
     // Escaping itself is unchanged.
-    assert.equal(escapeHtml('<a href="x">&\'</a>'),
-        '&lt;a href=&quot;x&quot;&gt;&amp;&#039;&lt;/a&gt;');
+    expect(escapeHtml('<a href="x">&\'</a>')).toBe('&lt;a href=&quot;x&quot;&gt;&amp;&#039;&lt;/a&gt;');
 });
 
 // --- L-6: no mistyped spec field in the manifest -----------------------------
@@ -318,9 +319,9 @@ test('the manifest no longer carries a non-spec `config` object', async () => {
     // The spec's `config` is an array of field descriptors; this addon emitted
     // an object. A client that starts honouring the field would get the wrong
     // type, and configurable is what actually routes the user to /configure.
-    assert.equal('config' in manifest, false);
-    assert.equal(manifest.behaviorHints.configurable, true);
-    assert.equal(manifest.behaviorHints.configurationRequired, true);
+    expect('config' in manifest).toBe(false);
+    expect(manifest.behaviorHints.configurable).toBe(true);
+    expect(manifest.behaviorHints.configurationRequired).toBe(true);
 });
 
 // --- L-7: credentials do not arrive by query string --------------------------
@@ -335,11 +336,11 @@ test('GET /configure ignores loose credential query parameters', async () => {
     // and lands in history, referrers and logs. Honouring it is what made it
     // worth constructing.
     for (const value of ['evil.test', 'leaked-user', 'leaked-pass']) {
-        assert.ok(!html.includes(value), `${value} must not be echoed back`);
+        expect(html, `${value} must not be echoed back`).not.toContain(value);
     }
-    assert.match(html, /name="serverUrl" value=""/);
-    assert.match(html, /name="username" value=""/);
-    assert.match(html, /name="password" value=""/);
+    expect(html).toMatch(/name="serverUrl" value=""/);
+    expect(html).toMatch(/name="username" value=""/);
+    expect(html).toMatch(/name="password" value=""/);
 });
 
 // --- M-4 / L-12: a token never gives its password back -----------------------
@@ -349,10 +350,10 @@ test('GET /configure ignores loose credential query parameters', async () => {
 const DISTINCT_PASSWORD = 'Sup3r-S3cret-Passw0rd';
 
 function assertPrefilledWithoutPassword(html) {
-    assert.ok(html.includes(providerBase), 'server url prefilled');
-    assert.match(html, new RegExp(`name="username" value="${USERNAME}"`));
-    assert.match(html, /name="password" value=""/);
-    assert.ok(!html.includes(DISTINCT_PASSWORD), 'the password must not appear anywhere on the page');
+    expect(html, 'server url prefilled').toContain(providerBase);
+    expect(html).toMatch(new RegExp(`name="username" value="${USERNAME}"`));
+    expect(html).toMatch(/name="password" value=""/);
+    expect(html, 'the password must not appear anywhere on the page').not.toContain(DISTINCT_PASSWORD);
 }
 
 test('GET /configure prefills from a token, but never the password', async () => {
@@ -366,51 +367,51 @@ test('GET /configure prefills from a token, but never the password', async () =>
 test('GET /:config/configure, where Stremio\'s Configure button lands, serves the same page', async () => {
     const token = encodeConfig({ serverUrl: providerBase, username: USERNAME, password: DISTINCT_PASSWORD });
     const res = await realFetch(`${base}/${token}/configure`);
-    assert.equal(res.status, 200);
+    expect(res.status).toBe(200);
     assertPrefilledWithoutPassword(await res.clone().text());
 
     // It is the credential page, so it carries that page's headers — and not the
     // wildcard the addon resources under the same token prefix get.
-    assert.equal(res.headers.get('cache-control'), 'no-store');
-    assert.match(res.headers.get('content-security-policy') || '', /frame-ancestors 'none'/);
-    assert.equal(res.headers.get('access-control-allow-origin'), null);
+    expect(res.headers.get('cache-control')).toBe('no-store');
+    expect(res.headers.get('content-security-policy') || '').toMatch(/frame-ancestors 'none'/);
+    expect(res.headers.get('access-control-allow-origin')).toBeNull();
 
     // A form without an action would POST back to /<token>/configure, which has
     // no handler.
-    assert.match(await res.text(), /<form method="POST" action="\/configure">/);
+    expect(await res.text()).toMatch(/<form method="POST" action="\/configure">/);
 });
 
 test('GET /:config/configure with an undecodable token renders the empty form', async () => {
     const res = await realFetch(`${base}/not-a-real-token/configure`);
     const html = await res.text();
-    assert.equal(res.status, 200);
-    assert.match(html, /name="serverUrl" value=""/);
-    assert.match(html, /name="username" value=""/);
-    assert.match(html, /name="password" value=""/);
+    expect(res.status).toBe(200);
+    expect(html).toMatch(/name="serverUrl" value=""/);
+    expect(html).toMatch(/name="username" value=""/);
+    expect(html).toMatch(/name="password" value=""/);
 });
 
 // --- L-8: a rejection is as fatal as a throw ---------------------------------
 
 test('unhandledRejection exits like uncaughtException', () => {
     // Asserted against the source, the way the existing handler tests are: the
-    // handlers live inside `if (require.main === module)` and cannot be reached
-    // from an in-process require.
-    const src = require('node:fs').readFileSync(require.resolve('../index.js'), 'utf8');
-    const bootstrap = src.slice(src.indexOf('if (require.main === module)'));
+    // handlers are installed by index.js, and requiring it starts the server.
+    const bootstrap = require('node:fs').readFileSync(require.resolve('../index.js'), 'utf8');
     const rejection = bootstrap.slice(bootstrap.indexOf("process.on('unhandledRejection'"));
 
-    assert.match(rejection, /Unhandled rejection, exiting/);
-    assert.match(rejection.slice(0, 300), /process\.exit\(1\)/,
-        'a rejection must not leave a wedged process answering /health with 200');
+    expect(rejection).toMatch(/Unhandled rejection, exiting/);
+    expect(
+        rejection.slice(0, 300),
+        'a rejection must not leave a wedged process answering /health with 200'
+    ).toMatch(/process\.exit\(1\)/);
 });
 
 test('no epoch date is written into an episode', () => {
     // Pinned against the source: the meta route needs a whole series payload to
     // exercise, but the bug was a single literal, and its return would be silent
     // — Stremio renders "1970" next to the episode rather than omitting a date.
-    const src = require('node:fs').readFileSync(require.resolve('../index.js'), 'utf8');
+    const src = require('node:fs').readFileSync(require.resolve('../src/routes/meta.js'), 'utf8');
     const inCode = src
         .split('\n')
         .filter(line => line.includes('1970-01-01') && !line.trim().startsWith('//'));
-    assert.deepEqual(inCode, [], 'the epoch fallback must not come back');
+    expect(inCode, 'the epoch fallback must not come back').toStrictEqual([]);
 });

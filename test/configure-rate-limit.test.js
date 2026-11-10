@@ -3,9 +3,6 @@
 // instance is a port scanner and a credential-stuffing relay on its own IP.
 process.env.CONFIG_SECRET = 'test-secret-for-unit-tests';
 
-const test = require('node:test');
-const assert = require('node:assert');
-
 const {
     rateLimitConfigure,
     configureAttempts,
@@ -14,19 +11,19 @@ const {
     CONFIGURE_RATE_WINDOW_MS,
     CONFIGURE_RATE_MAX_CLIENTS,
     getBaseUrl
-} = require('../index.js');
+} = require('./support/internals.js');
 
 // A request stub carrying only what the limiter reads.
 function reqFrom(ip, headers = {}) {
     return { socket: { remoteAddress: ip }, headers };
 }
 
-test.beforeEach(() => configureAttempts.clear());
+beforeEach(() => configureAttempts.clear());
 
 test('requests under the limit are allowed', () => {
     const req = reqFrom('203.0.113.5');
     for (let i = 0; i < CONFIGURE_RATE_LIMIT; i++) {
-        assert.strictEqual(rateLimitConfigure(req).allowed, true, `attempt ${i + 1} should pass`);
+        expect(rateLimitConfigure(req).allowed, `attempt ${i + 1} should pass`).toBe(true);
     }
 });
 
@@ -35,41 +32,38 @@ test('the attempt after the limit is blocked, with a Retry-After', () => {
     for (let i = 0; i < CONFIGURE_RATE_LIMIT; i++) rateLimitConfigure(req);
 
     const blocked = rateLimitConfigure(req);
-    assert.strictEqual(blocked.allowed, false);
-    assert.ok(blocked.retryAfter > 0, 'a blocked caller is told when to retry');
-    assert.ok(
-        blocked.retryAfter <= Math.ceil(CONFIGURE_RATE_WINDOW_MS / 1000),
-        'retryAfter never exceeds the window'
-    );
+    expect(blocked.allowed).toBe(false);
+    expect(blocked.retryAfter, 'a blocked caller is told when to retry').toBeGreaterThan(0);
+    expect(blocked.retryAfter, 'retryAfter never exceeds the window').toBeLessThanOrEqual(Math.ceil(CONFIGURE_RATE_WINDOW_MS / 1000));
 });
 
 test('one client being blocked does not block another', () => {
     const attacker = reqFrom('203.0.113.5');
     for (let i = 0; i <= CONFIGURE_RATE_LIMIT; i++) rateLimitConfigure(attacker);
-    assert.strictEqual(rateLimitConfigure(attacker).allowed, false);
+    expect(rateLimitConfigure(attacker).allowed).toBe(false);
 
-    assert.strictEqual(rateLimitConfigure(reqFrom('198.51.100.9')).allowed, true);
+    expect(rateLimitConfigure(reqFrom('198.51.100.9')).allowed).toBe(true);
 });
 
 test('the window expires and the client is allowed again', () => {
     const req = reqFrom('203.0.113.5');
     for (let i = 0; i <= CONFIGURE_RATE_LIMIT; i++) rateLimitConfigure(req);
-    assert.strictEqual(rateLimitConfigure(req).allowed, false);
+    expect(rateLimitConfigure(req).allowed).toBe(false);
 
     // Age the window out rather than sleeping through it.
     configureAttempts.get(clientKey(req)).resetAt = Date.now() - 1;
 
-    assert.strictEqual(rateLimitConfigure(req).allowed, true, 'a new window starts clean');
+    expect(rateLimitConfigure(req).allowed, 'a new window starts clean').toBe(true);
 });
 
 test('expired entries are swept, so the map tracks only active clients', () => {
     for (let i = 0; i < 50; i++) rateLimitConfigure(reqFrom(`203.0.113.${i}`));
-    assert.strictEqual(configureAttempts.size, 50);
+    expect(configureAttempts.size).toBe(50);
 
     for (const entry of configureAttempts.values()) entry.resetAt = Date.now() - 1;
 
     rateLimitConfigure(reqFrom('198.51.100.1'));
-    assert.strictEqual(configureAttempts.size, 1, 'the sweep dropped all 50 expired buckets');
+    expect(configureAttempts.size, 'the sweep dropped all 50 expired buckets').toBe(1);
 });
 
 test('a full limiter map evicts its oldest bucket rather than switching itself off', () => {
@@ -83,27 +77,27 @@ test('a full limiter map evicts its oldest bucket rather than switching itself o
     }
 
     const fresh = reqFrom('198.51.100.77');
-    assert.strictEqual(rateLimitConfigure(fresh).allowed, true, 'a new client still gets its first attempt');
-    assert.strictEqual(configureAttempts.size, CONFIGURE_RATE_MAX_CLIENTS, 'the map does not grow past the bound');
-    assert.ok(!configureAttempts.has('filler-0'), 'the oldest bucket made room');
+    expect(rateLimitConfigure(fresh).allowed, 'a new client still gets its first attempt').toBe(true);
+    expect(configureAttempts.size, 'the map does not grow past the bound').toBe(CONFIGURE_RATE_MAX_CLIENTS);
+    expect(configureAttempts.has('filler-0'), 'the oldest bucket made room').toBeFalsy();
 
     for (let i = 1; i < CONFIGURE_RATE_LIMIT; i++) rateLimitConfigure(fresh);
-    assert.strictEqual(rateLimitConfigure(fresh).allowed, false, 'and the new client is limited, not waved through');
+    expect(rateLimitConfigure(fresh).allowed, 'and the new client is limited, not waved through').toBe(false);
 });
 
 // The whole point of defaulting TRUST_PROXY off: the header is client-supplied,
 // so honoring it with no proxy in front hands every caller an unlimited supply
 // of fresh buckets.
 test('a spoofed X-Forwarded-For cannot escape the bucket when TRUST_PROXY is off', () => {
-    assert.notStrictEqual(process.env.TRUST_PROXY, 'true', 'this test asserts the default');
+    expect(process.env.TRUST_PROXY, 'this test asserts the default').not.toBe('true');
 
     for (let i = 0; i <= CONFIGURE_RATE_LIMIT; i++) {
         rateLimitConfigure(reqFrom('203.0.113.5', { 'x-forwarded-for': `10.0.0.${i}` }));
     }
 
     const spoofed = rateLimitConfigure(reqFrom('203.0.113.5', { 'x-forwarded-for': '10.9.9.9' }));
-    assert.strictEqual(spoofed.allowed, false, 'the socket address still governs');
-    assert.strictEqual(configureAttempts.size, 1, 'varying the header created no extra buckets');
+    expect(spoofed.allowed, 'the socket address still governs').toBe(false);
+    expect(configureAttempts.size, 'varying the header created no extra buckets').toBe(1);
 });
 
 test('forwarded headers do not choose the install link host when TRUST_PROXY is off', () => {
@@ -114,7 +108,7 @@ test('forwarded headers do not choose the install link host when TRUST_PROXY is 
         socket: {},
         headers: { host: 'addon.example.com', 'x-forwarded-proto': 'https', 'x-forwarded-host': 'attacker.example' }
     };
-    assert.strictEqual(getBaseUrl(req), 'http://addon.example.com');
+    expect(getBaseUrl(req)).toBe('http://addon.example.com');
 });
 
 test('an IPv6 client is limited by its /64, not by each address in it', () => {
@@ -122,20 +116,19 @@ test('an IPv6 client is limited by its /64, not by each address in it', () => {
     for (let i = 0; i <= CONFIGURE_RATE_LIMIT; i++) {
         rateLimitConfigure(reqFrom(`2001:db8:aaaa:bbbb::${(i + 1).toString(16)}`));
     }
-    assert.strictEqual(rateLimitConfigure(reqFrom('2001:db8:aaaa:bbbb:1234:5678:9abc:def0')).allowed, false);
-    assert.strictEqual(
+    expect(rateLimitConfigure(reqFrom('2001:db8:aaaa:bbbb:1234:5678:9abc:def0')).allowed).toBe(false);
+    expect(
         rateLimitConfigure(reqFrom('2001:db8:aaaa:cccc::1')).allowed,
-        true,
         'a different /64 is a different client'
-    );
+    ).toBe(true);
 });
 
 test('an IPv4 client on a dual-stack socket is the same bucket either way', () => {
-    assert.strictEqual(clientKey(reqFrom('::ffff:203.0.113.5')), clientKey(reqFrom('203.0.113.5')));
+    expect(clientKey(reqFrom('::ffff:203.0.113.5'))).toBe(clientKey(reqFrom('203.0.113.5')));
 });
 
 test('a request with no discoverable address still gets a bucket', () => {
     const req = { socket: {}, headers: {} };
     for (let i = 0; i <= CONFIGURE_RATE_LIMIT; i++) rateLimitConfigure(req);
-    assert.strictEqual(rateLimitConfigure(req).allowed, false, 'unknown callers are limited, not exempt');
+    expect(rateLimitConfigure(req).allowed, 'unknown callers are limited, not exempt').toBe(false);
 });

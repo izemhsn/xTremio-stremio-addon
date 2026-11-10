@@ -11,11 +11,9 @@ process.env.ALLOW_PRIVATE_NETWORKS = 'true';
 process.env.UPSTREAM_IDLE_TIMEOUT_MS = '250';
 process.env.UPSTREAM_BODY_TIMEOUT_MS = '1500';
 
-const test = require('node:test');
-const assert = require('node:assert');
 const http = require('node:http');
 
-const { xtremioGet, UPSTREAM_IDLE_TIMEOUT_MS, UPSTREAM_BODY_TIMEOUT_MS } = require('../index.js');
+const { xtremioGet, UPSTREAM_IDLE_TIMEOUT_MS, UPSTREAM_BODY_TIMEOUT_MS } = require('./support/internals.js');
 
 // A panel that misbehaves in whichever way the request's `action` names.
 function handler(req, res) {
@@ -52,52 +50,43 @@ function handler(req, res) {
 let provider;
 let cfg;
 
-test.before(async () => {
+beforeAll(async () => {
     await new Promise(resolve => { provider = http.createServer(handler).listen(0, '127.0.0.1', resolve); });
     cfg = { serverUrl: `http://127.0.0.1:${provider.address().port}`, username: 'u', password: 'p' };
 });
 
-test.after(async () => {
+afterAll(async () => {
     provider.closeAllConnections();
     await new Promise(resolve => provider.close(resolve));
 });
 
 test('the fixture sets the deadlines this file relies on', () => {
-    assert.equal(UPSTREAM_IDLE_TIMEOUT_MS, 250);
-    assert.equal(UPSTREAM_BODY_TIMEOUT_MS, 1500);
+    expect(UPSTREAM_IDLE_TIMEOUT_MS).toBe(250);
+    expect(UPSTREAM_BODY_TIMEOUT_MS).toBe(1500);
 });
 
 test('a slow download that keeps moving completes', async () => {
     // It takes several times the header deadline in all. A single timeout used to
     // cover the whole of it, and abandoned it.
     const data = await xtremioGet(cfg, 'slow_steady', {}, { timeoutMs: 300 });
-    assert.equal(data.length, 6);
+    expect(data.length).toBe(6);
 });
 
 test('a download that stalls is abandoned at the idle deadline, and says so', async () => {
     const started = Date.now();
-    await assert.rejects(
-        () => xtremioGet(cfg, 'stalled', {}, { timeoutMs: 300 }),
-        /timed out waiting for the next chunk after 250 ms/
-    );
-    assert.ok(Date.now() - started < UPSTREAM_BODY_TIMEOUT_MS, 'long before the overall deadline');
+    await expect(xtremioGet(cfg, 'stalled', {}, { timeoutMs: 300 })).rejects.toThrow(/timed out waiting for the next chunk after 250 ms/);
+    expect(Date.now() - started, 'long before the overall deadline').toBeLessThan(UPSTREAM_BODY_TIMEOUT_MS);
 });
 
 test('a trickle that never finishes is abandoned at the overall deadline', async () => {
     const started = Date.now();
-    await assert.rejects(
-        () => xtremioGet(cfg, 'trickle', {}, { timeoutMs: 300 }),
-        /timed out waiting for the whole response after 1500 ms/
-    );
+    await expect(xtremioGet(cfg, 'trickle', {}, { timeoutMs: 300 })).rejects.toThrow(/timed out waiting for the whole response after 1500 ms/);
     const elapsed = Date.now() - started;
-    assert.ok(elapsed >= UPSTREAM_BODY_TIMEOUT_MS - 100, `gave up after only ${elapsed} ms`);
+    expect(elapsed, `gave up after only ${elapsed} ms`).toBeGreaterThanOrEqual(UPSTREAM_BODY_TIMEOUT_MS - 100);
 });
 
 test('headers that never come are abandoned at the header deadline', async () => {
     const started = Date.now();
-    await assert.rejects(
-        () => xtremioGet(cfg, 'no_headers', {}, { timeoutMs: 300 }),
-        /timed out waiting for headers after 300 ms/
-    );
-    assert.ok(Date.now() - started < UPSTREAM_BODY_TIMEOUT_MS);
+    await expect(xtremioGet(cfg, 'no_headers', {}, { timeoutMs: 300 })).rejects.toThrow(/timed out waiting for headers after 300 ms/);
+    expect(Date.now() - started).toBeLessThan(UPSTREAM_BODY_TIMEOUT_MS);
 });

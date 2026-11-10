@@ -10,9 +10,6 @@
 process.env.CONFIG_SECRET = 'test-secret-for-unit-tests';
 process.env.ALLOW_PRIVATE_NETWORKS = 'true';
 
-const test = require('node:test');
-const assert = require('node:assert');
-
 const {
     app,
     encodeConfig,
@@ -31,7 +28,7 @@ const {
     liveStreamsCache,
     getAllVodStreams,
     getAllSeriesStreams
-} = require('../index.js');
+} = require('./support/internals.js');
 
 const realFetch = global.fetch;
 
@@ -97,12 +94,12 @@ function clearCaches() {
 let server;
 let base;
 
-test.before(async () => {
+beforeAll(async () => {
     await new Promise(resolve => { server = app.listen(0, '127.0.0.1', resolve); });
     base = `http://127.0.0.1:${server.address().port}`;
 });
 
-test.after(async () => {
+afterAll(async () => {
     global.fetch = realFetch;
     await new Promise(resolve => server.close(resolve));
 });
@@ -120,12 +117,12 @@ async function getCatalog(type, id, extra) {
 // --- the table ------------------------------------------------------------
 
 test('parseCatalogId routes every catalog the manifest declares', () => {
-    assert.deepEqual(parseCatalogId('xtremio_live'), { kind: 'live', variant: null, search: false });
-    assert.deepEqual(parseCatalogId('xtremio_movies_new'), { kind: 'movies', variant: 'new', search: false });
-    assert.deepEqual(parseCatalogId('xtremio_series_featured'), { kind: 'series', variant: 'featured', search: false });
-    assert.deepEqual(parseCatalogId('xtremio_search_movies'), { kind: 'movies', variant: null, search: true });
-    assert.deepEqual(parseCatalogId('xtremio_search_series'), { kind: 'series', variant: null, search: true });
-    assert.equal(parseCatalogId('nope'), null);
+    expect(parseCatalogId('xtremio_live')).toStrictEqual({ kind: 'live', variant: null, search: false });
+    expect(parseCatalogId('xtremio_movies_new')).toStrictEqual({ kind: 'movies', variant: 'new', search: false });
+    expect(parseCatalogId('xtremio_series_featured')).toStrictEqual({ kind: 'series', variant: 'featured', search: false });
+    expect(parseCatalogId('xtremio_search_movies')).toStrictEqual({ kind: 'movies', variant: null, search: true });
+    expect(parseCatalogId('xtremio_search_series')).toStrictEqual({ kind: 'series', variant: null, search: true });
+    expect(parseCatalogId('nope')).toBeNull();
 });
 
 test('every catalog the manifest declares is routable, and vice versa', async () => {
@@ -133,48 +130,50 @@ test('every catalog the manifest declares is routable, and vice versa', async ()
     // is what stops one drifting from the other.
     const manifest = await getManifest({ ...CFG_ARGS });
     const declared = manifest.catalogs.map(c => c.id);
-    assert.ok(declared.length >= 9, `expected the full catalog list, got ${declared.length}`);
+    expect(declared.length, `expected the full catalog list, got ${declared.length}`).toBeGreaterThanOrEqual(9);
     for (const id of declared) {
         const route = parseCatalogId(id);
-        assert.ok(route, `manifest declares ${id} but parseCatalogId does not route it`);
-        assert.ok(CATALOG_KINDS[route.kind], `${id} routes to unknown kind ${route.kind}`);
+        expect(route, `manifest declares ${id} but parseCatalogId does not route it`).toBeTruthy();
+        expect(CATALOG_KINDS[route.kind], `${id} routes to unknown kind ${route.kind}`).toBeTruthy();
     }
 });
 
 test('each kind agrees with the manifest on its id prefix and meta type', async () => {
     const manifest = await getManifest(null);
     for (const [name, kind] of Object.entries(CATALOG_KINDS)) {
-        assert.ok(manifest.idPrefixes.includes(kind.idPrefix), `${name}: ${kind.idPrefix} missing from idPrefixes`);
-        assert.ok(manifest.types.includes(kind.metaType), `${name}: ${kind.metaType} missing from types`);
+        expect(manifest.idPrefixes, `${name}: ${kind.idPrefix} missing from idPrefixes`).toContain(kind.idPrefix);
+        expect(manifest.types, `${name}: ${kind.metaType} missing from types`).toContain(kind.metaType);
     }
 });
 
 test('the manifest version is the package version', async () => {
     // It used to be a second hand-maintained copy of the same string.
     const manifest = await getManifest(null);
-    assert.equal(manifest.version, require('../package.json').version);
+    expect(manifest.version).toBe(require('../package.json').version);
 });
 
 test('toCatalogMetas maps each kind onto its own fields', () => {
-    assert.deepEqual(toCatalogMetas([MOVIES[0]], CATALOG_KINDS.movies), [{
+    expect(toCatalogMetas([MOVIES[0]], CATALOG_KINDS.movies)).toStrictEqual([{
         id: 'xtremio_movie_101', type: 'XT-Movies', name: 'Alpha', poster: 'a.png', posterShape: 'poster'
     }]);
-    assert.deepEqual(toCatalogMetas([SERIES[0]], CATALOG_KINDS.series), [{
+    expect(toCatalogMetas([SERIES[0]], CATALOG_KINDS.series)).toStrictEqual([{
         id: 'xtremio_series_201', type: 'series', name: 'Sierra', poster: 's.png', posterShape: 'poster'
     }]);
-    assert.deepEqual(toCatalogMetas([LIVE[0]], CATALOG_KINDS.live), [{
+    expect(toCatalogMetas([LIVE[0]], CATALOG_KINDS.live)).toStrictEqual([{
         id: 'xtremio_live_301', type: 'Live TV', name: 'News One', poster: 'n1.png', posterShape: 'square'
     }]);
     // A missing poster field must be absent, not the empty string — Stremio
     // renders an empty poster as a broken image.
-    assert.equal(toCatalogMetas([MOVIES[2]], CATALOG_KINDS.movies)[0].poster, undefined);
+    expect(toCatalogMetas([MOVIES[2]], CATALOG_KINDS.movies)[0].poster).toBeUndefined();
 });
 
 test('filterByName is a no-op without a search term', () => {
-    assert.equal(filterByName(MOVIES, undefined), MOVIES);
-    assert.deepEqual(filterByName(MOVIES, 'alph').map(s => s.stream_id), [101]);
+    expect(filterByName(MOVIES, undefined)).toBe(MOVIES);
+    expect(filterByName(MOVIES, 'alph').map(s => s.stream_id)).toStrictEqual([101]);
     // Items with no name must not throw the whole catalog away.
-    assert.deepEqual(filterByName([{ stream_id: 1 }, { stream_id: 2, name: 'Hit' }], 'hit').map(s => s.stream_id), [2]);
+    expect(
+        filterByName([{ stream_id: 1 }, { stream_id: 2, name: 'Hit' }], 'hit').map(s => s.stream_id)
+    ).toStrictEqual([2]);
 });
 
 // Audit O1. The titles were lowercased on every search, so Stremio's global
@@ -185,10 +184,10 @@ test('filterByName is a no-op without a search term', () => {
 test('a memoised title does not change what a search matches', () => {
     // Same list, three searches: the first fills the memo as it scans, the rest
     // read it. Nothing about the result may depend on which one is running.
-    assert.deepEqual(filterByName(MOVIES, 'alph').map(s => s.stream_id), [101]);
-    assert.deepEqual(filterByName(MOVIES, 'brav').map(s => s.stream_id), [102]);
-    assert.deepEqual(filterByName(MOVIES, 'alph').map(s => s.stream_id), [101]);
-    assert.deepEqual(filterByName(MOVIES, 'a').map(s => s.stream_id), [101, 102, 103]);
+    expect(filterByName(MOVIES, 'alph').map(s => s.stream_id)).toStrictEqual([101]);
+    expect(filterByName(MOVIES, 'brav').map(s => s.stream_id)).toStrictEqual([102]);
+    expect(filterByName(MOVIES, 'alph').map(s => s.stream_id)).toStrictEqual([101]);
+    expect(filterByName(MOVIES, 'a').map(s => s.stream_id)).toStrictEqual([101, 102, 103]);
 });
 
 test('a limit still stops the scan, and the memo picks up where it left off', () => {
@@ -196,21 +195,21 @@ test('a limit still stops the scan, and the memo picks up where it left off', ()
     // the tail uncomputed. A later unlimited search over the same list must
     // still see every item, not only the prefix the first one warmed.
     const items = MOVIES.slice();
-    assert.deepEqual(filterByName(items, 'a', 1).map(s => s.stream_id), [101]);
-    assert.deepEqual(filterByName(items, 'a', 2).map(s => s.stream_id), [101, 102]);
-    assert.deepEqual(filterByName(items, 'a').map(s => s.stream_id), [101, 102, 103]);
-    assert.deepEqual(filterByName(items, 'charl').map(s => s.stream_id), [103]);
+    expect(filterByName(items, 'a', 1).map(s => s.stream_id)).toStrictEqual([101]);
+    expect(filterByName(items, 'a', 2).map(s => s.stream_id)).toStrictEqual([101, 102]);
+    expect(filterByName(items, 'a').map(s => s.stream_id)).toStrictEqual([101, 102, 103]);
+    expect(filterByName(items, 'charl').map(s => s.stream_id)).toStrictEqual([103]);
 });
 
 test('a refetched list is searched again rather than answered from the old titles', () => {
     // The memo is keyed by the array's identity, exactly as the sorted views
     // are: a refetch is a new array and cannot inherit the old one's answers.
     const first = [{ stream_id: 1, name: 'Old Name' }];
-    assert.deepEqual(filterByName(first, 'old').map(s => s.stream_id), [1]);
+    expect(filterByName(first, 'old').map(s => s.stream_id)).toStrictEqual([1]);
 
     const refetched = [{ stream_id: 1, name: 'New Name' }];
-    assert.deepEqual(filterByName(refetched, 'old').map(s => s.stream_id), []);
-    assert.deepEqual(filterByName(refetched, 'new').map(s => s.stream_id), [1]);
+    expect(filterByName(refetched, 'old').map(s => s.stream_id)).toStrictEqual([]);
+    expect(filterByName(refetched, 'new').map(s => s.stream_id)).toStrictEqual([1]);
 });
 
 test('a title the memo cannot use is remembered as empty, not recomputed as a miss', () => {
@@ -218,11 +217,11 @@ test('a title the memo cannot use is remembered as empty, not recomputed as a mi
     // Cached with || instead of ??, every such item would be lowercased again on
     // every search — the exact cost this memo exists to remove.
     const items = [{ stream_id: 1 }, { stream_id: 2, name: {} }, { stream_id: 3, name: 'Hit' }];
-    assert.deepEqual(filterByName(items, 'hit').map(s => s.stream_id), [3]);
-    assert.deepEqual(filterByName(items, 'hit').map(s => s.stream_id), [3]);
+    expect(filterByName(items, 'hit').map(s => s.stream_id)).toStrictEqual([3]);
+    expect(filterByName(items, 'hit').map(s => s.stream_id)).toStrictEqual([3]);
     // An empty search term is a no-op, so '' matching everything is not reachable
     // through the route; matching on a substring of nothing still finds nothing.
-    assert.deepEqual(filterByName(items, 'x').map(s => s.stream_id), []);
+    expect(filterByName(items, 'x').map(s => s.stream_id)).toStrictEqual([]);
 });
 
 // --- L3: the comparators are total ----------------------------------------
@@ -235,11 +234,13 @@ test('every comparator breaks ties by id, in each direction', () => {
         const high = { [idField]: 2, rating: 5, added: 100, last_modified: 100 };
         for (const variant of ['new', 'popular', 'featured']) {
             const cmp = catalogComparator(kind, variant);
-            assert.ok(cmp, `${kindName}/${variant} must have a comparator`);
-            assert.ok(cmp(low, high) !== 0, `${kindName}/${variant} leaves tied items unordered`);
+            expect(cmp, `${kindName}/${variant} must have a comparator`).toBeTruthy();
+            expect(cmp(low, high) !== 0, `${kindName}/${variant} leaves tied items unordered`).toBeTruthy();
             // Antisymmetry: without it, sort order still depends on input order.
-            assert.equal(Math.sign(cmp(low, high)), -Math.sign(cmp(high, low)),
-                `${kindName}/${variant} comparator is not antisymmetric`);
+            expect(
+                Math.sign(cmp(low, high)),
+                `${kindName}/${variant} comparator is not antisymmetric`
+            ).toBe(-Math.sign(cmp(high, low)));
         }
     }
 });
@@ -265,7 +266,10 @@ test('the featured shuffle is injective, so it is already a total order', () => 
                 const item = { [kind.idField]: id };
                 // Position in a total order is unique iff nothing compares equal to it.
                 const key = String(cmp(item, { [kind.idField]: 0 }));
-                assert.ok(!seen.has(key), `${kindName} day+${day}: id ${id} collides with an earlier id`);
+                expect(
+                    seen.has(key),
+                    `${kindName} day+${day}: id ${id} collides with an earlier id`
+                ).toBeFalsy();
                 seen.add(key);
             }
         }
@@ -294,10 +298,10 @@ test('the featured shuffle actually varies from period to period', () => {
         // are 0 except at period+1, which keeps 22 of 2000 (1.1%) because the seed
         // is XORed into ids that only occupy eleven bits, so adjacent seeds share
         // structure. 5% sits well clear of that and still fails loudly at 100%.
-        assert.ok(
-            held < items.length / 20,
+        expect(
+            held,
             `period+${periods} kept ${held}/${items.length} positions — the shuffle is not varying`
-        );
+        ).toBeLessThan(items.length / 20);
     }
 });
 
@@ -315,7 +319,10 @@ test('the featured shuffle holds still within a period', () => {
     const periodStart = Math.floor(Date.UTC(2026, 5, 15) / PERIOD_MS) * PERIOD_MS;
     const first = orderAt(periodStart);
     for (const offset of [1, 1000, 3600000, DAY_MS, PERIOD_MS - 1]) {
-        assert.deepEqual(orderAt(periodStart + offset), first, `order changed ${offset}ms into the same period`);
+        expect(
+            orderAt(periodStart + offset),
+            `order changed ${offset}ms into the same period`
+        ).toStrictEqual(first);
     }
 });
 
@@ -326,9 +333,11 @@ test('the featured shuffle holds still within a period', () => {
 // holds pages this server has already forgotten — it makes it rare.
 test('one featured order lasts much longer than a client caches a page (L14)', () => {
     const STREMIO_PAGE_STALENESS_MS = (300 + 600) * 1000;
-    assert.ok(PERIOD_MS > 6 * DAY_MS, `a featured order lasts only ${PERIOD_MS}ms`);
-    assert.ok(PERIOD_MS / STREMIO_PAGE_STALENESS_MS > 500,
-        'the window where two orders can be mixed is not small against the period');
+    expect(PERIOD_MS, `a featured order lasts only ${PERIOD_MS}ms`).toBeGreaterThan(6 * DAY_MS);
+    expect(
+        PERIOD_MS / STREMIO_PAGE_STALENESS_MS,
+        'the window where two orders can be mixed is not small against the period'
+    ).toBeGreaterThan(500);
 
     // And the comparator and the memo key read the same function, so a sorted
     // view cannot outlive the seed it was built from. Computing the period in two
@@ -336,16 +345,16 @@ test('one featured order lasts much longer than a client caches a page (L14)', (
     // Anchored on a boundary, or `t + PERIOD_MS - 1` lands in the next period and
     // the test asserts the opposite of what it means.
     const t = Math.floor(Date.UTC(2026, 5, 15) / PERIOD_MS) * PERIOD_MS;
-    assert.equal(featuredEpoch(t), Math.floor(t / PERIOD_MS));
-    assert.equal(featuredEpoch(t), featuredEpoch(t + PERIOD_MS - 1));
-    assert.notEqual(featuredEpoch(t), featuredEpoch(t + PERIOD_MS));
+    expect(featuredEpoch(t)).toBe(Math.floor(t / PERIOD_MS));
+    expect(featuredEpoch(t)).toBe(featuredEpoch(t + PERIOD_MS - 1));
+    expect(featuredEpoch(t)).not.toBe(featuredEpoch(t + PERIOD_MS));
 });
 
 test('an unknown variant sorts not at all, preserving upstream order', () => {
-    assert.equal(catalogComparator(CATALOG_KINDS.movies, 'bogus'), null);
-    assert.equal(catalogComparator(CATALOG_KINDS.live, null), null);
+    expect(catalogComparator(CATALOG_KINDS.movies, 'bogus')).toBeNull();
+    expect(catalogComparator(CATALOG_KINDS.live, null)).toBeNull();
     // Live has no recency field, so `new` must not invent one.
-    assert.equal(catalogComparator(CATALOG_KINDS.live, 'new'), null);
+    expect(catalogComparator(CATALOG_KINDS.live, 'new')).toBeNull();
 });
 
 test('a catalog returns the same page cold or warm, even with tied sort keys', async () => {
@@ -371,7 +380,12 @@ test('a catalog returns the same page cold or warm, even with tied sort keys', a
             await getAllSeriesStreams(cfg);
             const warm = await getCatalog(type, id, extra);
 
-            assert.deepEqual(cold, warm, `${id} ${extra || '(no extra)'} differs by cache state`);
+            // Status and body only: the headers include Date, which can tick
+            // over between the two requests.
+            expect(
+                { status: cold.status, body: cold.body },
+                `${id} ${extra || '(no extra)'} differs by cache state`
+            ).toStrictEqual({ status: warm.status, body: warm.body });
         }
     }
 });
@@ -399,7 +413,7 @@ test('a warm full-list cache serves per-genre catalogs without another fetch', a
 
     await getCatalog('XT-Movies', 'xtremio_movies_new', 'genre=Action');
     await getCatalog('XT-Series', 'xtremio_series_new', 'genre=Comedy');
-    assert.equal(streamFetches, 0, 'a warm full list must not trigger a per-category fetch');
+    expect(streamFetches, 'a warm full list must not trigger a per-category fetch').toBe(0);
 });
 
 test('live matches on category_id or category_name, and drops items with neither', async () => {
@@ -408,7 +422,7 @@ test('live matches on category_id or category_name, and drops items with neither
     stubProvider();
     clearCaches();
     const { body } = await getCatalog('Live TV', 'xtremio_live', 'genre=News');
-    assert.deepEqual(body.metas.map(m => m.id), ['xtremio_live_301', 'xtremio_live_302']);
+    expect(body.metas.map(m => m.id)).toStrictEqual(['xtremio_live_301', 'xtremio_live_302']);
 });
 
 test('an unresolvable genre returns empty rather than the first category', async () => {
@@ -416,7 +430,7 @@ test('an unresolvable genre returns empty rather than the first category', async
     clearCaches();
     for (const [type, id] of [['XT-Movies', 'xtremio_movies_new'], ['Live TV', 'xtremio_live']]) {
         const { body } = await getCatalog(type, id, 'genre=Nonexistent');
-        assert.deepEqual(body.metas, [], `${id} must not fall back to another genre`);
+        expect(body.metas, `${id} must not fall back to another genre`).toStrictEqual([]);
     }
 });
 
@@ -424,20 +438,20 @@ test('no genre falls back to the first category', async () => {
     stubProvider();
     clearCaches();
     const { body } = await getCatalog('XT-Movies', 'xtremio_movies_new');
-    assert.equal(body.metas.length, MOVIES.length);
+    expect(body.metas.length).toBe(MOVIES.length);
 });
 
 test('search catalogs need a term and search the whole account', async () => {
     stubProvider();
     clearCaches();
     // No term: the catalog is empty rather than dumping every title.
-    assert.deepEqual((await getCatalog('XT-Movies', 'xtremio_search_movies')).body.metas, []);
+    expect((await getCatalog('XT-Movies', 'xtremio_search_movies')).body.metas).toStrictEqual([]);
 
     const hit = await getCatalog('XT-Movies', 'xtremio_search_movies', 'search=brav');
-    assert.deepEqual(hit.body.metas.map(m => m.id), ['xtremio_movie_102']);
+    expect(hit.body.metas.map(m => m.id)).toStrictEqual(['xtremio_movie_102']);
 
     const series = await getCatalog('XT-Series', 'xtremio_search_series', 'search=tango');
-    assert.deepEqual(series.body.metas.map(m => m.id), ['xtremio_series_202']);
+    expect(series.body.metas.map(m => m.id)).toStrictEqual(['xtremio_series_202']);
 });
 
 test('a negative skip cannot page backwards into the list tail', async () => {
@@ -449,8 +463,8 @@ test('a negative skip cannot page backwards into the list tail', async () => {
     clearCaches();
     const negative = await getCatalog('XT-Movies', 'xtremio_movies_new', 'skip=-2');
     const zero = await getCatalog('XT-Movies', 'xtremio_movies_new', 'skip=0');
-    assert.equal(zero.body.metas.length, MOVIES.length);
-    assert.deepEqual(negative.body.metas, zero.body.metas);
+    expect(zero.body.metas.length).toBe(MOVIES.length);
+    expect(negative.body.metas).toStrictEqual(zero.body.metas);
 });
 
 test('an unknown catalog id returns empty without calling upstream', async () => {
@@ -460,9 +474,9 @@ test('an unknown catalog id returns empty without calling upstream', async () =>
     const stubbed = global.fetch;
     global.fetch = (...a) => { calls++; return stubbed(...a); };
     const { status, body } = await getCatalog('XT-Movies', 'xtremio_not_a_catalog');
-    assert.equal(status, 200);
-    assert.deepEqual(body, { metas: [] });
-    assert.equal(calls, 0);
+    expect(status).toBe(200);
+    expect(body).toStrictEqual({ metas: [] });
+    expect(calls).toBe(0);
 });
 
 test('caching hints are attached to every catalog response', async () => {
@@ -474,18 +488,18 @@ test('caching hints are attached to every catalog response', async () => {
         ['XT-Series', 'xtremio_search_series', 'search=tango']
     ]) {
         const { body, headers } = await getCatalog(type, id, extra);
-        assert.equal(body.cacheMaxAge, 300, `${id} lost its cacheMaxAge`);
-        assert.equal(body.staleRevalidate, 600, `${id} lost its staleRevalidate`);
+        expect(body.cacheMaxAge, `${id} lost its cacheMaxAge`).toBe(300);
+        expect(body.staleRevalidate, `${id} lost its staleRevalidate`).toBe(600);
 
         // The body fields describe a Cache-Control header that this server has to
         // send itself. stremio-addon-sdk derives one from them; a hand-rolled
         // server that emits only the fields gives the client nothing to act on.
         const cc = headers.get('cache-control');
-        assert.ok(cc, `${id} sent no Cache-Control`);
-        assert.match(cc, /max-age=300/, `${id}: header disagrees with cacheMaxAge`);
-        assert.match(cc, /stale-while-revalidate=600/, `${id}: header disagrees with staleRevalidate`);
+        expect(cc, `${id} sent no Cache-Control`).toBeTruthy();
+        expect(cc, `${id}: header disagrees with cacheMaxAge`).toMatch(/max-age=300/);
+        expect(cc, `${id}: header disagrees with staleRevalidate`).toMatch(/stale-while-revalidate=600/);
         // Account-specific content behind a bearer token in the path.
-        assert.match(cc, /private/, `${id} must not be marked public`);
+        expect(cc, `${id} must not be marked public`).toMatch(/private/);
     }
 });
 
@@ -503,8 +517,8 @@ test('a degraded response is never cacheable', async () => {
     ];
     for (const [type, id, extra] of cases) {
         const { headers, body } = await getCatalog(type, id, extra);
-        assert.deepEqual(body.metas, [], `${id} should have degraded to an empty shelf`);
-        assert.equal(headers.get('cache-control'), 'no-store', `${id} left a degraded answer cacheable`);
+        expect(body.metas, `${id} should have degraded to an empty shelf`).toStrictEqual([]);
+        expect(headers.get('cache-control'), `${id} left a degraded answer cacheable`).toBe('no-store');
     }
 });
 
@@ -528,9 +542,8 @@ test('search results are ordered, so pagination survives a refetch', async () =>
     };
     const second = await getCatalog('XT-Series', 'xtremio_search_series', 'search=a');
 
-    assert.deepEqual(
+    expect(
         second.body.metas.map(m => m.id),
-        first.body.metas.map(m => m.id),
         'the same search returned a different order after a refetch'
-    );
+    ).toStrictEqual(first.body.metas.map(m => m.id));
 });

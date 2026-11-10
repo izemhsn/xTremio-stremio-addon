@@ -10,9 +10,6 @@
 // with it the resolver this file is about.
 process.env.CONFIG_SECRET = 'test-secret-for-unit-tests';
 
-const test = require('node:test');
-const assert = require('node:assert');
-
 const {
     resolveHostAddresses,
     assertSafeOutboundUrl,
@@ -22,7 +19,7 @@ const {
     DNS_SERVERS,
     parseDnsServers,
     makeDnsResolver
-} = require('../index.js');
+} = require('./support/internals.js');
 
 // Stands in for dns.Resolver: answers per family, or never answers at all.
 function fakeResolver({ v4 = [], v6 = [], hang = false } = {}) {
@@ -49,42 +46,43 @@ test('a nameserver that never answers is abandoned at the deadline, and cancelle
     const { state, makeResolver } = fakeResolver({ hang: true });
     const started = Date.now();
 
-    await assert.rejects(
-        () => resolveHostAddresses('dead.test', { timeoutMs: 100, makeResolver }),
-        (e) => e.code === 'ETIMEOUT'
-    );
+    await expect(resolveHostAddresses('dead.test', { timeoutMs: 100, makeResolver })).rejects.toMatchObject({
+        code: 'ETIMEOUT'
+    });
 
     const elapsed = Date.now() - started;
-    assert.ok(elapsed < 1000, `gave up after ${elapsed} ms`);
-    assert.ok(state.cancelled, 'the lookup was cancelled, not left running');
+    expect(elapsed, `gave up after ${elapsed} ms`).toBeLessThan(1000);
+    expect(state.cancelled, 'the lookup was cancelled, not left running').toBeTruthy();
 });
 
 test('the default deadline is finite', () => {
-    assert.ok(DNS_TIMEOUT_MS >= 500 && DNS_TIMEOUT_MS <= 30000, `DNS_TIMEOUT_MS is ${DNS_TIMEOUT_MS}`);
+    expect(
+        DNS_TIMEOUT_MS >= 500 && DNS_TIMEOUT_MS <= 30000,
+        `DNS_TIMEOUT_MS is ${DNS_TIMEOUT_MS}`
+    ).toBeTruthy();
 });
 
 test('an IPv4-only host resolves', async () => {
     const { makeResolver } = fakeResolver({ v4: ['93.184.216.34'], v6: failure('ENODATA') });
-    assert.deepEqual(await resolveHostAddresses('v4.test', { makeResolver }), [{ address: '93.184.216.34', family: 4 }]);
+    expect(await resolveHostAddresses('v4.test', { makeResolver })).toStrictEqual([{ address: '93.184.216.34', family: 4 }]);
 });
 
 test('an IPv6-only host resolves', async () => {
     const { makeResolver } = fakeResolver({ v4: failure('ENODATA'), v6: ['2606:2800:220:1::1'] });
-    assert.deepEqual(await resolveHostAddresses('v6.test', { makeResolver }), [{ address: '2606:2800:220:1::1', family: 6 }]);
+    expect(await resolveHostAddresses('v6.test', { makeResolver })).toStrictEqual([{ address: '2606:2800:220:1::1', family: 6 }]);
 });
 
 test('both families are returned together', async () => {
     const { makeResolver } = fakeResolver({ v4: ['93.184.216.34'], v6: ['2606:2800:220:1::1'] });
     const addresses = await resolveHostAddresses('dual.test', { makeResolver });
-    assert.deepEqual(addresses.map(a => a.family).sort(), [4, 6]);
+    expect(addresses.map(a => a.family).sort()).toStrictEqual([4, 6]);
 });
 
 test('a host with no addresses reports why, not just that one family was empty', async () => {
     const { makeResolver } = fakeResolver({ v4: failure('ENOTFOUND'), v6: failure('ENODATA') });
-    await assert.rejects(
-        () => resolveHostAddresses('gone.test', { makeResolver }),
-        (e) => e.code === 'ENOTFOUND'
-    );
+    await expect(resolveHostAddresses('gone.test', { makeResolver })).rejects.toMatchObject({
+        code: 'ENOTFOUND'
+    });
 });
 
 // --- falling back when c-ares itself is unusable ----------------------------------
@@ -117,14 +115,11 @@ test('an unreachable nameserver falls back to the OS resolver, with one warning'
     const { warnings, log } = quietLog();
 
     for (let i = 0; i < 2; i++) {
-        assert.deepEqual(
-            await resolveHostAddresses('panel.test', { makeResolver, lookup, log }),
-            [{ address: '93.184.216.34', family: 4 }]
-        );
+        expect(await resolveHostAddresses('panel.test', { makeResolver, lookup, log })).toStrictEqual([{ address: '93.184.216.34', family: 4 }]);
     }
-    assert.deepEqual(calls, ['panel.test', 'panel.test']);
-    assert.equal(warnings.length, 1, 'the operator hears it once, not on every lookup');
-    assert.match(warnings[0], /ECONNREFUSED/);
+    expect(calls).toStrictEqual(['panel.test', 'panel.test']);
+    expect(warnings.length, 'the operator hears it once, not on every lookup').toBe(1);
+    expect(warnings[0]).toMatch(/ECONNREFUSED/);
 });
 
 test('a bad name or a slow nameserver does not fall back', async () => {
@@ -133,27 +128,25 @@ test('a bad name or a slow nameserver does not fall back', async () => {
     const { log } = quietLog();
 
     const gone = countingLookup([{ address: '93.184.216.34', family: 4 }]);
-    await assert.rejects(
-        () => resolveHostAddresses('gone.test', {
-            makeResolver: fakeResolver({ v4: failure('ENOTFOUND'), v6: failure('ENODATA') }).makeResolver,
-            lookup: gone.lookup,
-            log
-        }),
-        (e) => e.code === 'ENOTFOUND'
-    );
-    assert.deepEqual(gone.calls, []);
+    await expect(resolveHostAddresses('gone.test', {
+        makeResolver: fakeResolver({ v4: failure('ENOTFOUND'), v6: failure('ENODATA') }).makeResolver,
+        lookup: gone.lookup,
+        log
+    })).rejects.toMatchObject({
+        code: 'ENOTFOUND'
+    });
+    expect(gone.calls).toStrictEqual([]);
 
     const slow = countingLookup([{ address: '93.184.216.34', family: 4 }]);
-    await assert.rejects(
-        () => resolveHostAddresses('dead.test', {
-            timeoutMs: 100,
-            makeResolver: fakeResolver({ hang: true }).makeResolver,
-            lookup: slow.lookup,
-            log
-        }),
-        (e) => e.code === 'ETIMEOUT'
-    );
-    assert.deepEqual(slow.calls, []);
+    await expect(resolveHostAddresses('dead.test', {
+        timeoutMs: 100,
+        makeResolver: fakeResolver({ hang: true }).makeResolver,
+        lookup: slow.lookup,
+        log
+    })).rejects.toMatchObject({
+        code: 'ETIMEOUT'
+    });
+    expect(slow.calls).toStrictEqual([]);
 });
 
 test('the fallback is held to the same deadline', async () => {
@@ -162,11 +155,12 @@ test('the fallback is held to the same deadline', async () => {
     const { log } = quietLog();
     const started = Date.now();
 
-    await assert.rejects(
-        () => resolveHostAddresses('stuck.test', { timeoutMs: 100, makeResolver, lookup, log }),
-        (e) => e.code === 'ETIMEOUT'
-    );
-    assert.ok(Date.now() - started < 1000);
+    await expect(
+        resolveHostAddresses('stuck.test', { timeoutMs: 100, makeResolver, lookup, log })
+    ).rejects.toMatchObject({
+        code: 'ETIMEOUT'
+    });
+    expect(Date.now() - started).toBeLessThan(1000);
 });
 
 // --- the SSRF check that uses it --------------------------------------------------
@@ -186,19 +180,20 @@ test('a host vetted within the pin window is not looked up again', async () => {
     await assertSafeOutboundUrl('http://cdn.reuse.test/b.ts', { resolve });
     await assertSafeOutboundUrl('https://cdn.reuse.test:8443/c.ts', { resolve });
 
-    assert.equal(lookups, 1);
-    assert.equal(dnsPins.get('cdn.reuse.test').expiresAt, expiresAt, 'reuse does not extend the pin');
+    expect(lookups).toBe(1);
+    expect(dnsPins.get('cdn.reuse.test').expiresAt, 'reuse does not extend the pin').toBe(expiresAt);
 
     dnsPins.get('cdn.reuse.test').expiresAt = Date.now() - 1;
     await assertSafeOutboundUrl('http://cdn.reuse.test/d.ts', { resolve });
-    assert.equal(lookups, 2, 'an expired pin is looked up again');
+    expect(lookups, 'an expired pin is looked up again').toBe(2);
 });
 
 test('an address the resolver returns is still vetted', async () => {
-    await assert.rejects(
-        () => assertSafeOutboundUrl('http://sneaky.test/', { resolve: async () => [{ address: '10.0.0.5', family: 4 }] }),
-        (e) => e.code === 'OUTBOUND_BLOCKED'
-    );
+    await expect(
+        assertSafeOutboundUrl('http://sneaky.test/', { resolve: async () => [{ address: '10.0.0.5', family: 4 }] })
+    ).rejects.toMatchObject({
+        code: 'OUTBOUND_BLOCKED'
+    });
 });
 
 test('localhost names are refused by name, without a lookup', async () => {
@@ -210,9 +205,11 @@ test('localhost names are refused by name, without a lookup', async () => {
         return [];
     };
     for (const url of ['http://localhost:8080/', 'http://api.localhost/', 'http://LOCALHOST./']) {
-        await assert.rejects(() => assertSafeOutboundUrl(url, { resolve }), (e) => e.code === 'OUTBOUND_BLOCKED', url);
+        await expect(assertSafeOutboundUrl(url, { resolve }), url).rejects.toMatchObject({
+            code: 'OUTBOUND_BLOCKED'
+        });
     }
-    assert.equal(lookups, 0);
+    expect(lookups).toBe(0);
 });
 
 // --- DNS_SERVERS -----------------------------------------------------------
@@ -225,14 +222,15 @@ test('localhost names are refused by name, without a lookup', async () => {
 
 test('DNS_SERVERS accepts every spelling c-ares does', () => {
     const quiet = { warn() {} };
-    assert.deepEqual(
-        parseDnsServers('8.8.8.8, 1.1.1.1:53 ,2001:4860:4860::8888,[2001:4860:4860::8844]:53', 'DNS_SERVERS', quiet),
+    expect(
+        parseDnsServers('8.8.8.8, 1.1.1.1:53 ,2001:4860:4860::8888,[2001:4860:4860::8844]:53', 'DNS_SERVERS', quiet)
+    ).toStrictEqual(
         ['8.8.8.8', '1.1.1.1:53', '2001:4860:4860::8888', '[2001:4860:4860::8844]:53']
     );
     // Validation is c-ares' own, not a regular expression of ours, so the rule
     // cannot drift from what setServers will actually take.
-    assert.deepEqual(parseDnsServers('', 'DNS_SERVERS', quiet), []);
-    assert.deepEqual(parseDnsServers(undefined, 'DNS_SERVERS', quiet), []);
+    expect(parseDnsServers('', 'DNS_SERVERS', quiet)).toStrictEqual([]);
+    expect(parseDnsServers(undefined, 'DNS_SERVERS', quiet)).toStrictEqual([]);
 });
 
 test('a bad DNS_SERVERS entry is dropped with a warning, not taken and not fatal', () => {
@@ -241,22 +239,22 @@ test('a bad DNS_SERVERS entry is dropped with a warning, not taken and not fatal
     // outage. The good entries must survive the bad one.
     const lines = [];
     const log = { warn: (m) => lines.push(m) };
-    assert.deepEqual(
-        parseDnsServers('8.8.8.8,nonsense,1.2.3.4.5,1.1.1.1', 'DNS_SERVERS', log),
-        ['8.8.8.8', '1.1.1.1']
-    );
-    assert.equal(lines.length, 2, `expected one warning per bad entry, got ${JSON.stringify(lines)}`);
-    assert.match(lines[0], /DNS_SERVERS: ignoring "nonsense"/);
-    assert.match(lines[1], /"1\.2\.3\.4\.5"/);
+    expect(parseDnsServers('8.8.8.8,nonsense,1.2.3.4.5,1.1.1.1', 'DNS_SERVERS', log)).toStrictEqual(['8.8.8.8', '1.1.1.1']);
+    expect(
+        lines.length,
+        `expected one warning per bad entry, got ${JSON.stringify(lines)}`
+    ).toBe(2);
+    expect(lines[0]).toMatch(/DNS_SERVERS: ignoring "nonsense"/);
+    expect(lines[1]).toMatch(/"1\.2\.3\.4\.5"/);
 });
 
 test('makeDnsResolver points the resolver at the configured servers', () => {
-    assert.deepEqual(makeDnsResolver(DNS_TIMEOUT_MS, ['8.8.8.8', '1.1.1.1']).getServers(), ['8.8.8.8', '1.1.1.1']);
+    expect(makeDnsResolver(DNS_TIMEOUT_MS, ['8.8.8.8', '1.1.1.1']).getServers()).toStrictEqual(['8.8.8.8', '1.1.1.1']);
 
     // Empty means leave c-ares to its own discovery, which is the default and what
     // works on most hosts — not "no servers", which would break every lookup.
-    assert.ok(makeDnsResolver(DNS_TIMEOUT_MS, []).getServers().length >= 0);
-    assert.deepEqual(DNS_SERVERS, [], 'the suite runs with DNS_SERVERS unset');
+    expect(makeDnsResolver(DNS_TIMEOUT_MS, []).getServers().length).toBeGreaterThanOrEqual(0);
+    expect(DNS_SERVERS, 'the suite runs with DNS_SERVERS unset').toStrictEqual([]);
 });
 
 test('every resolver this module makes goes through makeDnsResolver', () => {
@@ -264,6 +262,8 @@ test('every resolver this module makes goes through makeDnsResolver', () => {
     // not having it: the host it exists for would still fail, intermittently.
     const src = require('node:fs').readFileSync(require.resolve('../src/net/safe-fetch.js'), 'utf8');
     const constructions = src.match(/new dns\.Resolver\(/g) || [];
-    assert.equal(constructions.length, 2,
-        'expected exactly two: makeDnsResolver itself, and the validation probe in parseDnsServers');
+    expect(
+        constructions.length,
+        'expected exactly two: makeDnsResolver itself, and the validation probe in parseDnsServers'
+    ).toBe(2);
 });

@@ -13,9 +13,6 @@
 process.env.CONFIG_SECRET = 'test-secret-for-unit-tests';
 process.env.ALLOW_PRIVATE_NETWORKS = 'true';
 
-const test = require('node:test');
-const assert = require('node:assert');
-
 const {
     BoundedMap,
     estimateBytes,
@@ -24,7 +21,7 @@ const {
     CACHE_TTL,
     CACHE_MAX_STREAM_BYTES,
     CACHE_MAX_STREAM_ACCOUNTS
-} = require('../index.js');
+} = require('./support/internals.js');
 
 const entry = (bytes, extra = {}) => ({ data: null, bytes, ...extra });
 
@@ -34,13 +31,13 @@ test('entries are evicted on total bytes, not just entry count', () => {
     const map = new BoundedMap({ maxEntries: 100, maxBytes: 1000 });
     map.set('a', entry(400));
     map.set('b', entry(400));
-    assert.equal(map.size, 2, 'under budget, both stay');
+    expect(map.size, 'under budget, both stay').toBe(2);
 
     map.set('c', entry(400));
-    assert.equal(map.size, 2, 'the oldest went to get back under 1000 bytes');
-    assert.ok(!map.has('a'));
-    assert.ok(map.has('b') && map.has('c'));
-    assert.equal(map.totalBytes, 800);
+    expect(map.size, 'the oldest went to get back under 1000 bytes').toBe(2);
+    expect(map.has('a')).toBeFalsy();
+    expect(map.has('b') && map.has('c')).toBeTruthy();
+    expect(map.totalBytes).toBe(800);
 });
 
 test('the entry-count bound still applies on its own', () => {
@@ -48,7 +45,7 @@ test('the entry-count bound still applies on its own', () => {
     map.set('a', entry(1));
     map.set('b', entry(1));
     map.set('c', entry(1));
-    assert.deepEqual([...map.keys()], ['b', 'c']);
+    expect([...map.keys()]).toStrictEqual(['b', 'c']);
 });
 
 test('an entry larger than the whole budget is still cached', () => {
@@ -56,9 +53,9 @@ test('an entry larger than the whole budget is still cached', () => {
     // being over budget with one entry.
     const map = new BoundedMap({ maxEntries: 10, maxBytes: 1000 });
     map.set('huge', entry(5000));
-    assert.equal(map.size, 1);
-    assert.equal(map.get('huge').bytes, 5000);
-    assert.ok(map.overBudget(), 'and it reports being over rather than pretending');
+    expect(map.size).toBe(1);
+    expect(map.get('huge').bytes).toBe(5000);
+    expect(map.overBudget(), 'and it reports being over rather than pretending').toBeTruthy();
 });
 
 test('the byte total tracks replacement, deletion, sweeping and clearing', () => {
@@ -67,21 +64,21 @@ test('the byte total tracks replacement, deletion, sweeping and clearing', () =>
     const map = new BoundedMap({ maxEntries: 10, maxBytes: 10 ** 9, maxAgeMs: 1000 });
     map.set('a', entry(100, { ts: Date.now() }));
     map.set('b', entry(200, { ts: Date.now() - 5000 }));
-    assert.equal(map.totalBytes, 300);
+    expect(map.totalBytes).toBe(300);
 
     map.set('a', entry(50, { ts: Date.now() }));
-    assert.equal(map.totalBytes, 250, 'replacing an entry replaces its weight');
+    expect(map.totalBytes, 'replacing an entry replaces its weight').toBe(250);
 
-    assert.equal(map.sweep(), 1, 'b was past maxAgeMs');
-    assert.equal(map.totalBytes, 50);
+    expect(map.sweep(), 'b was past maxAgeMs').toBe(1);
+    expect(map.totalBytes).toBe(50);
 
     map.delete('a');
-    assert.equal(map.totalBytes, 0);
+    expect(map.totalBytes).toBe(0);
 
     map.set('c', entry(70, { ts: Date.now() }));
     map.clear();
-    assert.equal(map.totalBytes, 0);
-    assert.equal(map.size, 0);
+    expect(map.totalBytes).toBe(0);
+    expect(map.size).toBe(0);
 });
 
 test('an LRU touch does not disturb the byte total', () => {
@@ -92,8 +89,8 @@ test('an LRU touch does not disturb the byte total', () => {
     map.set('b', entry(200));
     map.get('a');
     map.get('a');
-    assert.equal(map.totalBytes, 300);
-    assert.deepEqual([...map.keys()], ['b', 'a'], 'and the touch still reorders');
+    expect(map.totalBytes).toBe(300);
+    expect([...map.keys()], 'and the touch still reorders').toStrictEqual(['b', 'a']);
 });
 
 // --- the thrashing signal --------------------------------------------------
@@ -108,9 +105,9 @@ test('evicting a live entry warns; evicting an expired one does not', () => {
 
     map.set('fresh', entry(1, { ts: Date.now() }));
     map.set('next', entry(1, { ts: Date.now() }));
-    assert.equal(warnings.length, 1, 'a within-TTL eviction is the "bounds too tight" signal');
-    assert.equal(warnings[0].key, 'fresh');
-    assert.equal(warnings[0].reason, 'entry count');
+    expect(warnings.length, 'a within-TTL eviction is the "bounds too tight" signal').toBe(1);
+    expect(warnings[0].key).toBe('fresh');
+    expect(warnings[0].reason).toBe('entry count');
 
     // And the real cache's own handler, not a copy of its rule: an entry
     // already past its TTL leaving is routine and must stay silent.
@@ -119,12 +116,12 @@ test('evicting a live entry warns; evicting an expired one does not', () => {
     console.warn = (msg) => logged.push(msg);
     try {
         vodStreamsCache.map.onEvict('k', { ts: Date.now() - CACHE_TTL - 1, bytes: 1 }, 'entry count');
-        assert.deepEqual(logged, [], 'an expired entry leaving is not a problem to report');
+        expect(logged, 'an expired entry leaving is not a problem to report').toStrictEqual([]);
 
         vodStreamsCache.map.onEvict('k', { ts: Date.now(), bytes: 12 * 1024 * 1024 }, 'byte budget');
-        assert.equal(logged.length, 1);
-        assert.match(logged[0], /evicted a live stream list on byte budget \(12 MB\)/);
-        assert.match(logged[0], /CACHE_MAX_STREAM_ACCOUNTS|CACHE_MAX_STREAM_MB/, 'says what to raise');
+        expect(logged.length).toBe(1);
+        expect(logged[0]).toMatch(/evicted a live stream list on byte budget \(12 MB\)/);
+        expect(logged[0], 'says what to raise').toMatch(/CACHE_MAX_STREAM_ACCOUNTS|CACHE_MAX_STREAM_MB/);
     } finally {
         console.warn = realWarn;
     }
@@ -139,13 +136,13 @@ test('onEvict reports which bound did it', () => {
     });
     map.set('a', entry(60));
     map.set('b', entry(60));
-    assert.deepEqual(reasons, ['byte budget']);
+    expect(reasons).toStrictEqual(['byte budget']);
 });
 
 test('the real stream cache is wired to both bounds', () => {
-    assert.equal(vodStreamsCache.map.maxEntries, CACHE_MAX_STREAM_ACCOUNTS);
-    assert.equal(vodStreamsCache.map.maxBytes, CACHE_MAX_STREAM_BYTES);
-    assert.equal(typeof vodStreamsCache.map.onEvict, 'function');
+    expect(vodStreamsCache.map.maxEntries).toBe(CACHE_MAX_STREAM_ACCOUNTS);
+    expect(vodStreamsCache.map.maxBytes).toBe(CACHE_MAX_STREAM_BYTES);
+    expect(typeof vodStreamsCache.map.onEvict).toBe('function');
 });
 
 test('a cached stream list is weighed when it is stored', () => {
@@ -156,8 +153,8 @@ test('a cached stream list is weighed when it is stored', () => {
 
     vodStreamsCache.set(cfg, items);
     const stored = [...vodStreamsCache.map.values()][0];
-    assert.ok(stored.bytes > 1000, `expected a real weight, got ${stored.bytes}`);
-    assert.equal(vodStreamsCache.map.totalBytes, stored.bytes);
+    expect(stored.bytes, `expected a real weight, got ${stored.bytes}`).toBeGreaterThan(1000);
+    expect(vodStreamsCache.map.totalBytes).toBe(stored.bytes);
     vodStreamsCache.map.clear();
 });
 
@@ -174,7 +171,10 @@ test('estimateBytes samples a list to within a few percent of weighing all of it
     const whole = weighJson(JSON.stringify(items));
     const estimated = estimateBytes(items);
     const error = Math.abs(estimated - whole) / whole;
-    assert.ok(error < 0.05, `estimate ${estimated} vs whole list ${Math.round(whole)} (${(error * 100).toFixed(1)}% off)`);
+    expect(
+        error,
+        `estimate ${estimated} vs whole list ${Math.round(whole)} (${(error * 100).toFixed(1)}% off)`
+    ).toBeLessThan(0.05);
 });
 
 test('a list of empty objects is weighed by what it occupies, not what it serializes to', () => {
@@ -185,21 +185,21 @@ test('a list of empty objects is weighed by what it occupies, not what it serial
     const items = Array.from({ length: 100000 }, () => ({}));
     const serialized = JSON.stringify(items).length;
     const weighed = estimateBytes(items);
-    assert.ok(weighed >= 20 * serialized, `weighed ${weighed} for ${serialized} bytes of text`);
+    expect(weighed, `weighed ${weighed} for ${serialized} bytes of text`).toBeGreaterThanOrEqual(20 * serialized);
 });
 
 test('estimateBytes handles the shapes that are not a big homogeneous list', () => {
-    assert.equal(estimateBytes([]), 0);
+    expect(estimateBytes([])).toBe(0);
     // Was 4, the length of "null". Weighed as a graph it is four characters of
     // text at half a byte each, and no structure.
-    assert.equal(estimateBytes(null), 2);
-    assert.ok(estimateBytes({ a: 'x'.repeat(100) }) > 100);
+    expect(estimateBytes(null)).toBe(2);
+    expect(estimateBytes({ a: 'x'.repeat(100) })).toBeGreaterThan(100);
 
     // A circular item cannot be measured; it must not throw or poison the total.
     const circular = { name: 'x' };
     circular.self = circular;
-    assert.equal(typeof estimateBytes([circular]), 'number');
-    assert.equal(typeof estimateBytes(circular), 'number');
+    expect(typeof estimateBytes([circular])).toBe('number');
+    expect(typeof estimateBytes(circular)).toBe('number');
 });
 
 test('estimateBytes is cheap on a large list', () => {
@@ -209,5 +209,5 @@ test('estimateBytes is cheap on a large list', () => {
     const started = process.hrtime.bigint();
     estimateBytes(big);
     const ms = Number(process.hrtime.bigint() - started) / 1e6;
-    assert.ok(ms < 50, `estimating took ${ms.toFixed(1)}ms`);
+    expect(ms, `estimating took ${ms.toFixed(1)}ms`).toBeLessThan(50);
 });

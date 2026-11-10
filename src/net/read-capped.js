@@ -17,7 +17,7 @@
 // Only for discardBody, so that "every path that abandons a response cancels its
 // body" stays one implementation rather than a rule copied here. safe-fetch
 // requires nothing from this module, so the edge adds no cycle.
-const { discardBody } = require('../net/safe-fetch.js');
+const { discardBody } = require('./safe-fetch.js');
 
 // The upstream host is supplied by the user and reachable before any
 // authentication, so an unbounded res.json() lets a hostile or broken provider
@@ -54,7 +54,7 @@ async function readJsonCapped(res, label, maxBytes = MAX_UPSTREAM_BYTES, { onChu
     if (Number.isFinite(declared) && declared > maxBytes) {
         // Refused before a byte is read, which means the body is still pending:
         // cancel it, or undici keeps that connection out of its pool until the
-        // response is collected (audit F3). The two caps below already cancel
+        // response is collected. The two caps below already cancel
         // through the reader; this is the one exit that never takes one.
         discardBody(res);
         throw new Error(`${label} response too large: ${declared} bytes exceeds ${maxBytes}`);
@@ -181,8 +181,6 @@ async function readTextCapped(body, maxBytes) {
 module.exports = {
     MAX_UPSTREAM_BYTES,
     MAX_PARSED_TO_BODY_RATIO,
-    PARSED_WEIGHT,
-    parsedSizeEstimates,
     readJsonCapped,
     readTextCapped,
     estimateBytes,

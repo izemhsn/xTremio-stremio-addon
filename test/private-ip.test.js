@@ -12,10 +12,7 @@
 // filter between a hostile provider and the internal network.
 process.env.CONFIG_SECRET = 'test-secret-for-unit-tests';
 
-const test = require('node:test');
-const assert = require('node:assert');
-
-const { isPrivateIp, addressBucket } = require('../index.js');
+const { isPrivateIp, addressBucket } = require('./support/internals.js');
 
 // --- what must be blocked --------------------------------------------------
 
@@ -35,7 +32,7 @@ test('IPv4 ranges that never belong on the public internet', () => {
         ['255.255.255.255', 'broadcast']
     ];
     for (const [ip, what] of blocked) {
-        assert.equal(isPrivateIp(ip), true, `${ip} (${what}) must be blocked`);
+        expect(isPrivateIp(ip), `${ip} (${what}) must be blocked`).toBe(true);
     }
 });
 
@@ -43,22 +40,22 @@ test('the two IPv4 ranges the old check missed', () => {
     // 192.0.0.0/24 is IETF protocol assignments; 198.18.0.0/15 is benchmarking.
     // Neither routes to anything a user's provider legitimately lives on.
     for (const ip of ['192.0.0.1', '192.0.0.255', '198.18.0.1', '198.19.255.255']) {
-        assert.equal(isPrivateIp(ip), true, `${ip} must be blocked`);
+        expect(isPrivateIp(ip), `${ip} must be blocked`).toBe(true);
     }
     // The neighbours stay reachable, so the new masks are not too wide.
     for (const ip of ['192.0.1.1', '198.17.255.255', '198.20.0.1']) {
-        assert.equal(isPrivateIp(ip), false, `${ip} must stay reachable`);
+        expect(isPrivateIp(ip), `${ip} must stay reachable`).toBe(false);
     }
 });
 
 test('the whole of fe80::/10, not just its first /64', () => {
     // The exact gap: the old string check tested for "fe80:".
     for (const ip of ['fe80::1', 'fe90::1', 'fea0::1', 'feaf::1', 'febf::ffff']) {
-        assert.equal(isPrivateIp(ip), true, `${ip} is link-local and must be blocked`);
+        expect(isPrivateIp(ip), `${ip} is link-local and must be blocked`).toBe(true);
     }
     // fec0::/10 (site-local, deprecated) is a separate range and also blocked.
-    assert.equal(isPrivateIp('fec0::1'), true);
-    assert.equal(isPrivateIp('feff::1'), true);
+    expect(isPrivateIp('fec0::1')).toBe(true);
+    expect(isPrivateIp('feff::1')).toBe(true);
 });
 
 test('other IPv6 ranges that must not be reachable', () => {
@@ -72,7 +69,7 @@ test('other IPv6 ranges that must not be reachable', () => {
         ['ff00::', 'bottom of the multicast range']
     ];
     for (const [ip, what] of blocked) {
-        assert.equal(isPrivateIp(ip), true, `${ip} (${what}) must be blocked`);
+        expect(isPrivateIp(ip), `${ip} (${what}) must be blocked`).toBe(true);
     }
 });
 
@@ -96,7 +93,7 @@ test('IPv6 formats that embed an IPv4 address are judged by that address', () =>
         ['::ffff:0:a00:1', 'IPv4-translated 10.0.0.1']
     ];
     for (const [ip, what] of blocked) {
-        assert.equal(isPrivateIp(ip), true, `${ip} (${what}) must be blocked`);
+        expect(isPrivateIp(ip), `${ip} (${what}) must be blocked`).toBe(true);
     }
 });
 
@@ -120,17 +117,17 @@ test('public addresses are not caught by the widened ranges', () => {
         ['fe7f::1', 'just below fe80::/10']
     ];
     for (const [ip, what] of allowed) {
-        assert.equal(isPrivateIp(ip), false, `${ip} (${what}) must stay reachable`);
+        expect(isPrivateIp(ip), `${ip} (${what}) must stay reachable`).toBe(false);
     }
 });
 
 test('an embedded public IPv4 stays reachable in every wrapper', () => {
     // These formats are decided by what they embed, not blocked wholesale: a
     // 6to4 address wrapping a public address is itself public.
-    assert.equal(isPrivateIp('::ffff:93.184.216.34'), false);
-    assert.equal(isPrivateIp('2002:5db8:d822::1'), false, '6to4 wrapping 93.184.216.34');
-    assert.equal(isPrivateIp('64:ff9b::5db8:d822'), false, 'NAT64 wrapping 93.184.216.34');
-    assert.equal(isPrivateIp('::ffff:0:5db8:d822'), false, 'IPv4-translated 93.184.216.34');
+    expect(isPrivateIp('::ffff:93.184.216.34')).toBe(false);
+    expect(isPrivateIp('2002:5db8:d822::1'), '6to4 wrapping 93.184.216.34').toBe(false);
+    expect(isPrivateIp('64:ff9b::5db8:d822'), 'NAT64 wrapping 93.184.216.34').toBe(false);
+    expect(isPrivateIp('::ffff:0:5db8:d822'), 'IPv4-translated 93.184.216.34').toBe(false);
 });
 
 test('the v4-mapped and IPv4-translated prefixes do not shadow each other', () => {
@@ -138,20 +135,22 @@ test('the v4-mapped and IPv4-translated prefixes do not shadow each other', () =
     // 12. A row written at the wrong offset would make one of them decide the
     // other's address, which reads as a pass either way and so cannot be seen
     // from the blocked list alone.
-    assert.equal(isPrivateIp('::ffff:7f00:1'), true, 'v4-mapped loopback');
-    assert.equal(isPrivateIp('::ffff:0:7f00:1'), true, 'IPv4-translated loopback');
-    assert.equal(isPrivateIp('::ffff:5db8:d822'), false, 'v4-mapped public');
-    assert.equal(isPrivateIp('::ffff:0:5db8:d822'), false, 'IPv4-translated public');
+    expect(isPrivateIp('::ffff:7f00:1'), 'v4-mapped loopback').toBe(true);
+    expect(isPrivateIp('::ffff:0:7f00:1'), 'IPv4-translated loopback').toBe(true);
+    expect(isPrivateIp('::ffff:5db8:d822'), 'v4-mapped public').toBe(false);
+    expect(isPrivateIp('::ffff:0:5db8:d822'), 'IPv4-translated public').toBe(false);
 });
 
 test('a client arriving as IPv4-translated is not bucketed as an IPv4 client', () => {
     // addressBucket resolves only the v4-mapped form to an IPv4 address, and it
     // names that entry rather than reading the table at [0] — adding a row above
     // it used to rekey every IPv4 client's rate-limit bucket silently.
-    assert.strictEqual(addressBucket('::ffff:127.0.0.1'), '127.0.0.1');
-    assert.strictEqual(addressBucket('::ffff:7f00:1'), '127.0.0.1');
-    assert.strictEqual(addressBucket('::ffff:0:7f00:1'), '0:0:0:0::/64',
-        'the translated form is a v6 address and is bucketed by its /64');
+    expect(addressBucket('::ffff:127.0.0.1')).toBe('127.0.0.1');
+    expect(addressBucket('::ffff:7f00:1')).toBe('127.0.0.1');
+    expect(
+        addressBucket('::ffff:0:7f00:1'),
+        'the translated form is a v6 address and is bucketed by its /64'
+    ).toBe('0:0:0:0::/64');
 });
 
 // --- parsing and failure mode ----------------------------------------------
@@ -160,16 +159,16 @@ test('the compressed and mixed notations all expand correctly', () => {
     // Same address written four ways; the matcher works on bytes, so all four
     // have to agree or the prefixes are being applied to the wrong offsets.
     for (const ip of ['::ffff:127.0.0.1', '::ffff:7f00:1', '0:0:0:0:0:ffff:7f00:1', '0:0:0:0:0:ffff:127.0.0.1']) {
-        assert.equal(isPrivateIp(ip), true, `${ip} must expand to v4-mapped loopback`);
+        expect(isPrivateIp(ip), `${ip} must expand to v4-mapped loopback`).toBe(true);
     }
     for (const ip of ['fe80:0:0:0:0:0:0:1', 'fe80::1', 'FE80::1']) {
-        assert.equal(isPrivateIp(ip), true, `${ip} must be link-local`);
+        expect(isPrivateIp(ip), `${ip} must be link-local`).toBe(true);
     }
 });
 
 test('a zone id does not smuggle an address past the check', () => {
-    assert.equal(isPrivateIp('fe80::1%eth0'), true);
-    assert.equal(isPrivateIp('fe90::1%25'), true);
+    expect(isPrivateIp('fe80::1%eth0')).toBe(true);
+    expect(isPrivateIp('fe90::1%25')).toBe(true);
 });
 
 test('anything unparseable is refused rather than allowed', () => {
@@ -178,7 +177,10 @@ test('anything unparseable is refused rather than allowed', () => {
     // so an unrecognised value means something unexpected, and that is not a
     // reason to permit an outbound connection.
     for (const value of ['', null, undefined, 'localhost', 'not-an-ip', '999.999.999.999', '::gg', {}, 42]) {
-        assert.equal(isPrivateIp(value), true, `${JSON.stringify(value)} must not be treated as public`);
+        expect(
+            isPrivateIp(value),
+            `${JSON.stringify(value)} must not be treated as public`
+        ).toBe(true);
     }
 });
 
@@ -203,12 +205,12 @@ test('local-use NAT64 (64:ff9b:1::/48) is blocked whole', () => {
         ['64:ff9b:1:0:8.8.8.8::', 'a public IPv4 inside it is still local-use']
     ];
     for (const [ip, what] of blocked) {
-        assert.equal(isPrivateIp(ip), true, `${ip} (${what}) must be blocked`);
+        expect(isPrivateIp(ip), `${ip} (${what}) must be blocked`).toBe(true);
     }
     // The well-known prefix keeps its embedded-address rule, and the neighbours
     // of the /48 stay reachable.
-    assert.equal(isPrivateIp('64:ff9b::8.8.8.8'), false, 'NAT64 to a public address stays reachable');
-    assert.equal(isPrivateIp('64:ff9b:2::1'), false, 'just above the local-use /48');
+    expect(isPrivateIp('64:ff9b::8.8.8.8'), 'NAT64 to a public address stays reachable').toBe(false);
+    expect(isPrivateIp('64:ff9b:2::1'), 'just above the local-use /48').toBe(false);
 });
 
 test('IPv4-compatible addresses (::/96) are blocked whole', () => {
@@ -225,24 +227,24 @@ test('IPv4-compatible addresses (::/96) are blocked whole', () => {
         ['::ffff', 'top of the first /112']
     ];
     for (const [ip, what] of blocked) {
-        assert.equal(isPrivateIp(ip), true, `${ip} (${what}) must be blocked`);
+        expect(isPrivateIp(ip), `${ip} (${what}) must be blocked`).toBe(true);
     }
     // v4-mapped sits at ::ffff:0:0/96 and is unaffected: it is still decided by
     // the IPv4 it carries, so a real provider reached that way stays reachable.
-    assert.equal(isPrivateIp('::ffff:8.8.8.8'), false, 'v4-mapped public must stay reachable');
-    assert.equal(isPrivateIp('::ffff:127.0.0.1'), true, 'v4-mapped loopback must stay blocked');
-    assert.equal(isPrivateIp('::1:0:0'), false, 'just above ::/96');
+    expect(isPrivateIp('::ffff:8.8.8.8'), 'v4-mapped public must stay reachable').toBe(false);
+    expect(isPrivateIp('::ffff:127.0.0.1'), 'v4-mapped loopback must stay blocked').toBe(true);
+    expect(isPrivateIp('::1:0:0'), 'just above ::/96').toBe(false);
 });
 
 test('Teredo (2001::/32) is blocked, and its neighbours are not', () => {
     // A Teredo address is a tunnel endpoint inside someone else's network, and
     // the IPv4 it carries is obfuscated rather than plainly embedded.
     for (const ip of ['2001::1', '2001:0:5ef5:79fb:8000:1:ac10:1', '2001:0:ffff:ffff:ffff:ffff:ffff:ffff']) {
-        assert.equal(isPrivateIp(ip), true, `${ip} is Teredo and must be blocked`);
+        expect(isPrivateIp(ip), `${ip} is Teredo and must be blocked`).toBe(true);
     }
     // The /32 is narrow on purpose: 2001::/23 holds real allocations, and
     // blocking a provider's address would be the worse and quieter bug.
     for (const ip of ['2001:1::1', '2001:4860:4860::8888', '2001:db8::1', '2000::1']) {
-        assert.equal(isPrivateIp(ip), false, `${ip} must stay reachable`);
+        expect(isPrivateIp(ip), `${ip} must stay reachable`).toBe(false);
     }
 });

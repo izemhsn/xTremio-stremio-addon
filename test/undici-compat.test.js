@@ -11,10 +11,7 @@
 // ALLOW_PRIVATE_NETWORKS is left unset so the real check has a pinned agent to judge.
 process.env.CONFIG_SECRET = 'test-secret-for-unit-tests';
 
-const test = require('node:test');
-const assert = require('node:assert');
-
-const { warnOnUndiciMismatch } = require('../index.js');
+const { warnOnUndiciMismatch } = require('./support/internals.js');
 
 function check(bundled, dependency, pinned = true) {
     const warnings = [];
@@ -23,40 +20,40 @@ function check(bundled, dependency, pinned = true) {
 }
 
 test('the documented Node 20.18.1 floor is not told its requests will fail', () => {
-    assert.deepEqual(check('6.20.0', '7.29.1'), { ok: true, warnings: [] }, 'Node 20.18.1');
-    assert.deepEqual(check('6.28.0', '7.29.1'), { ok: true, warnings: [] }, 'Node 22');
+    expect(check('6.20.0', '7.29.1'), 'Node 20.18.1').toStrictEqual({ ok: true, warnings: [] });
+    expect(check('6.28.0', '7.29.1'), 'Node 22').toStrictEqual({ ok: true, warnings: [] });
 });
 
 test('the same major is fine', () => {
-    assert.deepEqual(check('7.25.0', '7.29.1'), { ok: true, warnings: [] });
+    expect(check('7.25.0', '7.29.1')).toStrictEqual({ ok: true, warnings: [] });
 });
 
 test('undici 6 and 7 interoperate in both directions', () => {
-    assert.deepEqual(check('7.25.0', '6.28.1'), { ok: true, warnings: [] });
+    expect(check('7.25.0', '6.28.1')).toStrictEqual({ ok: true, warnings: [] });
 });
 
 test('an undici 8 agent with an older fetch is warned about, naming the failure', () => {
     const { ok, warnings } = check('7.25.0', '8.10.2');
-    assert.equal(ok, false);
-    assert.equal(warnings.length, 1);
-    assert.match(warnings[0], /invalid onRequestStart method/);
+    expect(ok).toBe(false);
+    expect(warnings.length).toBe(1);
+    expect(warnings[0]).toMatch(/invalid onRequestStart method/);
 });
 
 test('a runtime bundling a newer undici than any verified is warned about as unverified', () => {
     const { ok, warnings } = check('8.1.0', '7.29.1');
-    assert.equal(ok, false);
-    assert.match(warnings[0], /not been verified/);
+    expect(ok).toBe(false);
+    expect(warnings[0]).toMatch(/not been verified/);
 });
 
 test('there is nothing to judge without a pinned agent', () => {
     // With ALLOW_PRIVATE_NETWORKS on, no pinned agent exists and fetch uses its own.
-    assert.deepEqual(check('8.1.0', '7.29.1', false), { ok: true, warnings: [] });
+    expect(check('8.1.0', '7.29.1', false)).toStrictEqual({ ok: true, warnings: [] });
 });
 
 test('the runtime this suite is running on, with the shipped dependency, passes', () => {
     // Run on Node 20.18.1 this is the finding itself; on a future Node that bundles a
     // pairing nobody has measured, it is the signal to measure it.
     const warnings = [];
-    assert.equal(warnOnUndiciMismatch({ warn: (message) => warnings.push(message) }, { pinned: true }), true);
-    assert.deepEqual(warnings, []);
+    expect(warnOnUndiciMismatch({ warn: (message) => warnings.push(message) }, { pinned: true })).toBe(true);
+    expect(warnings).toStrictEqual([]);
 });

@@ -15,9 +15,6 @@ process.env.CONFIG_SECRET = 'test-secret-for-unit-tests';
 process.env.ALLOW_PRIVATE_NETWORKS = 'true';
 process.env.MAX_UPSTREAM_MB = '1';
 
-const test = require('node:test');
-const assert = require('node:assert');
-
 const {
     app,
     encodeConfig,
@@ -35,7 +32,7 @@ const {
     seriesStreamsCache,
     getSeriesInfo,
     readSeriesInfoEntry
-} = require('../index.js');
+} = require('./support/internals.js');
 
 const realFetch = global.fetch;
 const entry = (bytes, extra = {}) => ({ data: null, bytes, ...extra });
@@ -60,13 +57,13 @@ test('one budget evicts across caches, oldest first', () => {
     const b = new BoundedMap({ maxEntries: 100, ledger: budget });
     a.set('a1', entry(400));
     b.set('b1', entry(400));
-    assert.equal(budget.totalBytes, 800);
+    expect(budget.totalBytes).toBe(800);
 
     b.set('b2', entry(400));
-    assert.ok(!a.has('a1'), 'the oldest entry went, though it lived in the other cache');
-    assert.ok(b.has('b1') && b.has('b2'));
-    assert.equal(budget.totalBytes, 800);
-    assert.equal(a.totalBytes, 0, "and that cache's own total followed");
+    expect(a.has('a1'), 'the oldest entry went, though it lived in the other cache').toBeFalsy();
+    expect(b.has('b1') && b.has('b2')).toBeTruthy();
+    expect(budget.totalBytes).toBe(800);
+    expect(a.totalBytes, "and that cache's own total followed").toBe(0);
 });
 
 test('a read in any cache counts as use', () => {
@@ -78,8 +75,8 @@ test('a read in any cache counts as use', () => {
     a.get('a1');
 
     b.set('b2', entry(400));
-    assert.ok(a.has('a1'), 'read after b1 was written, so b1 is now the older of the two');
-    assert.ok(!b.has('b1'));
+    expect(a.has('a1'), 'read after b1 was written, so b1 is now the older of the two').toBeTruthy();
+    expect(b.has('b1')).toBeFalsy();
 });
 
 test('an entry larger than the whole shared budget is not cached, and says what to raise', () => {
@@ -93,10 +90,10 @@ test('an entry larger than the whole shared budget is not cached, and says what 
 
     const logged = captureWarnings(() => map.set('k', entry(5000)));
 
-    assert.ok(!map.has('k'), 'neither the oversized value nor the one it was replacing');
-    assert.ok(other.has('keep'), 'and nothing was evicted to make room it could never have had');
-    assert.equal(budget.totalBytes, 500);
-    assert.match(logged.join('\n'), /raise CACHE_MAX_MB/);
+    expect(map.has('k'), 'neither the oversized value nor the one it was replacing').toBeFalsy();
+    expect(other.has('keep'), 'and nothing was evicted to make room it could never have had').toBeTruthy();
+    expect(budget.totalBytes).toBe(500);
+    expect(logged.join('\n')).toMatch(/raise CACHE_MAX_MB/);
 });
 
 test("the per-cache rule still keeps one entry over that cache's own budget", () => {
@@ -105,8 +102,8 @@ test("the per-cache rule still keeps one entry over that cache's own budget", ()
     const budget = new CacheBudget(10000);
     const map = new BoundedMap({ maxEntries: 10, maxBytes: 1000, ledger: budget });
     map.set('big', entry(5000));
-    assert.ok(map.has('big'));
-    assert.equal(budget.totalBytes, 5000);
+    expect(map.has('big')).toBeTruthy();
+    expect(budget.totalBytes).toBe(5000);
 });
 
 test('the shared total tracks replacement, sweeping, clearing and deletion', () => {
@@ -118,20 +115,20 @@ test('the shared total tracks replacement, sweeping, clearing and deletion', () 
     a.set('x', entry(100, { ts: Date.now() }));
     a.set('old', entry(200, { ts: Date.now() - 5000 }));
     b.set('y', entry(300));
-    assert.equal(budget.totalBytes, 600);
+    expect(budget.totalBytes).toBe(600);
 
     a.set('x', entry(50, { ts: Date.now() }));
-    assert.equal(budget.totalBytes, 550, 'replacing an entry replaces its weight');
+    expect(budget.totalBytes, 'replacing an entry replaces its weight').toBe(550);
 
-    assert.equal(a.sweep(), 1);
-    assert.equal(budget.totalBytes, 350, 'a swept entry leaves the shared total too');
+    expect(a.sweep()).toBe(1);
+    expect(budget.totalBytes, 'a swept entry leaves the shared total too').toBe(350);
 
     b.clear();
-    assert.equal(budget.totalBytes, 50, 'clearing one cache releases its own share and nothing else');
+    expect(budget.totalBytes, 'clearing one cache releases its own share and nothing else').toBe(50);
 
     a.delete('x');
-    assert.equal(budget.totalBytes, 0);
-    assert.equal(budget.order.size, 0);
+    expect(budget.totalBytes).toBe(0);
+    expect(budget.order.size).toBe(0);
 });
 
 test('a weight mutated after an entry was added cannot make the total drift', () => {
@@ -141,13 +138,13 @@ test('a weight mutated after an entry was added cannot make the total drift', ()
     map.set('k', e);
     e.bytes = 999;
     map.delete('k');
-    assert.equal(budget.totalBytes, 0);
+    expect(budget.totalBytes).toBe(0);
 });
 
 // --- the production wiring ---------------------------------------------------
 
 test('every data cache is charged to the one production budget', () => {
-    assert.equal(CACHE_BUDGET.maxBytes, CACHE_MAX_BYTES);
+    expect(CACHE_BUDGET.maxBytes).toBe(CACHE_MAX_BYTES);
     const caches = {
         catCache,
         seriesInfoCache,
@@ -158,7 +155,7 @@ test('every data cache is charged to the one production budget', () => {
         seriesStreamsCache: seriesStreamsCache.map
     };
     for (const [name, map] of Object.entries(caches)) {
-        assert.equal(map.ledger, CACHE_BUDGET, `${name} is not under CACHE_MAX_MB`);
+        expect(map.ledger, `${name} is not under CACHE_MAX_MB`).toBe(CACHE_BUDGET);
     }
 });
 
@@ -170,7 +167,7 @@ test('many small accounts do not evict each other: bytes decide, not the account
     for (let i = 0; i < 12; i++) {
         vodStreamsCache.set({ serverUrl: 'http://panel.test', username: `user${i}`, password: 'p' }, [{ stream_id: i, name: `M${i}` }]);
     }
-    assert.equal(vodStreamsCache.map.size, 12);
+    expect(vodStreamsCache.map.size).toBe(12);
     vodStreamsCache.map.clear();
 });
 
@@ -179,9 +176,9 @@ test('a live stream list evicted by the shared budget names the shared knob', ()
     const logged = captureWarnings(() => {
         vodStreamsCache.map.onEvict('k', { ts: Date.now(), bytes: 5 * 1024 * 1024 }, 'global budget');
     });
-    assert.equal(logged.length, 1);
-    assert.match(logged[0], /raise CACHE_MAX_MB/);
-    assert.doesNotMatch(logged[0], /CACHE_MAX_STREAM_MB/);
+    expect(logged.length).toBe(1);
+    expect(logged[0]).toMatch(/raise CACHE_MAX_MB/);
+    expect(logged[0]).not.toMatch(/CACHE_MAX_STREAM_MB/);
 });
 
 // --- through the real paths ----------------------------------------------------
@@ -192,17 +189,17 @@ const CFG = encodeConfig(CFG_ARGS);
 let server;
 let base;
 
-test.before(async () => {
+beforeAll(async () => {
     await new Promise(resolve => { server = app.listen(0, '127.0.0.1', resolve); });
     base = `http://127.0.0.1:${server.address().port}`;
 });
 
-test.after(async () => {
+afterAll(async () => {
     global.fetch = realFetch;
     await new Promise(resolve => server.close(resolve));
 });
 
-test.beforeEach(() => {
+beforeEach(() => {
     global.fetch = realFetch;
     catCache.clear();
     seriesInfoCache.clear();
@@ -220,21 +217,24 @@ const jsonResponse = (text) => new Response(text, { headers: { 'content-type': '
 test('the caches that counted entries alone now store a weight', async () => {
     const items = Array.from({ length: 300 }, (_, i) => ({ stream_id: i, name: `Movie ${i}`, category_id: 20 }));
     await categoryStreamsCache.load('weight-test-category', async () => items);
-    assert.ok(categoryStreamsCache.map.peek('weight-test-category').bytes > 1000, 'per-category list');
+    expect(
+        categoryStreamsCache.map.peek('weight-test-category').bytes,
+        'per-category list'
+    ).toBeGreaterThan(1000);
 
     await vodInfoCache.load('weight-test-vod', async () => ({ info: { name: 'A Movie', plot: 'x'.repeat(500) } }));
-    assert.ok(vodInfoCache.map.peek('weight-test-vod').bytes > 250, 'movie info');
+    expect(vodInfoCache.map.peek('weight-test-vod').bytes, 'movie info').toBeGreaterThan(250);
 
     const seriesCfg = { serverUrl: 'http://127.0.0.1:9', username: 'u', password: 'p' };
     global.fetch = async () => jsonResponse(JSON.stringify({ info: { name: 'Show' }, episodes: { 1: [{ id: '1' }] } }));
     await getSeriesInfo(seriesCfg, '77');
-    assert.ok(readSeriesInfoEntry(seriesCfg, '77').bytes > 0, 'series info');
+    expect(readSeriesInfoEntry(seriesCfg, '77').bytes, 'series info').toBeGreaterThan(0);
 
     global.fetch = async () => jsonResponse(JSON.stringify([{ category_id: '1', category_name: 'Action' }]));
     const res = await realFetch(`${base}/${CFG}/manifest.json`);
-    assert.equal(res.status, 200);
+    expect(res.status).toBe(200);
     const [categories] = [...catCache.values()];
-    assert.ok(categories && categories.bytes > 0, 'categories');
+    expect(categories && categories.bytes > 0, 'categories').toBeTruthy();
 });
 
 test('a hostile list from the provider is refused before it reaches any cache', async () => {
@@ -253,9 +253,9 @@ test('a hostile list from the provider is refused before it reaches any cache', 
     const res = await realFetch(`${base}/${CFG}/catalog/XT-Movies/xtremio_search_movies/${encodeURIComponent('search=a')}.json`);
     const body = await res.json();
 
-    assert.ok(served >= 1, 'the provider was asked');
-    assert.deepEqual(body.metas, [], 'the shelf degrades quietly, as for any upstream failure');
-    assert.equal(vodStreamsCache.map.size, 0, 'nothing from it was cached');
+    expect(served, 'the provider was asked').toBeGreaterThanOrEqual(1);
+    expect(body.metas, 'the shelf degrades quietly, as for any upstream failure').toStrictEqual([]);
+    expect(vodStreamsCache.map.size, 'nothing from it was cached').toBe(0);
 });
 
 test('a real list is cached with the weight it was read with, not a sample', async () => {
@@ -268,10 +268,10 @@ test('a real list is cached with the weight it was read with, not a sample', asy
     );
 
     const res = await realFetch(`${base}/${CFG}/catalog/XT-Movies/xtremio_search_movies/${encodeURIComponent('search=Movie')}.json`);
-    assert.equal(res.status, 200);
+    expect(res.status).toBe(200);
 
     const [cached] = [...vodStreamsCache.map.values()];
-    assert.ok(cached, 'the list was cached');
-    assert.equal(cached.data.length, 1000);
-    assert.equal(cached.bytes, Math.round(weighJson(text)), 'weighed from every byte of the body it arrived as');
+    expect(cached, 'the list was cached').toBeTruthy();
+    expect(cached.data.length).toBe(1000);
+    expect(cached.bytes, 'weighed from every byte of the body it arrived as').toBe(Math.round(weighJson(text)));
 });

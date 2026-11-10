@@ -7,8 +7,6 @@
 process.env.CONFIG_SECRET = 'test-secret-for-unit-tests';
 process.env.ALLOW_PRIVATE_NETWORKS = 'true';
 
-const test = require('node:test');
-const assert = require('node:assert');
 const util = require('node:util');
 const crypto = require('node:crypto');
 
@@ -25,7 +23,7 @@ const {
     catCache,
     vodStreamsCache,
     categoryStreamsCache
-} = require('../index.js');
+} = require('./support/internals.js');
 
 const realFetch = global.fetch;
 const CFG_ARGS = { serverUrl: 'http://provider.test:8080', username: 'alice', password: 'secret' };
@@ -67,17 +65,17 @@ function shapedToken(version) {
 let server;
 let base;
 
-test.before(async () => {
+beforeAll(async () => {
     await new Promise(resolve => { server = app.listen(0, '127.0.0.1', resolve); });
     base = `http://127.0.0.1:${server.address().port}`;
 });
 
-test.after(async () => {
+afterAll(async () => {
     global.fetch = realFetch;
     await new Promise(resolve => server.close(resolve));
 });
 
-test.beforeEach(() => {
+beforeEach(() => {
     catCache.clear();
     vodStreamsCache.map.clear();
     categoryStreamsCache.map.clear();
@@ -88,12 +86,17 @@ const searchUrl = () => `${base}/${CFG}/catalog/XT-Movies/xtremio_search_movies/
 // --- route errors ----------------------------------------------------------------
 
 test('what counts as a bug in the addon and what counts as the provider', () => {
-    assert.equal(isProgrammingError(new TypeError("Cannot read properties of null (reading 'name')")), true);
-    assert.equal(isProgrammingError(new ReferenceError('x is not defined')), true);
-    assert.equal(isProgrammingError(new TypeError('fetch failed', { cause: new Error('ECONNREFUSED') })), false);
-    assert.equal(isProgrammingError(new Error('xtremio get_vod_streams failed: HTTP 502')), false);
-    assert.equal(isProgrammingError(Object.assign(new Error('aborted'), { name: 'AbortError' })), false);
-    assert.equal(isProgrammingError(new SyntaxError('Unexpected token < in JSON')), false, 'a provider sending HTML is not a bug');
+    expect(isProgrammingError(new TypeError("Cannot read properties of null (reading 'name')"))).toBe(true);
+    expect(isProgrammingError(new ReferenceError('x is not defined'))).toBe(true);
+    expect(
+        isProgrammingError(new TypeError('fetch failed', { cause: new Error('ECONNREFUSED') }))
+    ).toBe(false);
+    expect(isProgrammingError(new Error('xtremio get_vod_streams failed: HTTP 502'))).toBe(false);
+    expect(isProgrammingError(Object.assign(new Error('aborted'), { name: 'AbortError' }))).toBe(false);
+    expect(
+        isProgrammingError(new SyntaxError('Unexpected token < in JSON')),
+        'a provider sending HTML is not a bug'
+    ).toBe(false);
 });
 
 test('a bug in a route is logged with its stack', async () => {
@@ -114,10 +117,10 @@ test('a bug in a route is logged with its stack', async () => {
         body = await (await realFetch(searchUrl())).json();
     });
 
-    assert.deepEqual(body.metas, [], 'the user still gets the quiet answer');
+    expect(body.metas, 'the user still gets the quiet answer').toStrictEqual([]);
     const text = logged.join('\n');
-    assert.match(text, /\[catalog\] unexpected error: TypeError/);
-    assert.match(text, /\n\s+at /, 'with its stack');
+    expect(text).toMatch(/\[catalog\] unexpected error: TypeError/);
+    expect(text, 'with its stack').toMatch(/\n\s+at /);
 });
 
 test('a provider failure stays a single line', async () => {
@@ -130,8 +133,8 @@ test('a provider failure stays a single line', async () => {
     });
 
     const text = logged.join('\n');
-    assert.match(text, /\[catalog\] Error: fetch failed/);
-    assert.doesNotMatch(text, /unexpected error/);
+    expect(text).toMatch(/\[catalog\] Error: fetch failed/);
+    expect(text).not.toMatch(/unexpected error/);
 });
 
 // --- install URLs that will not decode --------------------------------------------
@@ -141,14 +144,14 @@ test('install URLs sealed under another secret are reported once, and counted af
     const foreign = sealConfig(CFG_ARGS, deriveConfigKeys('a-secret-this-server-never-had-0123456789'));
 
     const logged = capture(() => {
-        for (let i = 0; i < 5; i++) assert.equal(decodeConfig(foreign), null);
+        for (let i = 0; i < 5; i++) expect(decodeConfig(foreign)).toBeNull();
     });
 
     const reports = logged.filter(line => line.includes('install URLs refused'));
-    assert.equal(reports.length, 1, 'one broken install fires many requests; one line says why');
-    assert.match(reports[0], /1 sealed under a secret this server does not have/);
-    assert.match(reports[0], /CONFIG_SECRET/);
-    assert.equal(undecodableTokens.secret, 4, 'the rest wait for the next report');
+    expect(reports.length, 'one broken install fires many requests; one line says why').toBe(1);
+    expect(reports[0]).toMatch(/1 sealed under a secret this server does not have/);
+    expect(reports[0]).toMatch(/CONFIG_SECRET/);
+    expect(undecodableTokens.secret, 'the rest wait for the next report').toBe(4);
 });
 
 test('the next report carries everything counted since the last one', () => {
@@ -160,10 +163,10 @@ test('the next report carries everything counted since the last one', () => {
         noteUndecodableToken('secret', t0 + 1000);
         noteUndecodableToken('version', t0 + 2000);
     });
-    assert.deepEqual(quiet, [], 'nothing inside the interval');
+    expect(quiet, 'nothing inside the interval').toStrictEqual([]);
 
     const logged = capture(() => noteUndecodableToken('secret', t0 + UNDECODABLE_REPORT_INTERVAL_MS));
-    assert.match(logged.join('\n'), /2 sealed under a secret.*1 from an older token version/);
+    expect(logged.join('\n')).toMatch(/2 sealed under a secret.*1 from an older token version/);
 });
 
 test('scanner garbage is not counted, and a token from an older version is', () => {
@@ -173,8 +176,8 @@ test('scanner garbage is not counted, and a token from an older version is', () 
         decodeConfig('favicon.ico');
         decodeConfig(shapedToken('v2'));
     });
-    assert.equal(undecodableTokens.secret, 0);
-    assert.match(logged.join('\n'), /1 from an older token version/);
+    expect(undecodableTokens.secret).toBe(0);
+    expect(logged.join('\n')).toMatch(/1 from an older token version/);
 });
 
 // L5 — five dot-separated parts under a version prefix was enough to be counted,
@@ -196,7 +199,7 @@ test('a five-part string that is not token-shaped is not counted (L5)', () => {
         decodeConfig(`v3.${iv}.${tag}..${mac}`);         // nothing to decrypt
         decodeConfig(`v3.${iv}.${tag}.${ct}.${mac.slice(0, -4)}`); // MAC short of 32 bytes
     });
-    assert.deepEqual(quiet, [], 'none of these is a token this server could have issued');
+    expect(quiet, 'none of these is a token this server could have issued').toStrictEqual([]);
 
     // The positive controls: without them this test would also pass if decodeConfig
     // had stopped counting altogether.
@@ -204,16 +207,16 @@ test('a five-part string that is not token-shaped is not counted (L5)', () => {
     const sealedElsewhere = capture(() => {
         decodeConfig(sealConfig(CFG_ARGS, deriveConfigKeys('a-secret-this-server-never-had-0123456789')));
     });
-    assert.match(sealedElsewhere.join('\n'), /1 sealed under a secret/);
+    expect(sealedElsewhere.join('\n')).toMatch(/1 sealed under a secret/);
 
     resetReports();
     const olderVersion = capture(() => decodeConfig(shapedToken('v2')));
-    assert.match(olderVersion.join('\n'), /1 from an older token version/);
+    expect(olderVersion.join('\n')).toMatch(/1 from an older token version/);
 });
 
 test('a valid install URL is never reported', () => {
     resetReports();
-    const logged = capture(() => assert.ok(decodeConfig(CFG)));
-    assert.deepEqual(logged.filter(line => line.includes('install URLs refused')), []);
-    assert.equal(undecodableTokens.secret + undecodableTokens.version, 0);
+    const logged = capture(() => expect(decodeConfig(CFG)).toBeTruthy());
+    expect(logged.filter(line => line.includes('install URLs refused'))).toStrictEqual([]);
+    expect(undecodableTokens.secret + undecodableTokens.version).toBe(0);
 });

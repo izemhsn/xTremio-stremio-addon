@@ -1,9 +1,9 @@
 // Does this panel exist, and do these credentials work there?
 //
 // Three rules here are about not sending a password somewhere it should not go.
-// A typed `https://` is never moved onto http (audit S7): there is no http retry
+// A typed `https://` is never moved onto http: there is no http retry
 // when https fails, and a `server_info` naming http is ignored for that
-// connection. No scheme at all means https is tried *first* (audit L9), because
+// connection. No scheme at all means https is tried *first*, because
 // normalizeUrl assumes http and the old order put the password on the wire in
 // cleartext before anything had tried the panel's TLS port. And the attempt at a
 // scheme the user did not type is a guess, so it carries the shorter probe
@@ -11,12 +11,12 @@
 // otherwise make every scheme-less /configure wait the full deadline.
 //
 // A `server_info` origin is adopted only after credentialsWorkAt confirms the
-// credentials there (audit S8). A panel reporting its internal address used to
+// credentials there. A panel reporting its internal address used to
 // get "Connected!" and an install link whose every catalog was empty.
 const { normalizeUrl, buildUrl } = require('../helpers.js');
 const { safeFetch } = require('../net/safe-fetch.js');
-const { readJsonCapped } = require('../upstream/read-capped.js');
-const { panelHostAllowed, hostnameOf } = require('../panel-allowlist.js');
+const { readJsonCapped } = require('../net/read-capped.js');
+const { panelHostAllowed, hostnameOf } = require('./panel-allowlist.js');
 
 function schemeOf(url) {
     return String(url || '').startsWith('https:') ? 'https' : 'http';
@@ -41,7 +41,7 @@ function serverInfoOrigin(si) {
     if (!si || !si.url) return null;
     const proto = si.server_protocol || 'http';
     // https takes its port from https_port alone; borrowing `port` gave
-    // https://host:80 (audit S8).
+    // https://host:80.
     const port = proto === 'https' ? si.https_port : si.port;
     let parsed;
     try {
@@ -73,15 +73,11 @@ async function credentialsWorkAt(origin, username, password) {
 
 async function validateXtremioCredentials(serverUrl, username, password) {
     const base = normalizeUrl(serverUrl);
-    // Parsed once, here, because everything past this point assumes it parses:
-    // buildUrl inside the loop, and the catch block's own log line, which calls
-    // `new URL(url)` on the same value. A URL that fails both — `http://bad
-    // host:8080` — threw out of buildUrl, and the catch threw a *second* time
-    // while logging, which escaped this function entirely. POST /configure then
-    // answered "Something went wrong. Please try again." and logged nothing, so
-    // neither the user nor the operator was told the URL was the problem
-    // (audit F2). Once `base` parses, `httpsBase` does too: swapping the scheme
-    // cannot make a URL unparseable.
+    // Checked once, here, because everything below assumes the URL parses —
+    // including the log line in the catch block, which would otherwise throw a
+    // second time. A URL like `http://bad host:8080` gets a clear message instead.
+    // If `base` parses, `httpsBase` does too: swapping the scheme cannot make a
+    // URL unparseable.
     if (!URL.canParse(base)) {
         return { valid: false, error: 'That server URL is not valid — check it for typos, spaces or a missing port.' };
     }
@@ -90,11 +86,11 @@ async function validateXtremioCredentials(serverUrl, username, password) {
     // different orders.
     const typed = String(serverUrl || '').trim().toLowerCase();
     const typedScheme = typed.startsWith('http://') || typed.startsWith('https://');
-    // Someone who typed https:// is never moved onto http (audit S7). Someone who
+    // Someone who typed https:// is never moved onto http. Someone who
     // typed http:// asked for it, so that is tried first and https is the upgrade.
     // With no scheme at all, https goes first: the old order put the password on
     // the wire in cleartext before anything had tried the panel's TLS port, and no
-    // warning afterwards takes a sent password back (audit L9).
+    // warning afterwards takes a sent password back.
     const askedForHttps = schemeOf(base) === 'https';
     const httpsBase = base.replace(/^http:/, 'https:');
     // A scheme the user did not type is a guess, and a guess must not cost the
@@ -132,7 +128,7 @@ async function validateXtremioCredentials(serverUrl, username, password) {
 
             // `?.`: a panel answering a literal `null` threw here, and the catch
             // reported it as "Cannot reach that server", which it plainly could.
-            if (!json?.user_info) return { valid: false, error: 'Not a valid xTremio server' };
+            if (!json?.user_info) return { valid: false, error: 'Not a valid Xtream server' };
             if (json.user_info.auth !== 1) return { valid: false, error: 'Invalid username or password' };
             if (json.user_info.status !== 'Active') return { valid: false, error: `Account is ${json.user_info.status || 'inactive'}` };
 
@@ -163,8 +159,8 @@ async function validateXtremioCredentials(serverUrl, username, password) {
                 );
                 named = null;
             }
-            // And a surviving origin is adopted only once the credentials work there
-            // (audit S8). Checked last, so a refused host is never contacted, and
+            // And a surviving origin is adopted only once the credentials work
+            // there. Checked last, so a refused host is never contacted, and
             // skipped for the origin that just answered.
             if (named && new URL(named).origin !== new URL(url).origin
                 && !await credentialsWorkAt(named, username, password)) {
@@ -175,10 +171,10 @@ async function validateXtremioCredentials(serverUrl, username, password) {
                 named = null;
             }
             const finalUrl = named || url;
-            // Attribute the downgrade to whichever step actually caused it: the
-            // http retry, or the provider overriding a scheme that just worked.
-            const downgrade = describeDowngrade(base, url, 'fallback')
-                || describeDowngrade(url, finalUrl, 'provider');
+            // The only way onto http once https has worked: the provider's
+            // server_info overriding it. A failed https attempt is never retried
+            // over http, so there is no fallback downgrade to report.
+            const downgrade = describeDowngrade(url, finalUrl, 'provider');
             if (downgrade) {
                 console.warn(`[configure] ${new URL(finalUrl).host}: https→http downgrade (${downgrade.source}); credentials will travel in cleartext`);
             }
@@ -199,7 +195,7 @@ async function validateXtremioCredentials(serverUrl, username, password) {
                 `${reason}${next ? `; trying ${schemeOf(next.url)}` : ''}`
             );
             if (next) continue;
-            if (anyAnswered) return { valid: false, error: 'Not a valid xTremio server' };
+            if (anyAnswered) return { valid: false, error: 'Not a valid Xtream server' };
             return {
                 valid: false,
                 error: askedForHttps
@@ -218,6 +214,5 @@ module.exports = {
     schemeOf,
     describeDowngrade,
     serverInfoOrigin,
-    credentialsWorkAt,
     validateXtremioCredentials
 };

@@ -10,9 +10,6 @@
 process.env.CONFIG_SECRET = 'test-secret-for-unit-tests';
 process.env.ALLOW_PRIVATE_NETWORKS = 'true';
 
-const test = require('node:test');
-const assert = require('node:assert');
-
 const {
     app,
     encodeConfig,
@@ -24,7 +21,7 @@ const {
     liveStreamsCache,
     CACHE_TTL,
     CACHE_FAILURE_TTL
-} = require('../index.js');
+} = require('./support/internals.js');
 
 const realFetch = global.fetch;
 
@@ -84,17 +81,17 @@ const idsOf = body => body.metas.map(m => m.id);
 let server;
 let base;
 
-test.before(async () => {
+beforeAll(async () => {
     await new Promise(resolve => { server = app.listen(0, '127.0.0.1', resolve); });
     base = `http://127.0.0.1:${server.address().port}`;
 });
 
-test.after(async () => {
+afterAll(async () => {
     global.fetch = realFetch;
     await new Promise(resolve => server.close(resolve));
 });
 
-test.beforeEach(() => {
+beforeEach(() => {
     fullMovies = MOVIES;
     fullLive = LIVE;
     emptyScoped.clear();
@@ -115,15 +112,15 @@ test('a cached empty full list does not blank a genre shelf', async () => {
     fullMovies = [];
 
     const cold = await getCatalog('XT-Movies', 'xtremio_movies_new', 'genre=Action');
-    assert.deepEqual(idsOf(cold.body), ['xtremio_movie_102', 'xtremio_movie_101']);
+    expect(idsOf(cold.body)).toStrictEqual(['xtremio_movie_102', 'xtremio_movie_101']);
 
     const search = await getCatalog('XT-Movies', 'xtremio_search_movies', 'search=a');
-    assert.deepEqual(search.body.metas, [], 'the provider gave search nothing to search');
-    assert.equal(countOf('get_vod_streams'), 1, 'the search should have cached the empty full list');
+    expect(search.body.metas, 'the provider gave search nothing to search').toStrictEqual([]);
+    expect(countOf('get_vod_streams'), 'the search should have cached the empty full list').toBe(1);
 
     const warm = await getCatalog('XT-Movies', 'xtremio_movies_new', 'genre=Action');
-    assert.deepEqual(idsOf(warm.body), idsOf(cold.body), 'the cached empty list blanked the shelf');
-    assert.equal(countOf('get_vod_streams:20'), 1, 'the shelf should reuse the cached category list');
+    expect(idsOf(warm.body), 'the cached empty list blanked the shelf').toStrictEqual(idsOf(cold.body));
+    expect(countOf('get_vod_streams:20'), 'the shelf should reuse the cached category list').toBe(1);
 });
 
 test('a full list serves the categories it covers, and only those', async () => {
@@ -135,56 +132,56 @@ test('a full list serves the categories it covers, and only those', async () => 
     const action = await getCatalog('XT-Movies', 'xtremio_movies_new', 'genre=Action');
     const kids = await getCatalog('XT-Movies', 'xtremio_movies_new', 'genre=Kids');
 
-    assert.deepEqual(idsOf(action.body), ['xtremio_movie_102', 'xtremio_movie_101']);
-    assert.deepEqual(idsOf(kids.body), ['xtremio_movie_201']);
-    assert.equal(countOf('get_vod_streams:20'), 0, 'a covered category must not trigger a category fetch');
-    assert.equal(countOf('get_vod_streams:21'), 1);
+    expect(idsOf(action.body)).toStrictEqual(['xtremio_movie_102', 'xtremio_movie_101']);
+    expect(idsOf(kids.body)).toStrictEqual(['xtremio_movie_201']);
+    expect(countOf('get_vod_streams:20'), 'a covered category must not trigger a category fetch').toBe(0);
+    expect(countOf('get_vod_streams:21')).toBe(1);
 });
 
 test('an empty full list is cached briefly, a populated one for the full TTL', async () => {
     fullMovies = [];
-    assert.deepEqual(await getAllVodStreams(CFG_ARGS), []);
-    assert.deepEqual(await getAllVodStreams(CFG_ARGS), []);
-    assert.equal(countOf('get_vod_streams'), 1, 'still a hit for requests that arrive together');
+    expect(await getAllVodStreams(CFG_ARGS)).toStrictEqual([]);
+    expect(await getAllVodStreams(CFG_ARGS)).toStrictEqual([]);
+    expect(countOf('get_vod_streams'), 'still a hit for requests that arrive together').toBe(1);
 
     const [key] = [...vodStreamsCache.map.keys()];
-    assert.equal(vodStreamsCache.map.peek(key).ttl, CACHE_FAILURE_TTL);
+    expect(vodStreamsCache.map.peek(key).ttl).toBe(CACHE_FAILURE_TTL);
 
     // Past that window it is asked again, and a populated answer replaces it.
     vodStreamsCache.map.peek(key).ts -= CACHE_FAILURE_TTL + 1;
     fullMovies = MOVIES;
-    assert.equal((await getAllVodStreams(CFG_ARGS)).length, MOVIES.length);
-    assert.equal(countOf('get_vod_streams'), 2);
-    assert.equal(vodStreamsCache.map.peek(key).ttl, CACHE_TTL);
+    expect((await getAllVodStreams(CFG_ARGS)).length).toBe(MOVIES.length);
+    expect(countOf('get_vod_streams')).toBe(2);
+    expect(vodStreamsCache.map.peek(key).ttl).toBe(CACHE_TTL);
 });
 
 test('an empty live list falls back to the per-category fetch too', async () => {
     fullLive = [];
     const { body } = await getCatalog('Live TV', 'xtremio_live', 'genre=News');
-    assert.deepEqual(idsOf(body), ['xtremio_live_301']);
-    assert.equal(countOf('get_live_streams:10'), 1);
+    expect(idsOf(body)).toStrictEqual(['xtremio_live_301']);
+    expect(countOf('get_live_streams:10')).toBe(1);
 });
 
 test('an empty per-category answer is asked again within a minute', async () => {
     // No warm full list here, so nothing else can fill the shelf.
     emptyScoped.add('21');
     const first = await getCatalog('XT-Movies', 'xtremio_movies_new', 'genre=Kids');
-    assert.deepEqual(first.body.metas, []);
+    expect(first.body.metas).toStrictEqual([]);
 
     const key = [...categoryStreamsCache.map.keys()].find(k => k.endsWith('\n21'));
-    assert.equal(categoryStreamsCache.map.peek(key).ttl, CACHE_FAILURE_TTL);
+    expect(categoryStreamsCache.map.peek(key).ttl).toBe(CACHE_FAILURE_TTL);
 
     categoryStreamsCache.map.peek(key).ts -= CACHE_FAILURE_TTL + 1;
     emptyScoped.delete('21');
     const second = await getCatalog('XT-Movies', 'xtremio_movies_new', 'genre=Kids');
-    assert.deepEqual(idsOf(second.body), ['xtremio_movie_201']);
-    assert.equal(countOf('get_vod_streams:21'), 2);
+    expect(idsOf(second.body)).toStrictEqual(['xtremio_movie_201']);
+    expect(countOf('get_vod_streams:21')).toBe(2);
 });
 
 test('a populated per-category answer is still held for the full TTL', async () => {
     await getCatalog('XT-Movies', 'xtremio_movies_new', 'genre=Kids');
     const key = [...categoryStreamsCache.map.keys()].find(k => k.endsWith('\n21'));
-    assert.equal(categoryStreamsCache.map.peek(key).ttl, CACHE_TTL);
+    expect(categoryStreamsCache.map.peek(key).ttl).toBe(CACHE_TTL);
 });
 
 test('an empty page is never cacheable by the client', async () => {
@@ -192,14 +189,14 @@ test('an empty page is never cacheable by the client', async () => {
     // blank page for 300 s plus 600 s stale would outlast that recovery.
     emptyScoped.add('21');
     const shelf = await getCatalog('XT-Movies', 'xtremio_movies_new', 'genre=Kids');
-    assert.deepEqual(shelf.body, { metas: [] });
-    assert.equal(shelf.headers.get('cache-control'), 'no-store');
+    expect(shelf.body).toStrictEqual({ metas: [] });
+    expect(shelf.headers.get('cache-control')).toBe('no-store');
 
     const search = await getCatalog('XT-Movies', 'xtremio_search_movies', 'search=zzz');
-    assert.deepEqual(search.body, { metas: [] });
-    assert.equal(search.headers.get('cache-control'), 'no-store');
+    expect(search.body).toStrictEqual({ metas: [] });
+    expect(search.headers.get('cache-control')).toBe('no-store');
 
     // A page with items keeps its hints.
     const full = await getCatalog('XT-Movies', 'xtremio_movies_new', 'genre=Action');
-    assert.match(full.headers.get('cache-control'), /max-age=300/);
+    expect(full.headers.get('cache-control')).toMatch(/max-age=300/);
 });
