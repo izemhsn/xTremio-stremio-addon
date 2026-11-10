@@ -88,12 +88,13 @@ jobs:
           password: ${{ secrets.GITHUB_TOKEN }}   # GitHub creates this token automatically
 
       # Builds on every run, and pushes only for a version tag.
+      # Only a version tag gets the real ghcr.io tags: on other runs ref_name
+      # can be something like "7/merge" (pull requests), which is not a valid
+      # Docker tag, so those builds get a fixed local tag instead.
       - name: Build the Docker image (and publish it for a version tag)
         uses: docker/build-push-action@v6
         with:
           context: .
           platforms: linux/amd64,linux/arm64
           push: ${{ github.ref_type == 'tag' }}
-          tags: |
-            ghcr.io/izemhsn/xtremio-stremio-addon:${{ github.ref_name }}
-            ghcr.io/izemhsn/xtremio-stremio-addon:latest
+          tags: ${{ github.ref_type == 'tag' && format('ghcr.io/izemhsn/xtremio-stremio-addon:{0},ghcr.io/izemhsn/xtremio-stremio-addon:latest', github.ref_name) || 'xtremio-stremio-addon:ci' }}
